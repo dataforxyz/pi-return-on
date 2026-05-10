@@ -1,0 +1,24 @@
+{
+  "name": "pi-return-on",
+  "version": "0.1.0",
+  "description": "Pi extension for timers, watches, and return-on condition triggers that wake the agent later.",
+  "type": "module",
+  "private": true,
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

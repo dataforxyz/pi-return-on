@@ -1,0 +1,6 @@
+{
+  "name": "pi-return-on",
+  "version": "0.1.0",
+  "entry": "src/index.ts",
+  "description": "Timers and background condition watchers for Pi. Lets the agent return when timers/files/exec checks become true."
+}

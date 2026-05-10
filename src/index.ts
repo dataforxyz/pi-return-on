@@ -1,0 +1,722 @@
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawn } from "node:child_process";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+
+const EXTENSION_NAME = "return-on";
+const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
+const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
+const DEFAULT_TICK_MS = 1000;
+const DEFAULT_EXEC_EVERY_MS = 5000;
+const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
+const DEFAULT_FILE_EVERY_MS = 1000;
+const MIN_EXEC_EVERY_MS = 2000;
+const OUTPUT_LIMIT_BYTES = 50 * 1024;
+
+type GroupOp = "and" | "or" | "not";
+type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
+
+type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition;
+
+interface GroupCondition extends Record<string, unknown> {
+	op: GroupOp;
+	children: Condition[];
+}
+
+interface TimerCondition extends Record<string, unknown> {
+	type: "timer";
+	after?: string | number;
+	at?: string | number;
+}
+
+interface FileCondition extends Record<string, unknown> {
+	type: "file";
+	path: string;
+	exists?: boolean;
+	deleted?: boolean;
+	changed?: boolean;
+	stableFor?: string | number;
+	contains?: string;
+	matches?: string;
+	every?: string | number;
+}
+
+interface ExecCondition extends Record<string, unknown> {
+	type: "exec";
+	runner?: Runner;
+	shell?: Runner;
+	command?: string;
+	code?: string;
+	every?: string | number;
+	timeout?: string | number;
+	success?: boolean;
+	failure?: boolean;
+	exitCode?: number;
+	stdoutContains?: string;
+	stderrContains?: string;
+	outputContains?: string;
+	stdoutMatches?: string;
+	stderrMatches?: string;
+	outputMatches?: string;
+}
+
+interface LeafLatch {
+	trueAt: number;
+	summary: string;
+	details?: unknown;
+}
+
+interface LeafState {
+	lastCheckAt?: number;
+	lastMtimeMs?: number;
+	stableSince?: number;
+	lastSummary?: string;
+}
+
+interface ReturnOnJob {
+	id: string;
+	label: string;
+	cwd: string;
+	sessionFile?: string;
+	createdAt: number;
+	updatedAt: number;
+	status: "active" | "fired" | "cancelled";
+	condition: Condition;
+	resume: string;
+	timeoutAt?: number;
+	allowExec?: boolean;
+	latches: Record<string, LeafLatch>;
+	leafState: Record<string, LeafState>;
+	fireReason?: string;
+	firedAt?: number;
+	cancelledAt?: number;
+}
+
+interface JobsState {
+	version: 1;
+	jobs: ReturnOnJob[];
+}
+
+interface EvalResult {
+	value: boolean;
+	summary: string;
+	details?: unknown;
+}
+
+let jobs: ReturnOnJob[] = [];
+let currentSessionFile: string | undefined;
+let tickTimer: ReturnType<typeof setInterval> | undefined;
+let latestCtx: ExtensionContext | undefined;
+let ticking = false;
+
+function nowIso(ts = Date.now()): string {
+	return new Date(ts).toISOString();
+}
+
+function makeId(): string {
+	return `ro_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseDuration(input: string | number | undefined, fallbackMs?: number): number | undefined {
+	if (input === undefined || input === null || input === "") return fallbackMs;
+	if (typeof input === "number" && Number.isFinite(input)) return input;
+	if (typeof input !== "string") return fallbackMs;
+	const trimmed = input.trim();
+	if (!trimmed) return fallbackMs;
+	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|m|min|mins|h|hr|hrs|d|day|days)?$/i);
+	if (!match) return fallbackMs;
+	const value = Number(match[1]);
+	const unit = (match[2] ?? "ms").toLowerCase();
+	const multipliers: Record<string, number> = {
+		ms: 1,
+		s: 1000,
+		sec: 1000,
+		secs: 1000,
+		m: 60_000,
+		min: 60_000,
+		mins: 60_000,
+		h: 3_600_000,
+		hr: 3_600_000,
+		hrs: 3_600_000,
+		d: 86_400_000,
+		day: 86_400_000,
+		days: 86_400_000,
+	};
+	return Math.max(0, Math.round(value * (multipliers[unit] ?? 1)));
+}
+
+function parseAt(input: string | number | undefined, createdAt: number): number | undefined {
+	if (input === undefined || input === null || input === "") return undefined;
+	if (typeof input === "number" && Number.isFinite(input)) return input;
+	if (typeof input !== "string") return undefined;
+	const trimmed = input.trim();
+	if (!trimmed) return undefined;
+	const timeOnly = trimmed.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+	if (timeOnly) {
+		const date = new Date(createdAt);
+		date.setHours(Number(timeOnly[1]), Number(timeOnly[2]), Number(timeOnly[3] ?? 0), 0);
+		if (date.getTime() <= createdAt) date.setDate(date.getDate() + 1);
+		return date.getTime();
+	}
+	const parsed = Date.parse(trimmed);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function formatDuration(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+	if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+	return `${Math.round(ms / 86_400_000)}d`;
+}
+
+async function loadJobs(): Promise<void> {
+	try {
+		const raw = await fsp.readFile(JOBS_FILE, "utf8");
+		const parsed = JSON.parse(raw) as JobsState;
+		jobs = Array.isArray(parsed.jobs) ? parsed.jobs : [];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			console.error(`[${EXTENSION_NAME}] Failed to load jobs:`, error);
+		}
+		jobs = [];
+	}
+}
+
+async function saveJobs(): Promise<void> {
+	await fsp.mkdir(STATE_DIR, { recursive: true });
+	const tmp = `${JOBS_FILE}.${process.pid}.${Date.now()}.tmp`;
+	await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
+	await fsp.rename(tmp, JOBS_FILE);
+}
+
+function activeJobsForCurrentSession(): ReturnOnJob[] {
+	return jobs.filter((job) => job.status === "active" && (!job.sessionFile || !currentSessionFile || job.sessionFile === currentSessionFile));
+}
+
+function updateStatus(ctx = latestCtx): void {
+	if (!ctx?.hasUI) return;
+	const count = activeJobsForCurrentSession().length;
+	ctx.ui.setStatus(EXTENSION_NAME, count > 0 ? `return_on: ${count}` : undefined);
+}
+
+function startTicker(pi: ExtensionAPI): void {
+	if (tickTimer) return;
+	tickTimer = setInterval(() => {
+		void tick(pi);
+	}, DEFAULT_TICK_MS);
+	tickTimer.unref?.();
+}
+
+function stopTicker(): void {
+	if (tickTimer) clearInterval(tickTimer);
+	tickTimer = undefined;
+}
+
+function ensureTicker(pi: ExtensionAPI): void {
+	if (activeJobsForCurrentSession().length > 0) startTicker(pi);
+	else stopTicker();
+	updateStatus();
+}
+
+function normalizeCondition(input: unknown): Condition {
+	if (!isObject(input)) throw new Error("condition must be an object");
+	if (Array.isArray(input.any)) return { op: "or", children: input.any.map(normalizeCondition) };
+	if (Array.isArray(input.all)) return { op: "and", children: input.all.map(normalizeCondition) };
+	if (input.not !== undefined) return { op: "not", children: [normalizeCondition(input.not)] };
+	if (typeof input.op === "string") {
+		const op = input.op.toLowerCase();
+		if (op !== "and" && op !== "or" && op !== "not") throw new Error(`unsupported group op '${input.op}'`);
+		const childrenInput = Array.isArray(input.children) ? input.children : [];
+		if (op !== "not" && childrenInput.length === 0) throw new Error(`${op} group requires children`);
+		if (op === "not" && childrenInput.length !== 1) throw new Error("not group requires exactly one child");
+		return { ...input, op, children: childrenInput.map(normalizeCondition) } as Condition;
+	}
+	if (input.type === "timer") return input as TimerCondition;
+	if (input.type === "file") {
+		if (typeof input.path !== "string" || !input.path.trim()) throw new Error("file condition requires path");
+		return input as FileCondition;
+	}
+	if (input.type === "exec") {
+		if (typeof input.command !== "string" && typeof input.code !== "string") {
+			throw new Error("exec condition requires command or code");
+		}
+		return input as ExecCondition;
+	}
+	throw new Error(`unsupported condition type '${String(input.type)}'`);
+}
+
+function isGroupCondition(condition: Condition): condition is GroupCondition {
+	return "op" in condition;
+}
+
+function conditionHasExec(condition: Condition): boolean {
+	if ("type" in condition && condition.type === "exec") return true;
+	if (isGroupCondition(condition)) return condition.children.some(conditionHasExec);
+	return false;
+}
+
+function truncateText(value: string, limit = OUTPUT_LIMIT_BYTES): string {
+	const buf = Buffer.from(value);
+	if (buf.length <= limit) return value;
+	return `${buf.subarray(0, limit).toString("utf8")}\n[truncated ${buf.length - limit} bytes]`;
+}
+
+async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root"): Promise<EvalResult> {
+	if (isGroupCondition(condition)) {
+		const op = condition.op;
+		const children = condition.children;
+		const childResults = await Promise.all(children.map((child, index) => evaluateCondition(job, child, `${key}.${index}`)));
+		if (op === "and") {
+			const value = childResults.every((result) => result.value);
+			return { value, summary: `AND(${childResults.map((r) => r.summary).join("; ")})`, details: childResults };
+		}
+		if (op === "or") {
+			const value = childResults.some((result) => result.value);
+			return { value, summary: `OR(${childResults.map((r) => r.summary).join("; ")})`, details: childResults };
+		}
+		const child = childResults[0] ?? { value: false, summary: "missing child" };
+		return { value: !child.value, summary: `NOT(${child.summary})`, details: child };
+	}
+
+	const latched = job.latches[key];
+	if (latched) return { value: true, summary: latched.summary, details: latched.details };
+
+	let result: EvalResult;
+	if (condition.type === "timer") result = evaluateTimer(job, condition);
+	else if (condition.type === "file") result = await evaluateFile(job, condition, key);
+	else if (condition.type === "exec") result = await evaluateExec(job, condition, key);
+	else result = { value: false, summary: `unknown leaf ${(condition as { type?: string }).type}` };
+
+	if (result.value) {
+		job.latches[key] = { trueAt: Date.now(), summary: result.summary, details: result.details };
+		job.updatedAt = Date.now();
+	}
+	return result;
+}
+
+function evaluateTimer(job: ReturnOnJob, condition: TimerCondition): EvalResult {
+	const afterMs = parseDuration(condition.after);
+	const afterAt = afterMs !== undefined ? job.createdAt + afterMs : undefined;
+	const at = parseAt(condition.at, job.createdAt);
+	const target = afterAt ?? at;
+	if (!target) return { value: false, summary: "timer missing after/at" };
+	const remaining = target - Date.now();
+	return remaining <= 0
+		? { value: true, summary: `timer elapsed (${nowIso(target)})` }
+		: { value: false, summary: `timer pending ${formatDuration(remaining)}` };
+}
+
+async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: string): Promise<EvalResult> {
+	const state = job.leafState[key] ??= {};
+	const everyMs = parseDuration(condition.every, DEFAULT_FILE_EVERY_MS) ?? DEFAULT_FILE_EVERY_MS;
+	const now = Date.now();
+	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
+		return { value: false, summary: state.lastSummary ?? "file check waiting for interval" };
+	}
+	state.lastCheckAt = now;
+
+	const filePath = path.resolve(job.cwd, condition.path);
+	let stat: fs.Stats | undefined;
+	try {
+		stat = await fsp.stat(filePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+
+	const checks: Array<{ ok: boolean; label: string }> = [];
+	const shouldExist = condition.exists !== false && !condition.deleted;
+	if (condition.deleted) checks.push({ ok: !stat, label: `${condition.path} deleted` });
+	else if (condition.exists !== undefined || shouldExist) checks.push({ ok: !!stat, label: `${condition.path} exists` });
+
+	if (condition.changed) {
+		if (!stat) {
+			checks.push({ ok: false, label: `${condition.path} changed` });
+		} else if (state.lastMtimeMs === undefined) {
+			state.lastMtimeMs = stat.mtimeMs;
+			checks.push({ ok: false, label: `${condition.path} changed` });
+		} else {
+			checks.push({ ok: stat.mtimeMs !== state.lastMtimeMs, label: `${condition.path} changed` });
+			state.lastMtimeMs = stat.mtimeMs;
+		}
+	}
+
+	if (condition.stableFor !== undefined) {
+		const stableForMs = parseDuration(condition.stableFor, 0) ?? 0;
+		if (!stat) {
+			state.stableSince = undefined;
+			checks.push({ ok: false, label: `${condition.path} stable for ${formatDuration(stableForMs)}` });
+		} else {
+			if (state.lastMtimeMs !== stat.mtimeMs) {
+				state.lastMtimeMs = stat.mtimeMs;
+				state.stableSince = now;
+			} else if (state.stableSince === undefined) {
+				state.stableSince = now;
+			}
+			checks.push({ ok: now - (state.stableSince ?? now) >= stableForMs, label: `${condition.path} stable for ${formatDuration(stableForMs)}` });
+		}
+	}
+
+	if (condition.contains !== undefined || condition.matches !== undefined) {
+		let text = "";
+		try {
+			text = await fsp.readFile(filePath, "utf8");
+		} catch {
+			text = "";
+		}
+		if (condition.contains !== undefined) checks.push({ ok: text.includes(condition.contains), label: `${condition.path} contains '${condition.contains}'` });
+		if (condition.matches !== undefined) checks.push({ ok: new RegExp(condition.matches).test(text), label: `${condition.path} matches /${condition.matches}/` });
+	}
+
+	const ok = checks.length > 0 && checks.every((check) => check.ok);
+	const summary = checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ") || `file ${condition.path}`;
+	state.lastSummary = summary;
+	return { value: ok, summary, details: { path: filePath } };
+}
+
+async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: string): Promise<EvalResult> {
+	const state = job.leafState[key] ??= {};
+	const everyMs = Math.max(parseDuration(condition.every, DEFAULT_EXEC_EVERY_MS) ?? DEFAULT_EXEC_EVERY_MS, MIN_EXEC_EVERY_MS);
+	const now = Date.now();
+	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
+		return { value: false, summary: state.lastSummary ?? "exec check waiting for interval" };
+	}
+	state.lastCheckAt = now;
+
+	const timeoutMs = parseDuration(condition.timeout, DEFAULT_EXEC_TIMEOUT_MS) ?? DEFAULT_EXEC_TIMEOUT_MS;
+	const runner = condition.runner ?? condition.shell ?? "sh";
+	const { command, args, display } = buildExecArgs(runner, condition);
+	const proc = await runProcess(command, args, { cwd: job.cwd, timeoutMs });
+	const output = `${proc.stdout}\n${proc.stderr}`;
+	const checks: Array<{ ok: boolean; label: string }> = [];
+	const hasExplicit = condition.success !== undefined || condition.failure !== undefined || condition.exitCode !== undefined
+		|| condition.stdoutContains !== undefined || condition.stderrContains !== undefined || condition.outputContains !== undefined
+		|| condition.stdoutMatches !== undefined || condition.stderrMatches !== undefined || condition.outputMatches !== undefined;
+	if (!hasExplicit || condition.success === true) checks.push({ ok: proc.code === 0, label: "exit 0" });
+	if (condition.failure === true) checks.push({ ok: proc.code !== 0, label: "non-zero exit" });
+	if (condition.exitCode !== undefined) checks.push({ ok: proc.code === condition.exitCode, label: `exit ${condition.exitCode}` });
+	if (condition.stdoutContains !== undefined) checks.push({ ok: proc.stdout.includes(condition.stdoutContains), label: `stdout contains '${condition.stdoutContains}'` });
+	if (condition.stderrContains !== undefined) checks.push({ ok: proc.stderr.includes(condition.stderrContains), label: `stderr contains '${condition.stderrContains}'` });
+	if (condition.outputContains !== undefined) checks.push({ ok: output.includes(condition.outputContains), label: `output contains '${condition.outputContains}'` });
+	if (condition.stdoutMatches !== undefined) checks.push({ ok: new RegExp(condition.stdoutMatches).test(proc.stdout), label: `stdout matches /${condition.stdoutMatches}/` });
+	if (condition.stderrMatches !== undefined) checks.push({ ok: new RegExp(condition.stderrMatches).test(proc.stderr), label: `stderr matches /${condition.stderrMatches}/` });
+	if (condition.outputMatches !== undefined) checks.push({ ok: new RegExp(condition.outputMatches).test(output), label: `output matches /${condition.outputMatches}/` });
+
+	const ok = checks.every((check) => check.ok);
+	const summary = `${display} => code ${proc.code}${proc.timedOut ? " (timed out)" : ""}; ${checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ")}`;
+	state.lastSummary = summary;
+	return {
+		value: ok,
+		summary,
+		details: { code: proc.code, timedOut: proc.timedOut, stdout: truncateText(proc.stdout), stderr: truncateText(proc.stderr) },
+	};
+}
+
+function buildExecArgs(runner: Runner, condition: ExecCondition): { command: string; args: string[]; display: string } {
+	if (condition.code !== undefined) {
+		if (runner === "python") return { command: "python3", args: ["-c", condition.code], display: "python -c <code>" };
+		if (runner === "node") return { command: "node", args: ["-e", condition.code], display: "node -e <code>" };
+		if (runner === "xonsh") return { command: "xonsh", args: ["-c", condition.code], display: "xonsh -c <code>" };
+		if (runner === "bash") return { command: "bash", args: ["-lc", condition.code], display: "bash -lc <code>" };
+		return { command: "sh", args: ["-lc", condition.code], display: "sh -lc <code>" };
+	}
+	const commandText = condition.command ?? "";
+	if (runner === "bash") return { command: "bash", args: ["-lc", commandText], display: commandText };
+	if (runner === "xonsh") return { command: "xonsh", args: ["-c", commandText], display: commandText };
+	if (runner === "python") return { command: "python3", args: [commandText], display: `python ${commandText}` };
+	if (runner === "node") return { command: "node", args: [commandText], display: `node ${commandText}` };
+	return { command: "sh", args: ["-lc", commandText], display: commandText };
+}
+
+function runProcess(command: string, args: string[], options: { cwd: string; timeoutMs: number }): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+	return new Promise((resolve) => {
+		const child = spawn(command, args, { cwd: options.cwd, env: process.env });
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			setTimeout(() => child.kill("SIGKILL"), 1000).unref?.();
+		}, options.timeoutMs);
+		timer.unref?.();
+		child.stdout.on("data", (chunk) => { if (Buffer.byteLength(stdout) < OUTPUT_LIMIT_BYTES) stdout += chunk.toString(); });
+		child.stderr.on("data", (chunk) => { if (Buffer.byteLength(stderr) < OUTPUT_LIMIT_BYTES) stderr += chunk.toString(); });
+		child.on("error", (error) => {
+			clearTimeout(timer);
+			resolve({ code: 127, stdout: "", stderr: String(error), timedOut });
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({ code, stdout: truncateText(stdout), stderr: truncateText(stderr), timedOut });
+		});
+	});
+}
+
+async function tick(pi: ExtensionAPI): Promise<void> {
+	if (ticking) return;
+	ticking = true;
+	try {
+		let changed = false;
+		for (const job of activeJobsForCurrentSession()) {
+			const now = Date.now();
+			if (job.timeoutAt && now >= job.timeoutAt) {
+				await fireJob(pi, job, "timeout");
+				changed = true;
+				continue;
+			}
+			try {
+				const result = await evaluateCondition(job, job.condition);
+				if (result.value) {
+					await fireJob(pi, job, result.summary);
+					changed = true;
+				} else if (Object.keys(job.latches).length > 0) {
+					changed = true;
+				}
+			} catch (error) {
+				job.leafState.root = { ...job.leafState.root, lastSummary: `evaluation error: ${error instanceof Error ? error.message : String(error)}` };
+				job.updatedAt = now;
+				changed = true;
+			}
+		}
+		if (changed) await saveJobs();
+		ensureTicker(pi);
+	} finally {
+		ticking = false;
+	}
+}
+
+async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Promise<void> {
+	if (job.status !== "active") return;
+	job.status = "fired";
+	job.firedAt = Date.now();
+	job.updatedAt = job.firedAt;
+	job.fireReason = reason;
+	await saveJobs();
+	const message = formatFireMessage(job, reason);
+	try {
+		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt });
+	} catch {
+		// Best-effort audit trail.
+	}
+	pi.sendMessage(
+		{
+			customType: EXTENSION_NAME,
+			content: message,
+			display: true,
+			details: { id: job.id, label: job.label, reason, latches: job.latches },
+		},
+		{ triggerTurn: true },
+	);
+}
+
+function formatFireMessage(job: ReturnOnJob, reason: string): string {
+	const latched = Object.entries(job.latches)
+		.map(([key, latch]) => `- ${key}: ${latch.summary} at ${nowIso(latch.trueAt)}`)
+		.join("\n") || "- none";
+	return [
+		`return_on fired: ${job.label} (${job.id})`,
+		`Reason: ${reason}`,
+		`Created: ${nowIso(job.createdAt)}`,
+		`Fired: ${nowIso(job.firedAt ?? Date.now())}`,
+		`CWD: ${job.cwd}`,
+		"",
+		"Latched leaves:",
+		latched,
+		"",
+		"Resume instruction:",
+		job.resume,
+	].join("\n");
+}
+
+function summarizeJob(job: ReturnOnJob): string {
+	const timeout = job.timeoutAt ? ` timeout=${nowIso(job.timeoutAt)}` : "";
+	return `${job.id} [${job.status}] ${job.label}${timeout} cwd=${job.cwd}`;
+}
+
+function commandReply(content: string): void {
+	try {
+		// Commands are for humans, but showing the result in the transcript is useful.
+		(latestCtx as unknown);
+	} catch {
+		// no-op
+	}
+}
+
+export default function (pi: ExtensionAPI) {
+	pi.registerMessageRenderer?.(EXTENSION_NAME, (message, _options, theme) => {
+		return new Text(theme.fg("accent", "⏰ return_on\n") + message.content, 0, 0);
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		latestCtx = ctx;
+		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+		await loadJobs();
+		ensureTicker(pi);
+		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
+			ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		stopTicker();
+		latestCtx = undefined;
+	});
+
+	pi.registerCommand("return-on-list", {
+		description: "List active/completed return_on jobs for this session",
+		handler: async (_args, ctx) => {
+			latestCtx = ctx;
+			await loadJobs();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const relevant = jobs.filter((job) => !job.sessionFile || !session || job.sessionFile === session);
+			const text = relevant.length ? relevant.map(summarizeJob).join("\n") : "No return_on jobs for this session.";
+			ctx.ui.notify(text, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-status", {
+		description: "Show details for a return_on job: /return-on-status <id>",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			await loadJobs();
+			const id = args.trim();
+			const job = jobs.find((candidate) => candidate.id === id);
+			if (!job) {
+				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
+				return;
+			}
+			ctx.ui.notify(`${summarizeJob(job)}\n${JSON.stringify({ latches: job.latches, leafState: job.leafState }, null, 2)}`, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-cancel", {
+		description: "Cancel a return_on job: /return-on-cancel <id>",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			await loadJobs();
+			const id = args.trim();
+			const job = jobs.find((candidate) => candidate.id === id);
+			if (!job) {
+				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
+				return;
+			}
+			job.status = "cancelled";
+			job.cancelledAt = Date.now();
+			job.updatedAt = job.cancelledAt;
+			await saveJobs();
+			ensureTicker(pi);
+			ctx.ui.notify(`Cancelled ${id}`, "info");
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on",
+		label: "Return On",
+		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, and exec leaves plus and/or/not groups.",
+		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
+		promptGuidelines: [
+			"Use return_on when waiting for time, files, logs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
+			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
+			"return_on exec leaves run arbitrary local commands; set allowExec only when the user approved the command or after confirmation.",
+		],
+		parameters: Type.Object({
+			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
+			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/exec." }),
+			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
+			timeout: Type.Optional(Type.String({ description: "Optional max time before waking anyway, e.g. '30m'" })),
+			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+			await loadJobs();
+			const condition = normalizeCondition(params.condition);
+			const hasExec = conditionHasExec(condition);
+			let allowExec = params.allowExec === true;
+			if (hasExec && !allowExec) {
+				if (!ctx.hasUI) {
+					throw new Error("return_on condition contains exec leaves. Set allowExec=true only after user approval.");
+				}
+				allowExec = await ctx.ui.confirm("Allow return_on exec watcher?", "This watcher can run arbitrary local commands repeatedly. Approve it?", { timeout: 30_000 });
+				if (!allowExec) throw new Error("User did not approve exec watcher.");
+			}
+
+			const timeoutMs = parseDuration(params.timeout);
+			const job: ReturnOnJob = {
+				id: makeId(),
+				label: params.label?.trim() || "return_on watcher",
+				cwd: ctx.cwd,
+				sessionFile: currentSessionFile,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+				status: "active",
+				condition,
+				resume: params.resume,
+				...(timeoutMs !== undefined ? { timeoutAt: Date.now() + timeoutMs } : {}),
+				allowExec,
+				latches: {},
+				leafState: {},
+			};
+			jobs.push(job);
+			await saveJobs();
+			try {
+				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
+			} catch {
+				// Best-effort audit trail.
+			}
+			ensureTicker(pi);
+			return {
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}. I will wake the session when it fires; do not poll or wait manually.` }],
+				details: { job },
+				terminate: true,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on_cancel",
+		label: "Cancel Return On",
+		description: "Cancel a background return_on watcher by id.",
+		parameters: Type.Object({ id: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			await loadJobs();
+			const job = jobs.find((candidate) => candidate.id === params.id);
+			if (!job) throw new Error(`No return_on job found for '${params.id}'`);
+			job.status = "cancelled";
+			job.cancelledAt = Date.now();
+			job.updatedAt = job.cancelledAt;
+			await saveJobs();
+			ensureTicker(pi);
+			return { content: [{ type: "text", text: `Cancelled ${job.id}.` }], details: { job } };
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on_list",
+		label: "List Return On",
+		description: "List return_on watcher jobs for this session.",
+		parameters: Type.Object({ status: Type.Optional(StringEnum(["active", "fired", "cancelled", "all"] as const)) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			await loadJobs();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const status = params.status ?? "active";
+			const relevant = jobs.filter((job) => (!job.sessionFile || !session || job.sessionFile === session) && (status === "all" || job.status === status));
+			return {
+				content: [{ type: "text", text: relevant.length ? relevant.map(summarizeJob).join("\n") : `No ${status} return_on jobs.` }],
+				details: { jobs: relevant },
+			};
+		},
+	});
+}
