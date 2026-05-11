@@ -161,7 +161,8 @@ async function testLogContains(harness: Harness) {
   await fs.writeFile(log, "booting\n", "utf8");
   const jobId = await harness.register({
     label,
-    condition: { type: "file", path: "server.log", contains: "READY", every: "100ms" },
+    every: "100ms",
+    condition: { type: "file", path: "server.log", contains: "READY" },
     resume,
   });
   await expectNoWake(harness, jobId, 800, "log fired before READY was appended");
@@ -191,8 +192,7 @@ async function testProcessGone(harness: Harness) {
   const child = spawn("sleep", ["2"], { stdio: "ignore" });
   const jobId = await harness.register({
     label,
-    allowExec: true,
-    condition: { type: "exec", runner: "sh", command: `kill -0 ${child.pid}`, failure: true, every: "2s", timeout: "1s" },
+    condition: { type: "process", pid: child.pid, exited: true, every: "2s" },
     resume,
   });
   await expectNoWake(harness, jobId, 1_000, "process watcher fired while process was alive");
@@ -215,18 +215,37 @@ async function testPortOpen(harness: Harness) {
   const server = spawn("node", [serverScript], { cwd, stdio: "ignore" });
   const jobId = await harness.register({
     label,
-    allowExec: true,
-    condition: {
-      type: "exec",
-      runner: "node",
-      code: `const net=require('node:net'); const s=net.connect({port:${port}, host:'127.0.0.1'},()=>{s.destroy(); process.exit(0)}); s.on('error',()=>process.exit(1)); setTimeout(()=>process.exit(1),300);`,
-      success: true,
-      every: "2s",
-      timeout: "1s"
-    },
+    condition: { type: "port", host: "127.0.0.1", port, open: true, every: "2s", timeout: "1s" },
     resume,
   });
   await expectNoWake(harness, jobId, 800, "port watcher fired before server started");
+  await waitForWake(harness, { jobId, label, resume }, 6_000);
+  server.kill("SIGTERM");
+}
+
+async function testUrlReady(harness: Harness) {
+  const label = "smoke url ready";
+  const resume = "url ready resume";
+  const serverScript = path.join(cwd, "url-server.mjs");
+  const port = await getFreePort();
+  await fs.writeFile(serverScript, `
+    import http from 'node:http';
+    setTimeout(() => {
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('healthy');
+      });
+      server.listen(${port}, '127.0.0.1');
+      setTimeout(() => server.close(() => process.exit(0)), 4000);
+    }, 1200);
+  `, "utf8");
+  const server = spawn("node", [serverScript], { cwd, stdio: "ignore" });
+  const jobId = await harness.register({
+    label,
+    condition: { type: "url", url: `http://127.0.0.1:${port}/health`, status: 200, bodyContains: "healthy", every: "2s", timeout: "1s" },
+    resume,
+  });
+  await expectNoWake(harness, jobId, 800, "url watcher fired before server started");
   await waitForWake(harness, { jobId, label, resume }, 6_000);
   server.kill("SIGTERM");
 }
@@ -438,6 +457,7 @@ await testLogContains(harness);
 await testFileStable(harness);
 await testProcessGone(harness);
 await testPortOpen(harness);
+await testUrlReady(harness);
 await testFileExistsFalse(harness);
 await testNotConditionAfterDelete(harness);
 await testNotExecAfterDelete(harness);

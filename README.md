@@ -8,8 +8,11 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 
 - **Time** — after a duration or at a clock/date time.
 - **Files/logs** — exists, absent, deleted, changed, stable for a duration, contains text, matches regex.
+- **Processes** — pid running/exited, process name, command substring, or `/proc` regex match.
+- **Ports** — TCP port open/closed checks without shelling out.
+- **URLs** — HTTP status and optional body text/regex checks.
 - **Commands** — shell/bash/xonsh/python/node checks by exit code or output match.
-- **Processes/ports/URLs/agents** — via `exec` checks, e.g. `kill -0`, TCP probes, `curl`, or watching a result file.
+- **Agents/subagents** — usually by watching a result file or URL; `exec` remains available for custom integrations.
 - **Nested logic** — `and`, `or`, `not`, plus shorthand `all`, `any`, `not`.
 
 ## Tools
@@ -31,6 +34,7 @@ Slash commands:
   "label": "wait for render",
   "condition": { "type": "file", "path": "out/video.mp4", "stableFor": "10s" },
   "resume": "Continue now that the render output is ready.",
+  "every": "2s",
   "timeout": "30m",
   "allowExec": false
 }
@@ -41,6 +45,7 @@ Slash commands:
 | `label` | no | Short human-readable watcher name. |
 | `condition` | yes | Condition tree or leaf condition. |
 | `resume` | yes | Instruction included in the wake message. |
+| `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
@@ -48,7 +53,7 @@ Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `
 
 ## Polling with `every`
 
-File and exec leaves support `every`:
+File, process, port, URL, and exec leaves support `every`. A top-level `every` on `return_on` is inherited by leaves unless the leaf overrides it:
 
 ```json
 { "type": "file", "path": "build.log", "contains": "Done", "every": "2s" }
@@ -61,6 +66,9 @@ File and exec leaves support `every`:
 Defaults:
 
 - file checks: `1s`
+- process checks: `2s`
+- port checks: `2s`
+- URL checks: `5s`
 - exec checks: `5s`
 - exec checks are clamped to a minimum of `2s`
 
@@ -148,9 +156,37 @@ Supported fields:
 | `matches` | File text matches this JavaScript regex. |
 | `every` | Polling interval. |
 
+### Process
+
+```json
+{ "type": "process", "pid": 12345, "exited": true, "every": "2s" }
+```
+
+```json
+{ "type": "process", "name": "node", "running": true }
+```
+
+Supported fields: `pid`, `name`, `commandContains`, `matches`, `running`, `exited`, `state`, and `every`.
+
+### Port
+
+```json
+{ "type": "port", "host": "127.0.0.1", "port": 3000, "open": true, "every": "2s" }
+```
+
+Supported fields: `port`, `host`, `open`, `closed`, `timeout`, and `every`.
+
+### URL
+
+```json
+{ "type": "url", "url": "http://127.0.0.1:3000/health", "status": 200, "bodyContains": "ok", "every": "5s" }
+```
+
+Supported fields: `url`, `method`, `status`, `ok`, `bodyContains`, `bodyMatches`, `timeout`, and `every`.
+
 ### Exec
 
-Exec leaves run local commands. They are powerful and risky: commands run as the current user. The extension asks for confirmation in interactive mode unless `allowExec: true` is provided after explicit user approval.
+Exec leaves run local commands. They are powerful and risky: commands run as the current user. Prefer first-class `file`, `process`, `port`, and `url` leaves when possible. The extension asks for confirmation in interactive mode unless `allowExec: true` is provided after explicit user approval.
 
 ```json
 { "type": "exec", "runner": "sh", "command": "grep -q Ready server.log", "success": true, "every": "5s" }
@@ -223,8 +259,7 @@ Stdout/stderr are truncated in job details to avoid unbounded state growth.
 ```json
 {
   "label": "node process exited",
-  "allowExec": true,
-  "condition": { "type": "exec", "command": "kill -0 12345", "failure": true, "every": "2s" },
+  "condition": { "type": "process", "pid": 12345, "exited": true, "every": "2s" },
   "resume": "The process is gone; inspect its output and continue."
 }
 ```
@@ -234,8 +269,7 @@ Stdout/stderr are truncated in job details to avoid unbounded state growth.
 ```json
 {
   "label": "local server port open",
-  "allowExec": true,
-  "condition": { "type": "exec", "command": "nc -z 127.0.0.1 3000", "success": true, "every": "2s" },
+  "condition": { "type": "port", "host": "127.0.0.1", "port": 3000, "open": true, "every": "2s" },
   "resume": "Port 3000 is open; run the browser/API checks."
 }
 ```
@@ -245,8 +279,7 @@ Stdout/stderr are truncated in job details to avoid unbounded state growth.
 ```json
 {
   "label": "health check ready",
-  "allowExec": true,
-  "condition": { "type": "exec", "command": "curl -fsS http://127.0.0.1:3000/health", "success": true, "every": "5s", "timeout": "2s" },
+  "condition": { "type": "url", "url": "http://127.0.0.1:3000/health", "status": 200, "every": "5s", "timeout": "2s" },
   "resume": "The health check passes; continue integration testing."
 }
 ```
@@ -288,7 +321,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, stable files, process-gone checks, port-open checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 
@@ -296,10 +329,10 @@ For manual development checks, run the smoke suite directly and inspect the temp
 npm run smoke
 ```
 
-The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, registers the tools and commands, emits `session_start` / `session_shutdown`, and waits for real timer/file/exec wake messages.
+The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, registers the tools and commands, emits `session_start` / `session_shutdown`, and waits for real timer/file/process/port/url/exec wake messages.
 
 ## Current limitations
 
-- Process, port, URL, and agent watchers are currently expressed through `exec` or file checks rather than dedicated first-class leaf types.
-- Exec checks are polling-based, not event-driven.
+- Agent/subagent watchers are currently expressed through file, URL, or exec checks rather than a dedicated first-class leaf type.
+- Checks are polling-based, not event-driven.
 - Background commands should be treated as trusted local code.

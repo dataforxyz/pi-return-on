@@ -3,6 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
+import * as net from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -15,6 +16,11 @@ const DEFAULT_TICK_MS = 1000;
 const DEFAULT_EXEC_EVERY_MS = 5000;
 const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
 const DEFAULT_FILE_EVERY_MS = 1000;
+const DEFAULT_PROCESS_EVERY_MS = 2000;
+const DEFAULT_PORT_EVERY_MS = 2000;
+const DEFAULT_URL_EVERY_MS = 5000;
+const DEFAULT_PORT_TIMEOUT_MS = 1000;
+const DEFAULT_URL_TIMEOUT_MS = 5000;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 
@@ -23,7 +29,7 @@ type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
 
 const SUPPORTED_RUNNERS = new Set<Runner>(["sh", "bash", "xonsh", "python", "node"]);
 
-type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition;
+type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition | ProcessCondition | PortCondition | UrlCondition;
 
 interface GroupCondition extends Record<string, unknown> {
 	op: GroupOp;
@@ -67,6 +73,40 @@ interface ExecCondition extends Record<string, unknown> {
 	outputMatches?: string;
 }
 
+interface ProcessCondition extends Record<string, unknown> {
+	type: "process";
+	pid?: number;
+	name?: string;
+	commandContains?: string;
+	matches?: string;
+	state?: "running" | "exited";
+	running?: boolean;
+	exited?: boolean;
+	every?: string | number;
+}
+
+interface PortCondition extends Record<string, unknown> {
+	type: "port";
+	port: number;
+	host?: string;
+	open?: boolean;
+	closed?: boolean;
+	timeout?: string | number;
+	every?: string | number;
+}
+
+interface UrlCondition extends Record<string, unknown> {
+	type: "url";
+	url: string;
+	method?: string;
+	status?: number | number[];
+	ok?: boolean;
+	bodyContains?: string;
+	bodyMatches?: string;
+	timeout?: string | number;
+	every?: string | number;
+}
+
 interface LeafLatch {
 	trueAt: number;
 	summary: string;
@@ -93,6 +133,7 @@ interface ReturnOnJob {
 	resume: string;
 	timeoutAt?: number;
 	allowExec?: boolean;
+	every?: string | number;
 	latches: Record<string, LeafLatch>;
 	leafState: Record<string, LeafState>;
 	fireReason?: string;
@@ -155,6 +196,10 @@ function parseDuration(input: string | number | undefined, fallbackMs?: number):
 		days: 86_400_000,
 	};
 	return Math.max(0, Math.round(value * (multipliers[unit] ?? 1)));
+}
+
+function getPollingInterval(job: ReturnOnJob, conditionEvery: string | number | undefined, fallbackMs: number, minMs = 0): number {
+	return Math.max(parseDuration(conditionEvery ?? job.every, fallbackMs) ?? fallbackMs, minMs);
 }
 
 function parseAt(input: string | number | undefined, createdAt: number): number | undefined {
@@ -267,6 +312,30 @@ function normalizeCondition(input: unknown): Condition {
 		}
 		return input as ExecCondition;
 	}
+	if (input.type === "process") {
+		if (input.pid !== undefined && (typeof input.pid !== "number" || !Number.isInteger(input.pid) || input.pid <= 0)) {
+			throw new Error("process condition pid must be a positive integer");
+		}
+		if (input.pid === undefined && typeof input.name !== "string" && typeof input.commandContains !== "string" && typeof input.matches !== "string") {
+			throw new Error("process condition requires pid, name, commandContains, or matches");
+		}
+		return input as ProcessCondition;
+	}
+	if (input.type === "port") {
+		if (typeof input.port !== "number" || !Number.isInteger(input.port) || input.port <= 0 || input.port > 65535) {
+			throw new Error("port condition requires port between 1 and 65535");
+		}
+		return input as PortCondition;
+	}
+	if (input.type === "url") {
+		if (typeof input.url !== "string" || !input.url.trim()) throw new Error("url condition requires url");
+		try {
+			new URL(input.url);
+		} catch {
+			throw new Error(`url condition has invalid url '${String(input.url)}'`);
+		}
+		return input as UrlCondition;
+	}
 	throw new Error(`unsupported condition type '${String(input.type)}'`);
 }
 
@@ -312,6 +381,9 @@ async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "
 	if (condition.type === "timer") result = evaluateTimer(job, condition);
 	else if (condition.type === "file") result = await evaluateFile(job, condition, key);
 	else if (condition.type === "exec") result = await evaluateExec(job, condition, key);
+	else if (condition.type === "process") result = await evaluateProcess(job, condition, key);
+	else if (condition.type === "port") result = await evaluatePort(job, condition, key);
+	else if (condition.type === "url") result = await evaluateUrl(job, condition, key);
 	else result = { value: false, summary: `unknown leaf ${(condition as { type?: string }).type}` };
 
 	if (latchLeaves && result.value) {
@@ -335,7 +407,7 @@ function evaluateTimer(job: ReturnOnJob, condition: TimerCondition): EvalResult 
 
 async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: string): Promise<EvalResult> {
 	const state = job.leafState[key] ??= {};
-	const everyMs = parseDuration(condition.every, DEFAULT_FILE_EVERY_MS) ?? DEFAULT_FILE_EVERY_MS;
+	const everyMs = getPollingInterval(job, condition.every, DEFAULT_FILE_EVERY_MS);
 	const now = Date.now();
 	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
 		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "file check waiting for interval" };
@@ -405,7 +477,7 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 
 async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: string): Promise<EvalResult> {
 	const state = job.leafState[key] ??= {};
-	const everyMs = Math.max(parseDuration(condition.every, DEFAULT_EXEC_EVERY_MS) ?? DEFAULT_EXEC_EVERY_MS, MIN_EXEC_EVERY_MS);
+	const everyMs = getPollingInterval(job, condition.every, DEFAULT_EXEC_EVERY_MS, MIN_EXEC_EVERY_MS);
 	const now = Date.now();
 	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
 		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "exec check waiting for interval" };
@@ -440,6 +512,152 @@ async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: str
 		summary,
 		details: { code: proc.code, timedOut: proc.timedOut, stdout: truncateText(proc.stdout), stderr: truncateText(proc.stderr) },
 	};
+}
+
+async function evaluateProcess(job: ReturnOnJob, condition: ProcessCondition, key: string): Promise<EvalResult> {
+	const state = job.leafState[key] ??= {};
+	const everyMs = getPollingInterval(job, condition.every, DEFAULT_PROCESS_EVERY_MS);
+	const now = Date.now();
+	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
+		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "process check waiting for interval" };
+	}
+	state.lastCheckAt = now;
+
+	const running = await isProcessRunning(condition);
+	const wantsRunning = condition.exited === true || condition.state === "exited" ? false : condition.running ?? true;
+	const ok = wantsRunning ? running : !running;
+	const target = wantsRunning ? "running" : "exited";
+	const subject = condition.pid !== undefined
+		? `pid ${condition.pid}`
+		: condition.name
+			? `process name '${condition.name}'`
+			: condition.commandContains
+				? `command contains '${condition.commandContains}'`
+				: `process matches /${condition.matches}/`;
+	const summary = `${subject} is ${running ? "running" : "not running"}; target ${target}`;
+	state.lastSummary = summary;
+	state.lastValue = ok;
+	return { value: ok, summary, details: { running, target } };
+}
+
+async function isProcessRunning(condition: ProcessCondition): Promise<boolean> {
+	if (condition.pid !== undefined) {
+		try {
+			process.kill(condition.pid, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+
+	let matcher: RegExp | undefined;
+	if (condition.matches) matcher = new RegExp(condition.matches);
+	try {
+		const entries = await fsp.readdir("/proc", { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+			const procDir = path.join("/proc", entry.name);
+			let comm = "";
+			let cmdline = "";
+			try {
+				comm = (await fsp.readFile(path.join(procDir, "comm"), "utf8")).trim();
+			} catch {
+				// Ignore processes that exit or deny reads while scanning.
+			}
+			try {
+				cmdline = (await fsp.readFile(path.join(procDir, "cmdline"), "utf8")).replace(/\0/g, " ").trim();
+			} catch {
+				// Ignore processes that exit or deny reads while scanning.
+			}
+			const haystack = `${comm}\n${cmdline}`;
+			if (condition.name && comm === condition.name) return true;
+			if (condition.commandContains && cmdline.includes(condition.commandContains)) return true;
+			if (matcher?.test(haystack)) return true;
+		}
+	} catch {
+		return false;
+	}
+	return false;
+}
+
+async function evaluatePort(job: ReturnOnJob, condition: PortCondition, key: string): Promise<EvalResult> {
+	const state = job.leafState[key] ??= {};
+	const everyMs = getPollingInterval(job, condition.every, DEFAULT_PORT_EVERY_MS);
+	const now = Date.now();
+	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
+		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "port check waiting for interval" };
+	}
+	state.lastCheckAt = now;
+
+	const host = condition.host ?? "127.0.0.1";
+	const timeoutMs = parseDuration(condition.timeout, DEFAULT_PORT_TIMEOUT_MS) ?? DEFAULT_PORT_TIMEOUT_MS;
+	const open = await isPortOpen(host, condition.port, timeoutMs);
+	const wantsOpen = condition.closed === true ? false : condition.open !== false;
+	const ok = wantsOpen ? open : !open;
+	const summary = `${host}:${condition.port} is ${open ? "open" : "closed"}; target ${wantsOpen ? "open" : "closed"}`;
+	state.lastSummary = summary;
+	state.lastValue = ok;
+	return { value: ok, summary, details: { host, port: condition.port, open } };
+}
+
+function isPortOpen(host: string, port: number, timeoutMs: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const socket = net.createConnection({ host, port });
+		let settled = false;
+		const finish = (open: boolean) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			resolve(open);
+		};
+		socket.setTimeout(timeoutMs, () => finish(false));
+		socket.once("connect", () => finish(true));
+		socket.once("error", () => finish(false));
+	});
+}
+
+async function evaluateUrl(job: ReturnOnJob, condition: UrlCondition, key: string): Promise<EvalResult> {
+	const state = job.leafState[key] ??= {};
+	const everyMs = getPollingInterval(job, condition.every, DEFAULT_URL_EVERY_MS);
+	const now = Date.now();
+	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
+		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "url check waiting for interval" };
+	}
+	state.lastCheckAt = now;
+
+	const timeoutMs = parseDuration(condition.timeout, DEFAULT_URL_TIMEOUT_MS) ?? DEFAULT_URL_TIMEOUT_MS;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	timer.unref?.();
+	try {
+		const response = await fetch(condition.url, { method: condition.method ?? "GET", signal: controller.signal });
+		let body = "";
+		const needsBody = condition.bodyContains !== undefined || condition.bodyMatches !== undefined;
+		if (needsBody) body = truncateText(await response.text());
+		const checks: Array<{ ok: boolean; label: string }> = [];
+		if (condition.status !== undefined) {
+			const statuses = Array.isArray(condition.status) ? condition.status : [condition.status];
+			checks.push({ ok: statuses.includes(response.status), label: `status in ${statuses.join(",")}` });
+		} else if (condition.ok !== false) {
+			checks.push({ ok: response.ok, label: "2xx status" });
+		} else {
+			checks.push({ ok: !response.ok, label: "non-2xx status" });
+		}
+		if (condition.bodyContains !== undefined) checks.push({ ok: body.includes(condition.bodyContains), label: `body contains '${condition.bodyContains}'` });
+		if (condition.bodyMatches !== undefined) checks.push({ ok: new RegExp(condition.bodyMatches).test(body), label: `body matches /${condition.bodyMatches}/` });
+		const ok = checks.every((check) => check.ok);
+		const summary = `${condition.url} => ${response.status}; ${checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ")}`;
+		state.lastSummary = summary;
+		state.lastValue = ok;
+		return { value: ok, summary, details: { status: response.status, ok: response.ok, body } };
+	} catch (error) {
+		const summary = `${condition.url} request failed: ${error instanceof Error ? error.message : String(error)}`;
+		state.lastSummary = summary;
+		state.lastValue = false;
+		return { value: false, summary };
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function buildExecArgs(runner: Runner, condition: ExecCondition): { command: string; args: string[]; display: string } {
@@ -643,17 +861,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "return_on",
 		label: "Return On",
-		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, and exec leaves plus and/or/not groups.",
+		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, process, port, url, and exec leaves plus and/or/not groups.",
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
-			"Use return_on when waiting for time, files, logs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
+			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
-			"return_on exec leaves run arbitrary local commands; set allowExec only when the user approved the command or after confirmation.",
+			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only when the user approved the command or after confirmation.",
 		],
 		parameters: Type.Object({
 			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
-			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/exec." }),
+			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/process/port/url/exec." }),
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
+			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 		}),
@@ -685,6 +904,7 @@ export default function (pi: ExtensionAPI) {
 				resume: params.resume,
 				...(timeoutMs !== undefined ? { timeoutAt: Date.now() + timeoutMs } : {}),
 				allowExec,
+				...(params.every !== undefined ? { every: params.every } : {}),
 				latches: {},
 				leafState: {},
 			};
