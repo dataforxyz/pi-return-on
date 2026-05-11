@@ -51,6 +51,12 @@ Slash commands:
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
 
+## Event-driven when possible, polling as fallback
+
+File/log leaves use native `fs.watch` on parent directories when available, so file creation/modification/deletion can trigger an immediate re-evaluation instead of waiting for the next polling interval. If native watching is unavailable, or if the parent directory does not exist yet, the regular polling ticker still handles the watcher.
+
+Process, port, URL, and exec leaves remain polling-based.
+
 ## Polling with `every`
 
 File, process, port, URL, and exec leaves support `every`. A top-level `every` on `return_on` is inherited by leaves unless the leaf overrides it:
@@ -321,7 +327,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 
@@ -334,5 +340,5 @@ The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, reg
 ## Current limitations
 
 - Agent/subagent watchers are currently expressed through file, URL, or exec checks rather than a dedicated first-class leaf type.
-- Checks are polling-based, not event-driven.
+- File checks are event-assisted with polling fallback; process, port, URL, and exec checks are polling-based.
 - Background commands should be treated as trusted local code.

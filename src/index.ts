@@ -152,11 +152,22 @@ interface EvalResult {
 	details?: unknown;
 }
 
+interface FileWatchTarget {
+	jobId: string;
+	key: string;
+	filePath: string;
+	dir: string;
+	basename: string;
+}
+
 let jobs: ReturnOnJob[] = [];
 let currentSessionFile: string | undefined;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
+let immediateTickTimer: ReturnType<typeof setTimeout> | undefined;
 let latestCtx: ExtensionContext | undefined;
 let ticking = false;
+let fileWatchSignature = "";
+let fileWatchers = new Map<string, fs.FSWatcher>();
 
 function nowIso(ts = Date.now()): string {
 	return new Date(ts).toISOString();
@@ -270,9 +281,29 @@ function stopTicker(): void {
 	tickTimer = undefined;
 }
 
+function requestImmediateTick(pi: ExtensionAPI): void {
+	if (immediateTickTimer) return;
+	immediateTickTimer = setTimeout(() => {
+		immediateTickTimer = undefined;
+		void tick(pi);
+	}, 0);
+	immediateTickTimer.unref?.();
+}
+
+function stopFileWatchers(): void {
+	for (const watcher of fileWatchers.values()) watcher.close();
+	fileWatchers = new Map();
+	fileWatchSignature = "";
+}
+
 function ensureTicker(pi: ExtensionAPI): void {
-	if (activeJobsForCurrentSession().length > 0) startTicker(pi);
-	else stopTicker();
+	if (activeJobsForCurrentSession().length > 0) {
+		startTicker(pi);
+		reconcileFileWatchers(pi);
+	} else {
+		stopTicker();
+		stopFileWatchers();
+	}
 	updateStatus();
 }
 
@@ -341,6 +372,58 @@ function normalizeCondition(input: unknown): Condition {
 
 function isGroupCondition(condition: Condition): condition is GroupCondition {
 	return "op" in condition;
+}
+
+function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
+	if (isGroupCondition(condition)) {
+		condition.children.forEach((child, index) => collectFileWatchTargets(job, child, `${key}.${index}`, targets));
+		return targets;
+	}
+	if (condition.type === "file") {
+		const filePath = path.resolve(job.cwd, condition.path);
+		targets.push({ jobId: job.id, key, filePath, dir: path.dirname(filePath), basename: path.basename(filePath) });
+	}
+	return targets;
+}
+
+function reconcileFileWatchers(pi: ExtensionAPI): void {
+	const targets = activeJobsForCurrentSession().flatMap((job) => collectFileWatchTargets(job));
+	const groups = new Map<string, FileWatchTarget[]>();
+	for (const target of targets) {
+		const group = groups.get(target.dir) ?? [];
+		group.push(target);
+		groups.set(target.dir, group);
+	}
+	const signature = [...groups.entries()]
+		.map(([dir, group]) => `${dir}\0${group.map((target) => `${target.jobId}:${target.key}:${target.basename}`).sort().join("|")}`)
+		.sort()
+		.join("\n");
+	if (signature === fileWatchSignature) return;
+	stopFileWatchers();
+	fileWatchSignature = signature;
+
+	for (const [dir, group] of groups) {
+		try {
+			const watcher = fs.watch(dir, (_event, filename) => {
+				const changedName = filename ? path.basename(filename.toString()) : undefined;
+				for (const target of group) {
+					if (changedName && changedName !== target.basename) continue;
+					const job = jobs.find((candidate) => candidate.id === target.jobId && candidate.status === "active");
+					if (!job) continue;
+					const state = job.leafState[target.key] ??= {};
+					state.lastCheckAt = 0;
+				}
+				requestImmediateTick(pi);
+			});
+			watcher.on("error", () => {
+				watcher.close();
+				fileWatchers.delete(dir);
+			});
+			fileWatchers.set(dir, watcher);
+		} catch {
+			// Fall back to the normal polling ticker when native file watching is unavailable.
+		}
+	}
 }
 
 function conditionHasExec(condition: Condition): boolean {
@@ -808,6 +891,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		stopTicker();
+		stopFileWatchers();
+		if (immediateTickTimer) clearTimeout(immediateTickTimer);
+		immediateTickTimer = undefined;
 		latestCtx = undefined;
 	});
 

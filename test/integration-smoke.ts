@@ -170,6 +170,21 @@ async function testLogContains(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testFileWatchImmediate(harness: Harness) {
+  const label = "smoke file event";
+  const resume = "file event resume";
+  const log = path.join(cwd, "event.log");
+  await fs.writeFile(log, "booting\n", "utf8");
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "event.log", contains: "EVENT_READY", every: "1h" },
+    resume,
+  });
+  await sleep(1_300); // let polling observe the missing text; without fs.watch, the 1h interval would now suppress re-checks.
+  await fs.appendFile(log, "EVENT_READY\n", "utf8");
+  await waitForWake(harness, { jobId, label, resume }, 1_500);
+}
+
 async function testFileStable(harness: Harness) {
   const label = "smoke stable file";
   const resume = "stable file resume";
@@ -454,6 +469,7 @@ await harness.emit("session_start");
 
 await testTimer(harness);
 await testLogContains(harness);
+await testFileWatchImmediate(harness);
 await testFileStable(harness);
 await testProcessGone(harness);
 await testPortOpen(harness);
