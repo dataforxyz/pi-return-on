@@ -11,6 +11,7 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 - **Processes** — pid running/exited, process name, command substring, or `/proc` regex match.
 - **Ports** — TCP port open/closed checks without shelling out.
 - **URLs** — HTTP status and optional body text/regex checks.
+- **Incoming webhooks** — start a local HTTP endpoint that wakes the session when called.
 - **Commands** — shell/bash/xonsh/python/node checks by exit code or output match.
 - **Agents/subagents** — usually by watching a result file or URL; `exec` remains available for custom integrations.
 - **Nested logic** — `and`, `or`, `not`, plus shorthand `all`, `any`, `not`.
@@ -53,9 +54,35 @@ Slash commands:
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
 
-## Webhooks
+## Incoming webhooks
 
-A watcher can notify an external HTTP endpoint when it fires. The Pi session wake still happens normally; the webhook is best-effort and does not replace the wake message.
+Use a `webhook` condition when an external system should wake Pi by making an HTTP request. The extension starts a local HTTP server bound to `127.0.0.1` by default, generates a random path/token if you do not provide them, and returns the callable URL in the tool result.
+
+```json
+{
+  "label": "external callback",
+  "condition": { "type": "webhook" },
+  "resume": "The external webhook was called; continue."
+}
+```
+
+The generated URL looks like:
+
+```text
+POST http://127.0.0.1:39123/return-on/abc123...?token=...
+```
+
+For remote services, expose the local endpoint with an SSH tunnel, Tailscale, ngrok, Cloudflare Tunnel, etc. You can bind a fixed host/port by setting environment variables before starting Pi:
+
+```bash
+PI_RETURN_ON_WEBHOOK_HOST=127.0.0.1 PI_RETURN_ON_WEBHOOK_PORT=8787 pi
+```
+
+Optional condition fields: `path`, `token`, `method`, `bodyContains`, and `bodyMatches`.
+
+## Outgoing webhooks
+
+A watcher can also notify an external HTTP endpoint when it fires. The Pi session wake still happens normally; the webhook is best-effort and does not replace the wake message.
 
 ```json
 {
@@ -97,7 +124,7 @@ Process, port, URL, and exec leaves remain polling-based.
 
 ## Polling with `every`
 
-File, process, port, URL, and exec leaves support `every`. A top-level `every` on `return_on` is inherited by leaves unless the leaf overrides it:
+File, process, port, URL, and exec leaves support `every`. Incoming webhook leaves are event-driven. A top-level `every` on `return_on` is inherited by polling leaves unless the leaf overrides it:
 
 ```json
 { "type": "file", "path": "build.log", "contains": "Done", "every": "2s" }
@@ -365,7 +392,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, incoming webhook wakeups, outgoing webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 
@@ -377,6 +404,6 @@ The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, reg
 
 ## Current limitations
 
-- Agent/subagent watchers are currently expressed through file, URL, or exec checks rather than a dedicated first-class leaf type.
-- File checks are event-assisted with polling fallback; process, port, URL, and exec checks are polling-based.
+- Agent/subagent watchers are currently expressed through file, URL, incoming webhook, or exec checks rather than a dedicated first-class leaf type.
+- File checks are event-assisted with polling fallback; incoming webhooks are event-driven; process, port, URL, and exec checks are polling-based.
 - Background commands should be treated as trusted local code.

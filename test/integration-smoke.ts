@@ -170,6 +170,26 @@ async function testLogContains(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testIncomingWebhookWake(harness: Harness) {
+  const label = "smoke incoming webhook";
+  const resume = "incoming webhook resume";
+  const tool = harness.tools.get("return_on");
+  if (!tool) throw new Error("missing return_on tool");
+  const result = await tool.execute("incoming", {
+    label,
+    condition: { type: "webhook" },
+    resume,
+  }, new AbortController().signal, () => {}, harness.ctx);
+  if (!result?.terminate) throw new Error("incoming webhook registration should terminate");
+  const jobId = result.details.job.id as string;
+  allJobIds.push(jobId);
+  const url = result.details.incomingWebhooks?.[0]?.url;
+  if (!url) throw new Error("incoming webhook registration did not return a URL");
+  const response = await fetch(url, { method: "POST", body: JSON.stringify({ ready: true }) });
+  if (response.status !== 202) throw new Error(`incoming webhook returned ${response.status}: ${await response.text()}`);
+  await waitForWake(harness, { jobId, label, resume }, 2_500);
+}
+
 async function testWebhookOnFire(harness: Harness) {
   const label = "smoke webhook";
   const resume = "webhook resume";
@@ -509,6 +529,7 @@ const harness = createHarness("main-session");
 await harness.emit("session_start");
 
 await testTimer(harness);
+await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);
 await testLogContains(harness);
 await testFileWatchImmediate(harness);

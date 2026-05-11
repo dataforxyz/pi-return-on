@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import * as net from "node:net";
+import * as http from "node:http";
+import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -21,6 +23,8 @@ const DEFAULT_PORT_EVERY_MS = 2000;
 const DEFAULT_URL_EVERY_MS = 5000;
 const DEFAULT_PORT_TIMEOUT_MS = 1000;
 const DEFAULT_URL_TIMEOUT_MS = 5000;
+const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1";
+const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 
@@ -29,7 +33,7 @@ type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
 
 const SUPPORTED_RUNNERS = new Set<Runner>(["sh", "bash", "xonsh", "python", "node"]);
 
-type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition | ProcessCondition | PortCondition | UrlCondition;
+type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition | ProcessCondition | PortCondition | UrlCondition | IncomingWebhookCondition;
 
 interface GroupCondition extends Record<string, unknown> {
 	op: GroupOp;
@@ -114,6 +118,15 @@ interface WebhookConfig {
 	timeout?: string | number;
 }
 
+interface IncomingWebhookCondition extends Record<string, unknown> {
+	type: "webhook";
+	path?: string;
+	token?: string;
+	method?: string;
+	bodyContains?: string;
+	bodyMatches?: string;
+}
+
 interface LeafLatch {
 	trueAt: number;
 	summary: string;
@@ -168,6 +181,12 @@ interface FileWatchTarget {
 	basename: string;
 }
 
+interface IncomingWebhookTarget {
+	jobId: string;
+	key: string;
+	condition: IncomingWebhookCondition;
+}
+
 let jobs: ReturnOnJob[] = [];
 let currentSessionFile: string | undefined;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
@@ -176,6 +195,8 @@ let latestCtx: ExtensionContext | undefined;
 let ticking = false;
 let fileWatchSignature = "";
 let fileWatchers = new Map<string, fs.FSWatcher>();
+let incomingWebhookServer: http.Server | undefined;
+let incomingWebhookServerStarting: Promise<void> | undefined;
 
 function nowIso(ts = Date.now()): string {
 	return new Date(ts).toISOString();
@@ -183,6 +204,10 @@ function nowIso(ts = Date.now()): string {
 
 function makeId(): string {
 	return `ro_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeToken(bytes = 16): string {
+	return randomBytes(bytes).toString("hex");
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -304,13 +329,23 @@ function stopFileWatchers(): void {
 	fileWatchSignature = "";
 }
 
+function stopIncomingWebhookServer(): void {
+	incomingWebhookServer?.close();
+	incomingWebhookServer = undefined;
+	incomingWebhookServerStarting = undefined;
+}
+
 function ensureTicker(pi: ExtensionAPI): void {
-	if (activeJobsForCurrentSession().length > 0) {
+	const active = activeJobsForCurrentSession();
+	if (active.length > 0) {
 		startTicker(pi);
 		reconcileFileWatchers(pi);
+		if (active.some((job) => conditionHasIncomingWebhook(job.condition))) void ensureIncomingWebhookServer(pi);
+		else stopIncomingWebhookServer();
 	} else {
 		stopTicker();
 		stopFileWatchers();
+		stopIncomingWebhookServer();
 	}
 	updateStatus();
 }
@@ -389,11 +424,28 @@ function normalizeCondition(input: unknown): Condition {
 		}
 		return input as UrlCondition;
 	}
+	if (input.type === "webhook") {
+		if (input.path !== undefined && (typeof input.path !== "string" || !input.path.startsWith("/"))) throw new Error("webhook condition path must start with '/'");
+		if (input.token !== undefined && typeof input.token !== "string") throw new Error("webhook condition token must be a string");
+		if (input.method !== undefined && typeof input.method !== "string") throw new Error("webhook condition method must be a string");
+		return input as IncomingWebhookCondition;
+	}
 	throw new Error(`unsupported condition type '${String(input.type)}'`);
 }
 
 function isGroupCondition(condition: Condition): condition is GroupCondition {
 	return "op" in condition;
+}
+
+function prepareIncomingWebhooks(condition: Condition): void {
+	if (isGroupCondition(condition)) {
+		condition.children.forEach(prepareIncomingWebhooks);
+		return;
+	}
+	if (condition.type !== "webhook") return;
+	condition.path ??= `/return-on/${makeToken(8)}`;
+	condition.token ??= makeToken(16);
+	condition.method ??= "POST";
 }
 
 function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
@@ -448,9 +500,24 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 	}
 }
 
+function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: IncomingWebhookTarget[] = []): IncomingWebhookTarget[] {
+	if (isGroupCondition(condition)) {
+		condition.children.forEach((child, index) => collectIncomingWebhookTargets(job, child, `${key}.${index}`, targets));
+		return targets;
+	}
+	if (condition.type === "webhook") targets.push({ jobId: job.id, key, condition });
+	return targets;
+}
+
 function conditionHasExec(condition: Condition): boolean {
 	if ("type" in condition && condition.type === "exec") return true;
 	if (isGroupCondition(condition)) return condition.children.some(conditionHasExec);
+	return false;
+}
+
+function conditionHasIncomingWebhook(condition: Condition): boolean {
+	if ("type" in condition && condition.type === "webhook") return true;
+	if (isGroupCondition(condition)) return condition.children.some(conditionHasIncomingWebhook);
 	return false;
 }
 
@@ -489,6 +556,7 @@ async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "
 	else if (condition.type === "process") result = await evaluateProcess(job, condition, key);
 	else if (condition.type === "port") result = await evaluatePort(job, condition, key);
 	else if (condition.type === "url") result = await evaluateUrl(job, condition, key);
+	else if (condition.type === "webhook") result = evaluateIncomingWebhook(job, condition, key);
 	else result = { value: false, summary: `unknown leaf ${(condition as { type?: string }).type}` };
 
 	if (latchLeaves && result.value) {
@@ -496,6 +564,11 @@ async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "
 		job.updatedAt = Date.now();
 	}
 	return result;
+}
+
+function evaluateIncomingWebhook(job: ReturnOnJob, condition: IncomingWebhookCondition, key: string): EvalResult {
+	const state = job.leafState[key] ??= {};
+	return { value: state.lastValue ?? false, summary: state.lastSummary ?? `waiting for incoming webhook ${condition.path ?? ""}` };
 }
 
 function evaluateTimer(job: ReturnOnJob, condition: TimerCondition): EvalResult {
@@ -781,6 +854,99 @@ function buildExecArgs(runner: Runner, condition: ExecCondition): { command: str
 	return { command: "sh", args: ["-lc", commandText], display: commandText };
 }
 
+function getIncomingWebhookBaseUrl(): string | undefined {
+	const address = incomingWebhookServer?.address();
+	if (!address || typeof address === "string") return undefined;
+	const host = DEFAULT_WEBHOOK_HOST === "0.0.0.0" || DEFAULT_WEBHOOK_HOST === "::" ? "127.0.0.1" : DEFAULT_WEBHOOK_HOST;
+	return `http://${host}:${address.port}`;
+}
+
+function incomingWebhookUrls(job: ReturnOnJob): Array<{ path: string; url: string; method: string }> {
+	const base = getIncomingWebhookBaseUrl();
+	if (!base) return [];
+	return collectIncomingWebhookTargets(job).map((target) => {
+		const url = new URL(target.condition.path ?? "/return-on", base);
+		if (target.condition.token) url.searchParams.set("token", target.condition.token);
+		return { path: target.condition.path ?? "/return-on", url: url.toString(), method: target.condition.method ?? "POST" };
+	});
+}
+
+async function ensureIncomingWebhookServer(pi: ExtensionAPI): Promise<void> {
+	if (incomingWebhookServer?.listening) return;
+	if (incomingWebhookServerStarting) return incomingWebhookServerStarting;
+	incomingWebhookServerStarting = new Promise((resolve, reject) => {
+		const server = http.createServer((req, res) => {
+			void handleIncomingWebhook(pi, req, res);
+		});
+		server.once("error", reject);
+		server.listen(DEFAULT_WEBHOOK_PORT, DEFAULT_WEBHOOK_HOST, () => {
+			incomingWebhookServer = server;
+			server.off("error", reject);
+			resolve();
+		});
+	});
+	try {
+		await incomingWebhookServerStarting;
+	} finally {
+		incomingWebhookServerStarting = undefined;
+	}
+}
+
+function readRequestBody(req: http.IncomingMessage, limit = 64 * 1024): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let body = "";
+		req.on("data", (chunk) => {
+			body += chunk.toString();
+			if (Buffer.byteLength(body) > limit) {
+				reject(new Error("request body too large"));
+				req.destroy();
+			}
+		});
+		req.on("end", () => resolve(body));
+		req.on("error", reject);
+	});
+}
+
+async function handleIncomingWebhook(pi: ExtensionAPI, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+	try {
+		const base = getIncomingWebhookBaseUrl() ?? `http://${DEFAULT_WEBHOOK_HOST}:0`;
+		const url = new URL(req.url ?? "/", base);
+		const body = await readRequestBody(req);
+		const candidates = activeJobsForCurrentSession().flatMap((job) => collectIncomingWebhookTargets(job));
+		const matches = candidates.filter((target) => {
+			const condition = target.condition;
+			if ((condition.method ?? "POST").toUpperCase() !== (req.method ?? "GET").toUpperCase()) return false;
+			if ((condition.path ?? "/return-on") !== url.pathname) return false;
+			const token = url.searchParams.get("token") ?? req.headers["x-return-on-token"] ?? req.headers.authorization?.replace(/^Bearer\s+/i, "");
+			if (condition.token && token !== condition.token) return false;
+			if (condition.bodyContains !== undefined && !body.includes(condition.bodyContains)) return false;
+			if (condition.bodyMatches !== undefined && !new RegExp(condition.bodyMatches).test(body)) return false;
+			return true;
+		});
+		if (matches.length === 0) {
+			res.writeHead(404, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: false, error: "no matching active return_on webhook" }));
+			return;
+		}
+		const now = Date.now();
+		for (const target of matches) {
+			const job = jobs.find((candidate) => candidate.id === target.jobId && candidate.status === "active");
+			if (!job) continue;
+			const summary = `incoming webhook ${target.condition.path} received`;
+			job.latches[target.key] = { trueAt: now, summary, details: { method: req.method, path: url.pathname, body: truncateText(body) } };
+			job.leafState[target.key] = { ...job.leafState[target.key], lastValue: true, lastSummary: summary, lastCheckAt: now };
+			job.updatedAt = now;
+		}
+		await saveJobs();
+		requestImmediateTick(pi);
+		res.writeHead(202, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: true, matched: matches.map((target) => target.jobId) }));
+	} catch (error) {
+		res.writeHead(500, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+	}
+}
+
 function runProcess(command: string, args: string[], options: { cwd: string; timeoutMs: number }): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
 	return new Promise((resolve) => {
 		const child = spawn(command, args, { cwd: options.cwd, env: process.env });
@@ -951,6 +1117,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		stopTicker();
 		stopFileWatchers();
+		stopIncomingWebhookServer();
 		if (immediateTickTimer) clearTimeout(immediateTickTimer);
 		immediateTickTimer = undefined;
 		latestCtx = undefined;
@@ -1006,7 +1173,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "return_on",
 		label: "Return On",
-		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, process, port, url, and exec leaves plus and/or/not groups.",
+		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, process, port, url, incoming webhook, and exec leaves plus and/or/not groups.",
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
@@ -1015,7 +1182,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
-			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/process/port/url/exec." }),
+			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/process/port/url/webhook/exec." }),
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
@@ -1027,6 +1194,7 @@ export default function (pi: ExtensionAPI) {
 			currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 			await loadJobs();
 			const condition = normalizeCondition(params.condition);
+			prepareIncomingWebhooks(condition);
 			const hasExec = conditionHasExec(condition);
 			let allowExec = params.allowExec === true;
 			if (hasExec && !allowExec) {
@@ -1064,9 +1232,12 @@ export default function (pi: ExtensionAPI) {
 				// Best-effort audit trail.
 			}
 			ensureTicker(pi);
+			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
+			const incomingWebhooks = incomingWebhookUrls(job);
+			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}. I will wake the session when it fires; do not poll or wait manually.` }],
-				details: { job },
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}. I will wake the session when it fires; do not poll or wait manually.${webhookText}` }],
+				details: { job, incomingWebhooks },
 				terminate: true,
 			};
 		},
