@@ -230,8 +230,14 @@ function ensureTicker(pi: ExtensionAPI): void {
 
 function normalizeCondition(input: unknown): Condition {
 	if (!isObject(input)) throw new Error("condition must be an object");
-	if (Array.isArray(input.any)) return { op: "or", children: input.any.map(normalizeCondition) };
-	if (Array.isArray(input.all)) return { op: "and", children: input.all.map(normalizeCondition) };
+	if (Array.isArray(input.any)) {
+		if (input.any.length === 0) throw new Error("any group requires children");
+		return { op: "or", children: input.any.map(normalizeCondition) };
+	}
+	if (Array.isArray(input.all)) {
+		if (input.all.length === 0) throw new Error("all group requires children");
+		return { op: "and", children: input.all.map(normalizeCondition) };
+	}
 	if (input.not !== undefined) return { op: "not", children: [normalizeCondition(input.not)] };
 	if (typeof input.op === "string") {
 		const op = input.op.toLowerCase();
@@ -271,24 +277,26 @@ function truncateText(value: string, limit = OUTPUT_LIMIT_BYTES): string {
 	return `${buf.subarray(0, limit).toString("utf8")}\n[truncated ${buf.length - limit} bytes]`;
 }
 
-async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root"): Promise<EvalResult> {
+async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root", latchLeaves = true): Promise<EvalResult> {
 	if (isGroupCondition(condition)) {
 		const op = condition.op;
 		const children = condition.children;
-		const childResults = await Promise.all(children.map((child, index) => evaluateCondition(job, child, `${key}.${index}`)));
+		if (op === "not") {
+			const child = children[0]
+				? await evaluateCondition(job, children[0], `${key}.0`, false)
+				: { value: false, summary: "missing child" };
+			return { value: !child.value, summary: `NOT(${child.summary})`, details: child };
+		}
+		const childResults = await Promise.all(children.map((child, index) => evaluateCondition(job, child, `${key}.${index}`, latchLeaves)));
 		if (op === "and") {
 			const value = childResults.every((result) => result.value);
 			return { value, summary: `AND(${childResults.map((r) => r.summary).join("; ")})`, details: childResults };
 		}
-		if (op === "or") {
-			const value = childResults.some((result) => result.value);
-			return { value, summary: `OR(${childResults.map((r) => r.summary).join("; ")})`, details: childResults };
-		}
-		const child = childResults[0] ?? { value: false, summary: "missing child" };
-		return { value: !child.value, summary: `NOT(${child.summary})`, details: child };
+		const value = childResults.some((result) => result.value);
+		return { value, summary: `OR(${childResults.map((r) => r.summary).join("; ")})`, details: childResults };
 	}
 
-	const latched = job.latches[key];
+	const latched = latchLeaves ? job.latches[key] : undefined;
 	if (latched) return { value: true, summary: latched.summary, details: latched.details };
 
 	let result: EvalResult;
@@ -297,7 +305,7 @@ async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "
 	else if (condition.type === "exec") result = await evaluateExec(job, condition, key);
 	else result = { value: false, summary: `unknown leaf ${(condition as { type?: string }).type}` };
 
-	if (result.value) {
+	if (latchLeaves && result.value) {
 		job.latches[key] = { trueAt: Date.now(), summary: result.summary, details: result.details };
 		job.updatedAt = Date.now();
 	}
@@ -334,9 +342,11 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 	}
 
 	const checks: Array<{ ok: boolean; label: string }> = [];
-	const shouldExist = condition.exists !== false && !condition.deleted;
+	const explicitExists = condition.exists;
+	const shouldRequireExists = explicitExists !== false && !condition.deleted;
 	if (condition.deleted) checks.push({ ok: !stat, label: `${condition.path} deleted` });
-	else if (condition.exists !== undefined || shouldExist) checks.push({ ok: !!stat, label: `${condition.path} exists` });
+	else if (explicitExists === false) checks.push({ ok: !stat, label: `${condition.path} absent` });
+	else if (explicitExists === true || shouldRequireExists) checks.push({ ok: !!stat, label: `${condition.path} exists` });
 
 	if (condition.changed) {
 		if (!stat) {

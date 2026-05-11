@@ -11,7 +11,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "smoke": "tsx test/integration-smoke.ts"
+    "smoke": "tsx test/integration-smoke.ts",
+    "test": "npm run typecheck && npm run smoke"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
