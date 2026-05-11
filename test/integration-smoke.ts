@@ -170,6 +170,47 @@ async function testLogContains(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testWebhookOnFire(harness: Harness) {
+  const label = "smoke webhook";
+  const resume = "webhook resume";
+  const received: any[] = [];
+  const server = net.createServer((socket) => {
+    let raw = "";
+    socket.on("data", (chunk) => {
+      raw += chunk.toString();
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      const headers = raw.slice(0, headerEnd);
+      const lengthMatch = headers.match(/content-length:\s*(\d+)/i);
+      const contentLength = lengthMatch ? Number(lengthMatch[1]) : 0;
+      const body = raw.slice(headerEnd + 4);
+      if (Buffer.byteLength(body) < contentLength) return;
+      received.push(JSON.parse(body));
+      socket.end("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("webhook test server did not bind");
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "200ms" },
+    webhook: { url: `http://127.0.0.1:${address.port}/hook`, headers: { "x-test": "return-on" }, timeout: "2s" },
+    resume,
+  });
+  await waitForWake(harness, { jobId, label, resume }, 2_500);
+  const start = Date.now();
+  while (received.length === 0 && Date.now() - start < 2_500) await sleep(50);
+  server.close();
+  if (received.length !== 1) throw new Error(`expected one webhook delivery, saw ${received.length}`);
+  if (received[0].event !== "return_on.fired" || received[0].id !== jobId || received[0].label !== label || received[0].resume !== resume) {
+    throw new Error(`webhook payload had wrong content: ${JSON.stringify(received[0])}`);
+  }
+}
+
 async function testFileWatchImmediate(harness: Harness) {
   const label = "smoke file event";
   const resume = "file event resume";
@@ -468,6 +509,7 @@ const harness = createHarness("main-session");
 await harness.emit("session_start");
 
 await testTimer(harness);
+await testWebhookOnFire(harness);
 await testLogContains(harness);
 await testFileWatchImmediate(harness);
 await testFileStable(harness);

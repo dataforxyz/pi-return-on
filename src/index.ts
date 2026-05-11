@@ -107,6 +107,13 @@ interface UrlCondition extends Record<string, unknown> {
 	every?: string | number;
 }
 
+interface WebhookConfig {
+	url: string;
+	method?: string;
+	headers?: Record<string, string>;
+	timeout?: string | number;
+}
+
 interface LeafLatch {
 	trueAt: number;
 	summary: string;
@@ -134,6 +141,7 @@ interface ReturnOnJob {
 	timeoutAt?: number;
 	allowExec?: boolean;
 	every?: string | number;
+	webhook?: WebhookConfig;
 	latches: Record<string, LeafLatch>;
 	leafState: Record<string, LeafState>;
 	fireReason?: string;
@@ -305,6 +313,20 @@ function ensureTicker(pi: ExtensionAPI): void {
 		stopFileWatchers();
 	}
 	updateStatus();
+}
+
+function normalizeWebhook(input: unknown): WebhookConfig | undefined {
+	if (input === undefined || input === null || input === false) return undefined;
+	const config: WebhookConfig = typeof input === "string" ? { url: input } : isObject(input) ? { ...(input as Record<string, unknown>) } as unknown as WebhookConfig : (() => { throw new Error("webhook must be a URL string or object"); })();
+	if (typeof config.url !== "string" || !config.url.trim()) throw new Error("webhook requires url");
+	const parsed = new URL(config.url);
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("webhook url must use http or https");
+	if (config.method !== undefined && typeof config.method !== "string") throw new Error("webhook method must be a string");
+	if (config.headers !== undefined) {
+		if (!isObject(config.headers)) throw new Error("webhook headers must be an object");
+		config.headers = Object.fromEntries(Object.entries(config.headers).map(([key, value]) => [key, String(value)]));
+	}
+	return config;
 }
 
 function normalizeCondition(input: unknown): Condition {
@@ -830,6 +852,9 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	} catch {
 		// Best-effort audit trail.
 	}
+	void sendWebhook(job, reason).catch((error) => {
+		console.error(`[${EXTENSION_NAME}] Webhook failed for ${job.id}:`, error);
+	});
 	pi.sendMessage(
 		{
 			customType: EXTENSION_NAME,
@@ -839,6 +864,40 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 		},
 		{ triggerTurn: true },
 	);
+}
+
+async function sendWebhook(job: ReturnOnJob, reason: string): Promise<void> {
+	if (!job.webhook) return;
+	const timeoutMs = parseDuration(job.webhook.timeout, 5000) ?? 5000;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	timer.unref?.();
+	try {
+		const headers = new Headers(job.webhook.headers ?? {});
+		if (!headers.has("content-type")) headers.set("content-type", "application/json");
+		const body = JSON.stringify({
+			event: "return_on.fired",
+			id: job.id,
+			label: job.label,
+			reason,
+			createdAt: job.createdAt,
+			firedAt: job.firedAt,
+			cwd: job.cwd,
+			sessionFile: job.sessionFile,
+			resume: job.resume,
+			condition: job.condition,
+			latches: job.latches,
+		});
+		const response = await fetch(job.webhook.url, {
+			method: job.webhook.method ?? "POST",
+			headers,
+			body,
+			signal: controller.signal,
+		});
+		if (!response.ok) throw new Error(`webhook returned HTTP ${response.status}`);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function formatFireMessage(job: ReturnOnJob, reason: string): string {
@@ -960,6 +1019,7 @@ export default function (pi: ExtensionAPI) {
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
+			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -978,6 +1038,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const timeoutMs = parseDuration(params.timeout);
+			const webhook = normalizeWebhook(params.webhook);
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
@@ -991,6 +1052,7 @@ export default function (pi: ExtensionAPI) {
 				...(timeoutMs !== undefined ? { timeoutAt: Date.now() + timeoutMs } : {}),
 				allowExec,
 				...(params.every !== undefined ? { every: params.every } : {}),
+				...(webhook ? { webhook } : {}),
 				latches: {},
 				leafState: {},
 			};

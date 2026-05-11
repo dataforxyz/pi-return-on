@@ -36,6 +36,7 @@ Slash commands:
   "resume": "Continue now that the render output is ready.",
   "every": "2s",
   "timeout": "30m",
+  "webhook": "https://example.com/pi-return-on-hook",
   "allowExec": false
 }
 ```
@@ -47,9 +48,46 @@ Slash commands:
 | `resume` | yes | Instruction included in the wake message. |
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. |
+| `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
+
+## Webhooks
+
+A watcher can notify an external HTTP endpoint when it fires. The Pi session wake still happens normally; the webhook is best-effort and does not replace the wake message.
+
+```json
+{
+  "label": "deploy finished",
+  "condition": { "type": "file", "path": "deploy.log", "contains": "DONE" },
+  "webhook": {
+    "url": "https://example.com/pi-return-on-hook",
+    "headers": { "authorization": "Bearer TOKEN" },
+    "timeout": "5s"
+  },
+  "resume": "Deploy finished; inspect the result."
+}
+```
+
+The webhook receives JSON like:
+
+```json
+{
+  "event": "return_on.fired",
+  "id": "ro_...",
+  "label": "deploy finished",
+  "reason": "...",
+  "createdAt": 1760000000000,
+  "firedAt": 1760000010000,
+  "cwd": "/path/to/project",
+  "resume": "Deploy finished; inspect the result.",
+  "condition": {},
+  "latches": {}
+}
+```
+
+Headers are stored in the local jobs state file while the watcher is active, so avoid putting long-lived secrets there unless you trust the machine and state file permissions.
 
 ## Event-driven when possible, polling as fallback
 
@@ -327,7 +365,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 
