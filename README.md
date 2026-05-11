@@ -288,7 +288,15 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking and a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, stable files, process-gone checks, port-open checks, boolean trees, `not`, cancel, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, file/log checks, stable files, process-gone checks, port-open checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+
+For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
+
+```bash
+npm run smoke
+```
+
+The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, registers the tools and commands, emits `session_start` / `session_shutdown`, and waits for real timer/file/exec wake messages.
 
 ## Current limitations
 

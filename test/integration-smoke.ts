@@ -40,21 +40,28 @@ function getFreePort(): Promise<number> {
   });
 }
 
-function createHarness(sessionName: string) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>) } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
-  const commands = new Map<string, unknown>();
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const statuses: Array<{ key: string; value?: string }> = [];
+  const commands = new Map<string, any>();
   const sessionFile = path.join(cwd, `${sessionName}.jsonl`);
+  let confirmCalls = 0;
 
   const ctx: any = {
     cwd,
-    hasUI: true,
+    hasUI: options.hasUI ?? true,
     sessionManager: { getSessionFile: () => sessionFile },
     ui: {
-      confirm: async () => true,
-      notify() {},
-      setStatus() {},
+      confirm: async () => {
+        confirmCalls += 1;
+        if (typeof options.confirm === "function") return options.confirm();
+        return options.confirm ?? true;
+      },
+      notify(message: string, level?: string) { notifications.push({ message, level }); },
+      setStatus(key: string, value?: string) { statuses.push({ key, value }); },
     },
   };
 
@@ -102,7 +109,7 @@ function createHarness(sessionName: string) {
     await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
-  return { commands, ctx, emit, messages, register, cancel, sessionFile, tools };
+  return { commands, ctx, emit, messages, notifications, register, cancel, sessionFile, statuses, tools, get confirmCalls() { return confirmCalls; } };
 }
 
 function wakeEntries(harness: Harness, jobId: string) {
@@ -246,12 +253,28 @@ async function testNotConditionAfterDelete(harness: Harness) {
   await fs.writeFile(file, "present", "utf8");
   const jobId = await harness.register({
     label,
-    condition: { not: { type: "file", path: "not-flag.txt", exists: true, every: "100ms" } },
+    condition: { not: { type: "file", path: "not-flag.txt", exists: true, every: "2s" } },
     resume,
   });
-  await expectNoWake(harness, jobId, 1_200, "not condition fired while child was true");
+  await expectNoWake(harness, jobId, 2_500, "not condition fired while child was true or between polls");
   await fs.unlink(file);
-  await waitForWake(harness, { jobId, label, resume }, 2_500);
+  await waitForWake(harness, { jobId, label, resume }, 4_000);
+}
+
+async function testNotExecAfterDelete(harness: Harness) {
+  const label = "smoke not exec after delete";
+  const resume = "not exec resume";
+  const file = path.join(cwd, "not-exec-flag.txt");
+  await fs.writeFile(file, "present", "utf8");
+  const jobId = await harness.register({
+    label,
+    allowExec: true,
+    condition: { not: { type: "exec", runner: "sh", command: "test -f not-exec-flag.txt", success: true, every: "2s" } },
+    resume,
+  });
+  await expectNoWake(harness, jobId, 2_500, "not exec condition fired while command was still succeeding or between polls");
+  await fs.unlink(file);
+  await waitForWake(harness, { jobId, label, resume }, 4_000);
 }
 
 async function testEmptyGroupRejected(harness: Harness) {
@@ -312,6 +335,68 @@ async function testTimeoutWake(harness: Harness) {
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
 }
 
+async function testExecConfirmationAndValidation() {
+  const noUi = createHarness("no-ui-exec", { hasUI: false });
+  await noUi.emit("session_start");
+  let rejected = false;
+  try {
+    await noUi.register({ label: "no ui exec", condition: { type: "exec", command: "exit 0" }, resume: "no ui resume" });
+  } catch (error) {
+    rejected = error instanceof Error && error.message.includes("allowExec=true");
+  }
+  if (!rejected) throw new Error("exec watcher without allowExec was not rejected when UI was unavailable");
+  await noUi.emit("session_shutdown");
+
+  const invalidRunner = createHarness("invalid-runner");
+  await invalidRunner.emit("session_start");
+  rejected = false;
+  try {
+    await invalidRunner.register({ label: "bad runner", allowExec: true, condition: { type: "exec", runner: "ruby", command: "exit 0" }, resume: "bad runner resume" });
+  } catch (error) {
+    rejected = error instanceof Error && error.message.includes("unsupported exec runner");
+  }
+  if (!rejected) throw new Error("unsupported exec runner was not rejected");
+  await invalidRunner.emit("session_shutdown");
+
+  const confirmed = createHarness("confirmed-exec", { confirm: true });
+  await confirmed.emit("session_start");
+  const label = "confirmed exec";
+  const resume = "confirmed exec resume";
+  const jobId = await confirmed.register({ label, condition: { type: "exec", runner: "sh", command: "exit 0", success: true, every: "2s" }, resume });
+  if (confirmed.confirmCalls !== 1) throw new Error(`expected one exec confirmation, saw ${confirmed.confirmCalls}`);
+  await waitForWake(confirmed, { jobId, label, resume }, 3_500);
+  await confirmed.emit("session_shutdown");
+}
+
+async function testListToolAndCommands() {
+  const harness = createHarness("list-and-commands");
+  await harness.emit("session_start");
+  const activeId = await harness.register({ label: "list active", condition: { type: "timer", after: "10s" }, resume: "list active resume" });
+  const cancelId = await harness.register({ label: "list cancel", condition: { type: "timer", after: "10s" }, resume: "list cancel resume" });
+  await harness.cancel(cancelId);
+
+  const listTool = harness.tools.get("return_on_list");
+  if (!listTool) throw new Error("missing return_on_list tool");
+  const active = await listTool.execute("list", { status: "active" }, new AbortController().signal, () => {}, harness.ctx);
+  const cancelled = await listTool.execute("list", { status: "cancelled" }, new AbortController().signal, () => {}, harness.ctx);
+  const activeText = String(active.content?.[0]?.text ?? "");
+  const cancelledText = String(cancelled.content?.[0]?.text ?? "");
+  if (!activeText.includes(activeId) || activeText.includes(cancelId)) throw new Error(`active list had wrong jobs: ${activeText}`);
+  if (!cancelledText.includes(cancelId) || cancelledText.includes(activeId)) throw new Error(`cancelled list had wrong jobs: ${cancelledText}`);
+
+  await harness.commands.get("return-on-status")?.handler(cancelId, harness.ctx);
+  if (!harness.notifications.some((entry) => entry.message.includes(cancelId) && entry.message.includes("cancelled"))) {
+    throw new Error("return-on-status command did not notify cancelled job details");
+  }
+  await harness.commands.get("return-on-list")?.handler("", harness.ctx);
+  if (!harness.notifications.some((entry) => entry.message.includes(activeId) && entry.message.includes(cancelId))) {
+    throw new Error("return-on-list command did not notify session jobs");
+  }
+
+  await harness.cancel(activeId);
+  await harness.emit("session_shutdown");
+}
+
 async function testRestartResume() {
   const label = "smoke restart";
   const resume = "restart resume";
@@ -355,11 +440,14 @@ await testProcessGone(harness);
 await testPortOpen(harness);
 await testFileExistsFalse(harness);
 await testNotConditionAfterDelete(harness);
+await testNotExecAfterDelete(harness);
 await testEmptyGroupRejected(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await harness.emit("session_shutdown");
+await testExecConfirmationAndValidation();
+await testListToolAndCommands();
 await testRestartResume();
 await testSessionIsolation();
 

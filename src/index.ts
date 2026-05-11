@@ -21,6 +21,8 @@ const OUTPUT_LIMIT_BYTES = 50 * 1024;
 type GroupOp = "and" | "or" | "not";
 type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
 
+const SUPPORTED_RUNNERS = new Set<Runner>(["sh", "bash", "xonsh", "python", "node"]);
+
 type Condition = GroupCondition | TimerCondition | FileCondition | ExecCondition;
 
 interface GroupCondition extends Record<string, unknown> {
@@ -76,6 +78,7 @@ interface LeafState {
 	lastMtimeMs?: number;
 	stableSince?: number;
 	lastSummary?: string;
+	lastValue?: boolean;
 }
 
 interface ReturnOnJob {
@@ -256,6 +259,12 @@ function normalizeCondition(input: unknown): Condition {
 		if (typeof input.command !== "string" && typeof input.code !== "string") {
 			throw new Error("exec condition requires command or code");
 		}
+		for (const field of ["runner", "shell"] as const) {
+			const runner = input[field];
+			if (runner !== undefined && (!SUPPORTED_RUNNERS.has(runner as Runner) || typeof runner !== "string")) {
+				throw new Error(`unsupported exec ${field} '${String(runner)}'`);
+			}
+		}
 		return input as ExecCondition;
 	}
 	throw new Error(`unsupported condition type '${String(input.type)}'`);
@@ -329,7 +338,7 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 	const everyMs = parseDuration(condition.every, DEFAULT_FILE_EVERY_MS) ?? DEFAULT_FILE_EVERY_MS;
 	const now = Date.now();
 	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
-		return { value: false, summary: state.lastSummary ?? "file check waiting for interval" };
+		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "file check waiting for interval" };
 	}
 	state.lastCheckAt = now;
 
@@ -390,6 +399,7 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 	const ok = checks.length > 0 && checks.every((check) => check.ok);
 	const summary = checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ") || `file ${condition.path}`;
 	state.lastSummary = summary;
+	state.lastValue = ok;
 	return { value: ok, summary, details: { path: filePath } };
 }
 
@@ -398,7 +408,7 @@ async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: str
 	const everyMs = Math.max(parseDuration(condition.every, DEFAULT_EXEC_EVERY_MS) ?? DEFAULT_EXEC_EVERY_MS, MIN_EXEC_EVERY_MS);
 	const now = Date.now();
 	if (state.lastCheckAt && now - state.lastCheckAt < everyMs) {
-		return { value: false, summary: state.lastSummary ?? "exec check waiting for interval" };
+		return { value: state.lastValue ?? false, summary: state.lastSummary ?? "exec check waiting for interval" };
 	}
 	state.lastCheckAt = now;
 
@@ -424,6 +434,7 @@ async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: str
 	const ok = checks.every((check) => check.ok);
 	const summary = `${display} => code ${proc.code}${proc.timedOut ? " (timed out)" : ""}; ${checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ")}`;
 	state.lastSummary = summary;
+	state.lastValue = ok;
 	return {
 		value: ok,
 		summary,
@@ -643,7 +654,7 @@ export default function (pi: ExtensionAPI) {
 			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
 			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/exec." }),
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
-			timeout: Type.Optional(Type.String({ description: "Optional max time before waking anyway, e.g. '30m'" })),
+			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
