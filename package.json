@@ -10,7 +10,8 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx test/integration-smoke.ts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
@@ -19,6 +20,7 @@
     "typebox": "^1.1.38"
   },
   "devDependencies": {
+    "tsx": "^4.20.6",
     "typescript": "^5.0.0"
   }
 }
