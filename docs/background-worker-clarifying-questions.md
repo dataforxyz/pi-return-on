@@ -1,6 +1,8 @@
 # Background Worker + Waiting UI Clarifying Questions
 
-This document captures the open design questions for strengthening `pi-return-on` with a background worker, better wake delivery, and improved visibility into what is being waited on.
+This document captures the original open design questions for strengthening `pi-return-on` with a background worker, better wake delivery, and improved visibility into what is being waited on.
+
+> Clarification: the immediate problem is not that `return_on` blocks itself. The immediate problem is that agents sometimes choose direct blocking waits instead of starting background work and using `return_on`. The chosen first step is documented in [Direct Wait Policy](./direct-wait-policy.md): Option A prompt guidance plus Option C high-confidence blocking. Background-worker questions remain useful for future hardening, but they are not the first implementation target.
 
 ## How we will decide
 
