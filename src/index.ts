@@ -17,6 +17,7 @@ const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
 const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
 const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
+const DIRECT_WAIT_AUDIT_FILE = path.join(STATE_DIR, "direct-wait-audit.jsonl");
 const DEFAULT_TICK_MS = 1000;
 const DEFAULT_EXEC_EVERY_MS = 5000;
 const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
@@ -241,9 +242,28 @@ interface IncomingWebhookTarget {
 	condition: IncomingWebhookCondition;
 }
 
+type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_backgrounded";
+
 interface DirectWaitMatch {
 	kind: string;
 	detail: string;
+	durationMs?: number;
+}
+
+interface DirectWaitAnalysis extends DirectWaitMatch {
+	action: DirectWaitAuditAction;
+}
+
+interface DirectWaitAuditEntry extends DirectWaitAnalysis {
+	version: 1;
+	event: "direct_wait";
+	timestamp: number;
+	cwd?: string;
+	sessionFile?: string;
+	toolName: string;
+	command: string;
+	thresholdMs: number;
+	reason?: string;
 }
 
 let jobs: ReturnOnJob[] = [];
@@ -356,14 +376,15 @@ function isExplicitlyBackgrounded(command: string): boolean {
 		|| /(^|[^&])&(\s*(echo\s+\$!|disown|$|[;]))/.test(normalized);
 }
 
-function findDirectWait(command: string): DirectWaitMatch | undefined {
-	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
-	if (!normalized || isExplicitlyBackgrounded(normalized)) return undefined;
-
+function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefined {
 	for (const match of normalized.matchAll(/(?:^|[;&|]\s*)(?:rtk\s+run\s+)?sleep\s+(\d+(?:\.\d+)?)(ms|s|m|h|d)?\b/g)) {
 		const durationMs = parseShellSleepDurationMs(match[1], match[2] ?? "s");
-		if (durationMs !== undefined && durationMs >= DIRECT_SLEEP_BLOCK_THRESHOLD_MS) {
-			return { kind: "long sleep", detail: `sleep ${match[1]}${match[2] ?? "s"}` };
+		if (durationMs !== undefined) {
+			return {
+				kind: durationMs >= DIRECT_SLEEP_BLOCK_THRESHOLD_MS ? "long sleep" : "short sleep",
+				detail: `sleep ${match[1]}${match[2] ?? "s"}`,
+				durationMs,
+			};
 		}
 	}
 
@@ -384,6 +405,21 @@ function findDirectWait(command: string): DirectWaitMatch | undefined {
 	return found ? { kind: found.kind, detail: found.detail } : undefined;
 }
 
+function analyzeDirectWait(command: string): DirectWaitAnalysis | undefined {
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	if (!normalized) return undefined;
+	const match = detectDirectWaitPattern(normalized);
+	if (!match) return undefined;
+	if (isExplicitlyBackgrounded(normalized)) return { ...match, action: "allowed_backgrounded" };
+	if (match.durationMs !== undefined && match.durationMs < DIRECT_SLEEP_BLOCK_THRESHOLD_MS) return { ...match, action: "allowed_short_sleep" };
+	return { ...match, action: "blocked" };
+}
+
+function findDirectWait(command: string): DirectWaitMatch | undefined {
+	const analysis = analyzeDirectWait(command);
+	return analysis?.action === "blocked" ? analysis : undefined;
+}
+
 function formatDirectWaitBlockReason(match: DirectWaitMatch): string {
 	return [
 		`Blocked direct wait (${match.kind}: ${match.detail}).`,
@@ -391,6 +427,66 @@ function formatDirectWaitBlockReason(match: DirectWaitMatch): string {
 		"Start the long-running command in the background with logs/pid captured, then call return_on to wake on the readiness/completion signal.",
 		"Example pattern: mkdir -p .return-on && <command> > .return-on/task.log 2>&1 & echo $! > .return-on/task.pid; then return_on on a file/log/process/port/url condition.",
 	].join(" ");
+}
+
+function redactCommand(command: string): string {
+	return command
+		.replace(/((?:token|api[_-]?key|secret|password|passwd|pwd)=)([^\s;&|]+)/gi, "$1[redacted]")
+		.replace(/(Authorization:\s*Bearer\s+)[^\s'\"]+/gi, "$1[redacted]");
+}
+
+function truncateAuditText(input: string, maxLength = 500): string {
+	return input.length > maxLength ? `${input.slice(0, maxLength - 1)}…` : input;
+}
+
+async function appendDirectWaitAudit(entry: DirectWaitAuditEntry): Promise<void> {
+	try {
+		await fsp.mkdir(STATE_DIR, { recursive: true });
+		await fsp.appendFile(DIRECT_WAIT_AUDIT_FILE, `${JSON.stringify(entry)}\n`, "utf8");
+	} catch (error) {
+		console.error(`[${EXTENSION_NAME}] Failed to append direct wait audit entry:`, error);
+	}
+}
+
+async function readDirectWaitAudit(limit = 50): Promise<DirectWaitAuditEntry[]> {
+	try {
+		const raw = await fsp.readFile(DIRECT_WAIT_AUDIT_FILE, "utf8");
+		const lines = raw.split("\n").filter(Boolean);
+		return lines.slice(-limit).flatMap((line) => {
+			try {
+				return [JSON.parse(line) as DirectWaitAuditEntry];
+			} catch {
+				return [];
+			}
+		});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			console.error(`[${EXTENSION_NAME}] Failed to read direct wait audit:`, error);
+		}
+		return [];
+	}
+}
+
+function formatDirectWaitAudit(entries: DirectWaitAuditEntry[]): string {
+	if (entries.length === 0) return `No direct-wait audit entries found at ${DIRECT_WAIT_AUDIT_FILE}.`;
+	const byAction = new Map<string, number>();
+	const byKind = new Map<string, number>();
+	for (const entry of entries) {
+		byAction.set(entry.action, (byAction.get(entry.action) ?? 0) + 1);
+		byKind.set(entry.kind, (byKind.get(entry.kind) ?? 0) + 1);
+	}
+	const formatCounts = (counts: Map<string, number>) => [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([key, count]) => `${key}=${count}`).join(", ");
+	const recent = entries.slice(-15).map((entry) => {
+		const duration = entry.durationMs !== undefined ? ` ${formatDuration(entry.durationMs)}` : "";
+		return `- ${nowIso(entry.timestamp)} ${entry.action} ${entry.kind}${duration} ${entry.detail} cwd=${entry.cwd ?? "?"} cmd=${truncateAuditText(entry.command, 120)}`;
+	}).join("\n");
+	return [
+		`Direct-wait audit (${entries.length} recent entries, file: ${DIRECT_WAIT_AUDIT_FILE})`,
+		`By action: ${formatCounts(byAction)}`,
+		`By kind: ${formatCounts(byKind)}`,
+		"Recent:",
+		recent,
+	].join("\n");
 }
 
 async function loadJobs(): Promise<void> {
@@ -1580,13 +1676,33 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
 	});
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const input = event.input as { command?: unknown };
 		const command = typeof input.command === "string" ? input.command : "";
-		const directWait = findDirectWait(command);
+		const directWait = analyzeDirectWait(command);
 		if (!directWait) return undefined;
-		return { block: true, reason: formatDirectWaitBlockReason(directWait) };
+		const reason = directWait.action === "blocked" ? formatDirectWaitBlockReason(directWait) : undefined;
+		const auditEntry: DirectWaitAuditEntry = {
+			version: 1,
+			event: "direct_wait",
+			timestamp: Date.now(),
+			cwd: ctx?.cwd,
+			sessionFile: ctx?.sessionManager.getSessionFile() ?? undefined,
+			toolName: event.toolName,
+			command: redactCommand(command),
+			thresholdMs: DIRECT_SLEEP_BLOCK_THRESHOLD_MS,
+			...directWait,
+			...(reason ? { reason } : {}),
+		};
+		await appendDirectWaitAudit(auditEntry);
+		try {
+			pi.appendEntry?.("return-on-direct-wait", auditEntry);
+		} catch {
+			// Best-effort audit trail.
+		}
+		if (directWait.action !== "blocked") return undefined;
+		return { block: true, reason };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1667,6 +1783,28 @@ export default function (pi: ExtensionAPI) {
 			await saveJobs();
 			ensureTicker(pi);
 			ctx.ui.notify(`Cancelled ${id}`, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-direct-waits", {
+		description: "Show the direct-wait policy audit log: /return-on-direct-waits [limit]",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			const requestedLimit = Number.parseInt(args.trim(), 10);
+			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
+			const entries = await readDirectWaitAudit(limit);
+			ctx.ui.notify(formatDirectWaitAudit(entries), "info");
+		},
+	});
+
+	pi.registerCommand("return-on-audit", {
+		description: "Alias for /return-on-direct-waits",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			const requestedLimit = Number.parseInt(args.trim(), 10);
+			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
+			const entries = await readDirectWaitAudit(limit);
+			ctx.ui.notify(formatDirectWaitAudit(entries), "info");
 		},
 	});
 

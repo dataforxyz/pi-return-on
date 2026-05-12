@@ -36,6 +36,35 @@ Block obvious direct waits in bash tool calls and return an actionable reason. T
 
 Commands that are explicitly backgrounded with `&`, `nohup`, `setsid`, or `disown` are not blocked by this policy.
 
+## Observability
+
+Every direct-wait policy interaction is appended to:
+
+```text
+~/.local/state/pi-return-on/direct-wait-audit.jsonl
+```
+
+The audit records:
+
+- blocked direct waits
+- allowed short sleeps under 10 seconds
+- allowed/backgrounded direct-wait-shaped commands
+- cwd, session file, command, matched kind/detail, threshold, timestamp, and reason when blocked
+
+Commands are lightly redacted for common `token=`, `api_key=`, `secret=`, and password-style values.
+
+Use `/return-on-direct-waits [limit]` or `/return-on-audit [limit]` inside Pi to see a recent summary.
+
+Use the scanner script outside Pi to summarize the audit log and scan Pi session logs for possible missed opportunities:
+
+```bash
+npm run audit:direct-waits
+node scripts/scan-direct-waits.mjs --json
+node scripts/scan-direct-waits.mjs ~/.pi/agent/sessions
+```
+
+The scanner reports structured audit counts plus text-log candidates such as long sleeps, streaming waits, polling loops, and foreground dev servers that may not have gone through the current blocker.
+
 ## Deferred option
 
 ### Option D: auto-convert

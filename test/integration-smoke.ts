@@ -122,11 +122,17 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     return id;
   }
 
+  async function runCommand(name: string, args = "") {
+    const command = commands.get(name);
+    if (!command) throw new Error(`missing command ${name}`);
+    await command.handler(args, ctx);
+  }
+
   async function cancel(id: string) {
     await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
-  return { beforeAgentStart, commands, ctx, emit, messages, notifications, register, cancel, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
+  return { beforeAgentStart, commands, ctx, emit, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
 }
 
 function wakeEntries(harness: Harness, jobId: string) {
@@ -194,6 +200,24 @@ async function testDirectWaitPolicy(harness: Harness) {
 
   const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
   if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);
+
+  const auditFile = path.join(process.env.HOME!, ".local", "state", "pi-return-on", "direct-wait-audit.jsonl");
+  const auditLines = (await fs.readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  if (!auditLines.some((entry) => entry.action === "blocked" && entry.detail === "sleep 10s")) {
+    throw new Error(`blocked sleep was not audited: ${JSON.stringify(auditLines)}`);
+  }
+  if (!auditLines.some((entry) => entry.action === "allowed_short_sleep" && entry.detail === "sleep 9s")) {
+    throw new Error(`allowed short sleep was not audited: ${JSON.stringify(auditLines)}`);
+  }
+  if (!auditLines.some((entry) => entry.action === "allowed_backgrounded" && entry.detail === "package manager dev server")) {
+    throw new Error(`backgrounded direct-wait opportunity was not audited: ${JSON.stringify(auditLines)}`);
+  }
+
+  await harness.runCommand("return-on-direct-waits", "10");
+  const notification = harness.notifications.at(-1)?.message ?? "";
+  if (!notification.includes("Direct-wait audit") || !notification.includes("allowed_short_sleep") || !notification.includes("blocked")) {
+    throw new Error(`direct wait audit command did not summarize entries: ${notification}`);
+  }
 }
 
 async function testTimer(harness: Harness) {

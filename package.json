@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "smoke": "tsx test/integration-smoke.ts",
     "scan-errors": "node scripts/scan-return-on-errors.mjs",
-    "test": "npm run typecheck && npm run smoke"
+    "test": "npm run typecheck && npm run smoke",
+    "audit:direct-waits": "node scripts/scan-direct-waits.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
