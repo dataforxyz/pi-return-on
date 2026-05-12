@@ -604,6 +604,10 @@ async function testListToolAndCommands() {
   const harness = createHarness("list-and-commands");
   await harness.emit("session_start");
   const activeId = await harness.register({ label: "list active", condition: { type: "timer", after: "10s" }, resume: "list active resume" });
+  const statusAfterActive = harness.statuses.at(-1)?.value ?? "";
+  if (!statusAfterActive.includes("list active") || !statusAfterActive.includes("timer")) {
+    throw new Error(`status tag did not show active wait label and condition: ${statusAfterActive}`);
+  }
   const cancelId = await harness.register({ label: "list cancel", condition: { type: "timer", after: "10s" }, resume: "list cancel resume" });
   await harness.cancel(cancelId);
 
@@ -613,8 +617,8 @@ async function testListToolAndCommands() {
   const cancelled = await listTool.execute("list", { status: "cancelled" }, new AbortController().signal, () => {}, harness.ctx);
   const activeText = String(active.content?.[0]?.text ?? "");
   const cancelledText = String(cancelled.content?.[0]?.text ?? "");
-  if (!activeText.includes(activeId) || activeText.includes(cancelId)) throw new Error(`active list had wrong jobs: ${activeText}`);
-  if (!cancelledText.includes(cancelId) || cancelledText.includes(activeId)) throw new Error(`cancelled list had wrong jobs: ${cancelledText}`);
+  if (!activeText.includes(activeId) || activeText.includes(cancelId) || !activeText.includes("waiting:") || !activeText.includes("condition:")) throw new Error(`active list had wrong jobs or missing wait detail: ${activeText}`);
+  if (!cancelledText.includes(cancelId) || cancelledText.includes(activeId) || !cancelledText.includes("waiting:")) throw new Error(`cancelled list had wrong jobs or missing wait detail: ${cancelledText}`);
 
   await harness.commands.get("return-on-status")?.handler(cancelId, harness.ctx);
   if (!harness.notifications.some((entry) => entry.message.includes(cancelId) && entry.message.includes("cancelled"))) {

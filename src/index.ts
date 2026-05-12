@@ -535,8 +535,8 @@ function activeJobsForCurrentSession(): ReturnOnJob[] {
 
 function updateStatus(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
-	const count = activeJobsForCurrentSession().length;
-	ctx.ui.setStatus(EXTENSION_NAME, count > 0 ? `return_on: ${count}` : undefined);
+	const active = activeJobsForCurrentSession();
+	ctx.ui.setStatus(EXTENSION_NAME, active.length > 0 ? formatStatusTag(active) : undefined);
 }
 
 function startTicker(pi: ExtensionAPI): void {
@@ -1648,11 +1648,71 @@ function formatFireMessage(job: ReturnOnJob, reason: string): string {
 	].join("\n");
 }
 
+function truncateInline(value: string, limit: number): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	return normalized.length > limit ? `${normalized.slice(0, Math.max(0, limit - 1))}…` : normalized;
+}
+
+function describeCondition(condition: Condition): string {
+	if (isGroupCondition(condition)) {
+		const op = condition.op.toUpperCase();
+		return `${op}(${condition.children.map(describeCondition).join(", ")})`;
+	}
+	if (condition.type === "timer") return condition.after !== undefined ? `timer after ${condition.after}` : `timer at ${condition.at ?? "?"}`;
+	if (condition.type === "file") {
+		const checks = [
+			condition.deleted ? "deleted" : undefined,
+			condition.exists === false ? "absent" : undefined,
+			condition.exists === true ? "exists" : undefined,
+			condition.changed ? "changed" : undefined,
+			condition.stableFor !== undefined ? `stable ${condition.stableFor}` : undefined,
+			condition.contains !== undefined ? `contains '${condition.contains}'` : undefined,
+			condition.matches !== undefined ? `matches /${condition.matches}/` : undefined,
+		].filter(Boolean).join("+");
+		return `file ${condition.path}${checks ? ` ${checks}` : ""}`;
+	}
+	if (condition.type === "exec") return `exec ${condition.command ?? condition.code ?? "?"}`;
+	if (condition.type === "process") {
+		const target = condition.pid !== undefined ? `pid ${condition.pid}` : condition.name ?? condition.commandContains ?? condition.matches ?? "?";
+		const state = condition.exited || condition.state === "exited" ? "exited" : "running";
+		return `process ${target} ${state}`;
+	}
+	if (condition.type === "port") return `port ${condition.host ?? "127.0.0.1"}:${condition.port} ${condition.closed ? "closed" : "open"}`;
+	if (condition.type === "url") return `url ${condition.url}`;
+	if (condition.type === "webhook") return `webhook ${condition.method ?? "POST"} ${condition.path ?? ""}`;
+	return "unknown condition";
+}
+
+function latestLeafSummary(job: ReturnOnJob): string | undefined {
+	const latched = Object.entries(job.latches);
+	if (latched.length > 0) return `latched ${latched.length}: ${latched.map(([, latch]) => latch.summary).join("; ")}`;
+	const summaries = Object.values(job.leafState)
+		.filter((state) => state.lastSummary)
+		.sort((a, b) => (b.lastCheckAt ?? 0) - (a.lastCheckAt ?? 0));
+	return summaries[0]?.lastSummary;
+}
+
+function formatJobWaitSummary(job: ReturnOnJob): string {
+	return latestLeafSummary(job) ?? describeCondition(job.condition);
+}
+
+function formatStatusTag(active: ReturnOnJob[]): string {
+	if (active.length === 1) {
+		const job = active[0];
+		return `⏰ ${truncateInline(job.label, 22)} · ${truncateInline(formatJobWaitSummary(job), 48)}`;
+	}
+	const labels = active.slice(0, 3).map((job) => truncateInline(job.label, 16)).join(" · ");
+	const more = active.length > 3 ? ` +${active.length - 3}` : "";
+	return `⏰ ${active.length} waiting: ${labels}${more}`;
+}
+
 function summarizeJob(job: ReturnOnJob): string {
 	const timeout = job.timeoutAt ? ` timeout=${nowIso(job.timeoutAt)}` : "";
 	const delivery = job.delivery?.mode ? ` delivery=${job.delivery.mode}` : "";
 	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
-	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler} cwd=${job.cwd}`;
+	const fired = job.firedAt ? ` fired=${nowIso(job.firedAt)}` : "";
+	const cancelled = job.cancelledAt ? ` cancelled=${nowIso(job.cancelledAt)}` : "";
+	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
 }
 
 function commandReply(content: string): void {
