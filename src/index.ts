@@ -242,6 +242,13 @@ interface IncomingWebhookTarget {
 	condition: IncomingWebhookCondition;
 }
 
+type LeafCondition = TimerCondition | FileCondition | ExecCondition | ProcessCondition | PortCondition | UrlCondition | IncomingWebhookCondition;
+
+interface ConditionLeafTarget {
+	key: string;
+	condition: LeafCondition;
+}
+
 type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_backgrounded";
 
 interface DirectWaitMatch {
@@ -789,6 +796,15 @@ function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.conditi
 		return targets;
 	}
 	if (condition.type === "webhook") targets.push({ jobId: job.id, key, condition });
+	return targets;
+}
+
+function collectConditionLeafTargets(condition: Condition, key = "root", targets: ConditionLeafTarget[] = []): ConditionLeafTarget[] {
+	if (isGroupCondition(condition)) {
+		condition.children.forEach((child, index) => collectConditionLeafTargets(child, `${key}.${index}`, targets));
+		return targets;
+	}
+	targets.push({ key, condition });
 	return targets;
 }
 
@@ -1706,6 +1722,54 @@ function formatStatusTag(active: ReturnOnJob[]): string {
 	return `⏰ ${active.length} waiting: ${labels}${more}`;
 }
 
+function pollingIntervalForLeaf(job: ReturnOnJob, condition: LeafCondition): number | undefined {
+	if (condition.type === "file") return getPollingInterval(job, condition.every, DEFAULT_FILE_EVERY_MS);
+	if (condition.type === "exec") return getPollingInterval(job, condition.every, DEFAULT_EXEC_EVERY_MS, MIN_EXEC_EVERY_MS);
+	if (condition.type === "process") return getPollingInterval(job, condition.every, DEFAULT_PROCESS_EVERY_MS);
+	if (condition.type === "port") return getPollingInterval(job, condition.every, DEFAULT_PORT_EVERY_MS);
+	if (condition.type === "url") return getPollingInterval(job, condition.every, DEFAULT_URL_EVERY_MS);
+	return undefined;
+}
+
+function formatNextCheck(job: ReturnOnJob, key: string, condition: LeafCondition): string | undefined {
+	if (job.status !== "active") return undefined;
+	const interval = pollingIntervalForLeaf(job, condition);
+	if (interval === undefined) return undefined;
+	const last = job.leafState[key]?.lastCheckAt;
+	if (!last) return "next check: due now";
+	const remaining = last + interval - Date.now();
+	return remaining <= 0 ? "next check: due now" : `next check: in ${formatDuration(remaining)}`;
+}
+
+function formatConditionTree(condition: Condition, key = "root", depth = 0): string {
+	const prefix = "  ".repeat(depth);
+	if (isGroupCondition(condition)) {
+		return [
+			`${prefix}${key}: ${condition.op.toUpperCase()}`,
+			...condition.children.map((child, index) => formatConditionTree(child, `${key}.${index}`, depth + 1)),
+		].join("\n");
+	}
+	return `${prefix}${key}: ${describeCondition(condition)}`;
+}
+
+function formatLeafStateLines(job: ReturnOnJob): string[] {
+	return collectConditionLeafTargets(job.condition).map(({ key, condition }) => {
+		const latch = job.latches[key];
+		if (latch) return `${key}: latched at ${nowIso(latch.trueAt)} — ${latch.summary}`;
+		const state = job.leafState[key];
+		const checked = state?.lastCheckAt ? `last check ${nowIso(state.lastCheckAt)}` : "not checked yet";
+		const value = state?.lastValue === undefined ? "unknown" : state.lastValue ? "true" : "false";
+		const next = formatNextCheck(job, key, condition);
+		return `${key}: ${value}; ${checked}${next ? `; ${next}` : ""}; ${state?.lastSummary ?? describeCondition(condition)}`;
+	});
+}
+
+function formatJobWebhooks(job: ReturnOnJob): string[] {
+	const urls = incomingWebhookUrls(job);
+	if (urls.length > 0) return urls.map((hook) => `${hook.method} ${hook.url}`);
+	return collectIncomingWebhookTargets(job).map((target) => `${target.condition.method ?? "POST"} ${target.condition.path ?? "/return-on"}${target.condition.token ? "?token=<redacted>" : ""}`);
+}
+
 function summarizeJob(job: ReturnOnJob): string {
 	const timeout = job.timeoutAt ? ` timeout=${nowIso(job.timeoutAt)}` : "";
 	const delivery = job.delivery?.mode ? ` delivery=${job.delivery.mode}` : "";
@@ -1713,6 +1777,35 @@ function summarizeJob(job: ReturnOnJob): string {
 	const fired = job.firedAt ? ` fired=${nowIso(job.firedAt)}` : "";
 	const cancelled = job.cancelledAt ? ` cancelled=${nowIso(job.cancelledAt)}` : "";
 	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
+}
+
+function formatJobDetails(job: ReturnOnJob): string {
+	const lines = [
+		`return_on job ${job.id}`,
+		`Status: ${job.status}`,
+		`Label: ${job.label}`,
+		`Created: ${nowIso(job.createdAt)}`,
+		`Updated: ${nowIso(job.updatedAt)}`,
+		...(job.timeoutAt ? [`Timeout: ${nowIso(job.timeoutAt)}`] : []),
+		...(job.firedAt ? [`Fired: ${nowIso(job.firedAt)}`] : []),
+		...(job.fireReason ? [`Fire reason: ${job.fireReason}`] : []),
+		...(job.cancelledAt ? [`Cancelled: ${nowIso(job.cancelledAt)}`] : []),
+		...(job.delivery ? [`Delivery: ${job.delivery.mode} notify=${job.delivery.notify}`] : []),
+		...(job.handlerRunId ? [`Handler: ${job.handlerRunId}`] : []),
+		`CWD: ${job.cwd}`,
+		"",
+		`Waiting: ${formatJobWaitSummary(job)}`,
+		"",
+		"Condition tree:",
+		formatConditionTree(job.condition),
+		"",
+		"Leaf checks:",
+		...formatLeafStateLines(job).map((line) => `- ${line}`),
+	];
+	const hooks = formatJobWebhooks(job);
+	if (hooks.length > 0) lines.push("", "Incoming webhooks:", ...hooks.map((hook) => `- ${hook}`));
+	lines.push("", "Resume instruction:", job.resume);
+	return lines.join("\n");
 }
 
 function commandReply(content: string): void {
@@ -1808,7 +1901,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
 				return;
 			}
-			ctx.ui.notify(`${summarizeJob(job)}\n${JSON.stringify({ latches: job.latches, leafState: job.leafState }, null, 2)}`, "info");
+			ctx.ui.notify(formatJobDetails(job), "info");
 		},
 	});
 
@@ -1939,7 +2032,7 @@ export default function (pi: ExtensionAPI) {
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}. I will wake the session when it fires; do not poll or wait manually.${webhookText}` }],
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}\nI will wake the session when it fires; do not poll or wait manually.${webhookText}` }],
 				details: { job, incomingWebhooks },
 				terminate: true,
 			};

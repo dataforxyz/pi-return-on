@@ -621,8 +621,8 @@ async function testListToolAndCommands() {
   if (!cancelledText.includes(cancelId) || cancelledText.includes(activeId) || !cancelledText.includes("waiting:")) throw new Error(`cancelled list had wrong jobs or missing wait detail: ${cancelledText}`);
 
   await harness.commands.get("return-on-status")?.handler(cancelId, harness.ctx);
-  if (!harness.notifications.some((entry) => entry.message.includes(cancelId) && entry.message.includes("cancelled"))) {
-    throw new Error("return-on-status command did not notify cancelled job details");
+  if (!harness.notifications.some((entry) => entry.message.includes(cancelId) && entry.message.includes("cancelled") && entry.message.includes("Condition tree:") && entry.message.includes("Leaf checks:"))) {
+    throw new Error("return-on-status command did not notify rich cancelled job details");
   }
   await harness.commands.get("return-on-list")?.handler("", harness.ctx);
   if (!harness.notifications.some((entry) => entry.message.includes(activeId) && entry.message.includes(cancelId))) {

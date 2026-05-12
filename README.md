@@ -34,7 +34,8 @@ Visibility:
 
 - Active waits update the Pi status footer with compact tags such as `⏰ build · port 127.0.0.1:3000 open` or `⏰ 2 waiting: build · render`.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
-- `/return-on-status <id>` includes latch and leaf-state details for deeper debugging.
+- The `return_on` registration result includes a `Waiting for:` line so the agent and user can immediately verify the watcher target.
+- `/return-on-status <id>` includes the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
 
 Diagnostics:
 
