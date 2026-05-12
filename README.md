@@ -32,7 +32,9 @@ Slash commands:
 
 Diagnostics:
 
-- `npm run scan-errors` scans local Pi session JSONL logs for failed `return_on` tool calls and groups common error messages/argument shapes. Use `npm run scan-errors -- <path>` to scan non-default session roots.
+- `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
+- By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, `handlers.json`, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
 
 ## `return_on` parameters
 
