@@ -91,6 +91,23 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     for (const handler of events.get(event) ?? []) await handler({}, ctx);
   }
 
+  async function beforeAgentStart(systemPrompt = "base system prompt") {
+    let current = systemPrompt;
+    for (const handler of events.get("before_agent_start") ?? []) {
+      const result = await handler({ prompt: "test", images: [], systemPrompt: current, systemPromptOptions: {} }, ctx);
+      if (typeof result?.systemPrompt === "string") current = result.systemPrompt;
+    }
+    return current;
+  }
+
+  async function toolCall(toolName: string, input: any) {
+    for (const handler of events.get("tool_call") ?? []) {
+      const result = await handler({ toolName, toolCallId: "tool-call", input }, ctx);
+      if (result?.block) return result;
+    }
+    return undefined;
+  }
+
   function requireTool(name: string): Tool {
     const tool = tools.get(name);
     if (!tool) throw new Error(`missing tool ${name}`);
@@ -109,7 +126,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
-  return { commands, ctx, emit, messages, notifications, register, cancel, sessionFile, statuses, tools, get confirmCalls() { return confirmCalls; } };
+  return { beforeAgentStart, commands, ctx, emit, messages, notifications, register, cancel, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
 }
 
 function wakeEntries(harness: Harness, jobId: string) {
@@ -144,6 +161,34 @@ async function expectNoWake(harness: Harness, jobId: string, durationMs: number,
   await sleep(durationMs);
   const entries = wakeEntries(harness, jobId);
   if (entries.length !== 0) throw new Error(`unexpected early wake for ${jobId}: ${reason}`);
+}
+
+async function testDirectWaitPolicy(harness: Harness) {
+  const systemPrompt = await harness.beforeAgentStart();
+  if (!systemPrompt.includes("Direct wait policy for return_on") || !systemPrompt.includes("Do not block the conversation with direct waits")) {
+    throw new Error(`direct wait guidance was not injected into the system prompt: ${systemPrompt}`);
+  }
+
+  const blockedSleep = await harness.toolCall("bash", { command: "sleep 30" });
+  if (!blockedSleep?.block || !String(blockedSleep.reason).includes("return_on")) {
+    throw new Error(`long sleep was not blocked with return_on guidance: ${JSON.stringify(blockedSleep)}`);
+  }
+
+  const blockedTail = await harness.toolCall("bash", { command: "tail -f server.log" });
+  if (!blockedTail?.block || !String(blockedTail.reason).includes("tail -f")) {
+    throw new Error(`tail -f was not blocked: ${JSON.stringify(blockedTail)}`);
+  }
+
+  const blockedDevServer = await harness.toolCall("bash", { command: "npm run dev" });
+  if (!blockedDevServer?.block || !String(blockedDevServer.reason).includes("background")) {
+    throw new Error(`foreground dev server was not blocked: ${JSON.stringify(blockedDevServer)}`);
+  }
+
+  const shortSleep = await harness.toolCall("bash", { command: "sleep 1" });
+  if (shortSleep?.block) throw new Error(`short sleep should not be blocked: ${JSON.stringify(shortSleep)}`);
+
+  const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
+  if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);
 }
 
 async function testTimer(harness: Harness) {
@@ -528,6 +573,7 @@ async function testSessionIsolation() {
 const harness = createHarness("main-session");
 await harness.emit("session_start");
 
+await testDirectWaitPolicy(harness);
 await testTimer(harness);
 await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);

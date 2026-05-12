@@ -27,6 +27,14 @@ const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
+const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 5_000;
+
+const DIRECT_WAIT_SYSTEM_GUIDANCE = [
+	"Direct wait policy for return_on:",
+	"- Do not block the conversation with direct waits such as long sleep commands, tail -f, watch, infinite polling loops, or foreground dev servers.",
+	"- For long-running work, start the command in the background, capture logs/pid files, then register a return_on watcher for the file, process, port, URL, webhook, or timer that means it is ready/done.",
+	"- After registering return_on, end the turn and let return_on wake the session instead of polling manually.",
+].join("\n");
 
 type GroupOp = "and" | "or" | "not";
 type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
@@ -187,6 +195,11 @@ interface IncomingWebhookTarget {
 	condition: IncomingWebhookCondition;
 }
 
+interface DirectWaitMatch {
+	kind: string;
+	detail: string;
+}
+
 let jobs: ReturnOnJob[] = [];
 let currentSessionFile: string | undefined;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
@@ -269,6 +282,68 @@ function formatDuration(ms: number): string {
 	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
 	if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
 	return `${Math.round(ms / 86_400_000)}d`;
+}
+
+function parseShellSleepDurationMs(value: string, unit = "s"): number | undefined {
+	const numeric = Number(value);
+	if (!Number.isFinite(numeric)) return undefined;
+	const normalizedUnit = unit.toLowerCase();
+	const multiplier = normalizedUnit === "" || normalizedUnit === "s"
+		? 1000
+		: normalizedUnit === "m"
+			? 60_000
+			: normalizedUnit === "h"
+				? 3_600_000
+				: normalizedUnit === "d"
+					? 86_400_000
+					: normalizedUnit === "ms"
+						? 1
+						: undefined;
+	return multiplier === undefined ? undefined : Math.round(numeric * multiplier);
+}
+
+function isExplicitlyBackgrounded(command: string): boolean {
+	const normalized = command.replace(/\\\n/g, " ");
+	return /(^|\s)(nohup|setsid)\s+/.test(normalized)
+		|| /(^|[;\s])disown(\s|;|$)/.test(normalized)
+		|| /(^|[^&])&(\s*(echo\s+\$!|disown|$|[;]))/.test(normalized);
+}
+
+function findDirectWait(command: string): DirectWaitMatch | undefined {
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	if (!normalized || isExplicitlyBackgrounded(normalized)) return undefined;
+
+	for (const match of normalized.matchAll(/(?:^|[;&|]\s*)(?:rtk\s+run\s+)?sleep\s+(\d+(?:\.\d+)?)(ms|s|m|h|d)?\b/g)) {
+		const durationMs = parseShellSleepDurationMs(match[1], match[2] ?? "s");
+		if (durationMs !== undefined && durationMs >= DIRECT_SLEEP_BLOCK_THRESHOLD_MS) {
+			return { kind: "long sleep", detail: `sleep ${match[1]}${match[2] ?? "s"}` };
+		}
+	}
+
+	const checks: Array<{ regex: RegExp; kind: string; detail: string }> = [
+		{ regex: /(?:^|[;&|]\s*)tail\b[^;&|]*(?:\s-f\b|\s--follow(?:=\S+)?\b)/, kind: "streaming log wait", detail: "tail -f/--follow" },
+		{ regex: /(?:^|[;&|]\s*)journalctl\b[^;&|]*(?:\s-f\b|\s--follow\b)/, kind: "streaming log wait", detail: "journalctl -f/--follow" },
+		{ regex: /(?:^|[;&|]\s*)kubectl\s+logs\b[^;&|]*(?:\s-f\b|\s--follow\b)/, kind: "streaming log wait", detail: "kubectl logs -f/--follow" },
+		{ regex: /(?:^|[;&|]\s*)watch\s+/, kind: "repeated polling", detail: "watch" },
+		{ regex: /\bwhile\s+(?:true|:)\s*;\s*do\b/, kind: "infinite loop", detail: "while true/while :" },
+		{ regex: /\bfor\s*\(\(\s*;\s*;\s*\)\)\s*;\s*do\b/, kind: "infinite loop", detail: "for ((;;))" },
+		{ regex: /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?dev\b/, kind: "foreground dev server", detail: "package manager dev server" },
+		{ regex: /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+start\b/, kind: "foreground server", detail: "package manager start server" },
+		{ regex: /(?:^|[;&|]\s*)(?:next|vite|astro|webpack-dev-server)\s+(?:dev|serve)?\b/, kind: "foreground dev server", detail: "dev server command" },
+		{ regex: /(?:^|[;&|]\s*)python(?:3)?\s+-m\s+http\.server\b/, kind: "foreground server", detail: "python -m http.server" },
+	];
+
+	const found = checks.find((check) => check.regex.test(normalized));
+	return found ? { kind: found.kind, detail: found.detail } : undefined;
+}
+
+function formatDirectWaitBlockReason(match: DirectWaitMatch): string {
+	return [
+		`Blocked direct wait (${match.kind}: ${match.detail}).`,
+		"Do not keep the agent turn busy waiting.",
+		"Start the long-running command in the background with logs/pid captured, then call return_on to wake on the readiness/completion signal.",
+		"Example pattern: mkdir -p .return-on && <command> > .return-on/task.log 2>&1 & echo $! > .return-on/task.pid; then return_on on a file/log/process/port/url condition.",
+	].join(" ");
 }
 
 async function loadJobs(): Promise<void> {
@@ -1104,6 +1179,19 @@ export default function (pi: ExtensionAPI) {
 		return new Text(theme.fg("accent", "⏰ return_on\n") + message.content, 0, 0);
 	});
 
+	pi.on("before_agent_start", async (event) => {
+		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
+	});
+
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "bash") return undefined;
+		const input = event.input as { command?: unknown };
+		const command = typeof input.command === "string" ? input.command : "";
+		const directWait = findDirectWait(command);
+		if (!directWait) return undefined;
+		return { block: true, reason: formatDirectWaitBlockReason(directWait) };
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
@@ -1177,8 +1265,10 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
+			"Do not use direct waits like long sleep commands, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
+			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
-			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only when the user approved the command or after confirmation.",
+			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only after user approval.",
 		],
 		parameters: Type.Object({
 			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
