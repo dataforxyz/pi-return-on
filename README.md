@@ -21,12 +21,18 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 - `return_on` — register a watcher and terminate the current LLM turn.
 - `return_on_list` — list watcher jobs for the current session.
 - `return_on_cancel` — cancel a watcher by id.
+- `return_on_handlers` — list background fork/sibling handlers launched for fired watchers.
 
 Slash commands:
 
 - `/return-on-list`
 - `/return-on-status <id>`
 - `/return-on-cancel <id>`
+- `/return-on-handlers`
+
+Diagnostics:
+
+- `npm run scan-errors` scans local Pi session JSONL logs for failed `return_on` tool calls and groups common error messages/argument shapes. Use `npm run scan-errors -- <path>` to scan non-default session roots.
 
 ## `return_on` parameters
 
@@ -38,6 +44,7 @@ Slash commands:
   "every": "2s",
   "timeout": "30m",
   "webhook": "https://example.com/pi-return-on-hook",
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" },
   "allowExec": false
 }
 ```
@@ -50,9 +57,32 @@ Slash commands:
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
+| `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
+
+## Background fork handlers
+
+Legacy delivery wakes the same parent session with `triggerTurn: true`. For events that should be handled without distracting the parent, pass:
+
+```json
+{
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+}
+```
+
+When the watcher fires, the extension writes an event capsule under `~/.local/state/pi-return-on/handlers/<id>/`, starts `pi -p --fork <parent-session> @prompt.md` as a sibling/background Pi process, and posts a brief ack plus final handler summary back into the parent transcript. The fork inherits normal Pi extension discovery, so tools such as `subagent(...)` are available when they are installed for top-level Pi sessions.
+
+Useful delivery options:
+
+- `notify: "ack-and-summary"` — post launch ack and final summary.
+- `notify: "summary"` — only post the final summary.
+- `notify: "none"` — keep handler output in its handler directory only.
+- `triggerParentOnSummary: true` — make the final summary trigger a parent turn; default is display-only.
+- `piCommand` — override the `pi` executable path for testing or custom installs. `PI_RETURN_ON_PI_BIN` also works.
+
+Set `PI_RETURN_ON_DELIVERY_MODE=fork` before starting Pi to make fork handling the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
 
 ## Incoming webhooks
 
@@ -193,6 +223,16 @@ Empty `all` / `any` groups are rejected.
 { "type": "timer", "at": "18:00" }
 ```
 
+Common aliases are accepted and normalized:
+
+```json
+{ "timer": "20m" }
+```
+
+```json
+{ "type": "timer", "duration": "20m" }
+```
+
 `at` can be an ISO-like date/time or `HH:MM`; if `HH:MM` has already passed today, it means tomorrow.
 
 ### File / log
@@ -261,6 +301,12 @@ Exec leaves run local commands. They are powerful and risky: commands run as the
 
 ```json
 { "type": "exec", "runner": "sh", "command": "grep -q Ready server.log", "success": true, "every": "5s" }
+```
+
+A common alias is accepted and normalized:
+
+```json
+{ "exec": "grep -q Ready server.log", "success": true, "every": "5s" }
 ```
 
 ```json
@@ -382,9 +428,11 @@ Jobs are persisted to:
 
 ```text
 ~/.local/state/pi-return-on/jobs.json
+~/.local/state/pi-return-on/handlers.json
+~/.local/state/pi-return-on/handlers/<handler-id>/
 ```
 
-Jobs are scoped by Pi session file. A watcher resumes the session that registered it after `/reload` or restart, but should not wake a different session.
+Jobs are scoped by Pi session file. A watcher resumes the session that registered it after `/reload` or restart, but should not wake a different session. Fork-handler output is persisted under `handlers/<handler-id>/`.
 
 ## Testing
 
@@ -392,7 +440,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, incoming webhook wakeups, outgoing webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, fork-delivery handler launch/summary, incoming webhook wakeups, outgoing webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 

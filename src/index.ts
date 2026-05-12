@@ -12,8 +12,11 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const EXTENSION_NAME = "return-on";
+const HANDLER_MESSAGE_TYPE = "return-on-handler";
 const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
+const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
+const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
 const DEFAULT_TICK_MS = 1000;
 const DEFAULT_EXEC_EVERY_MS = 5000;
 const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
@@ -28,6 +31,7 @@ const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PO
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
+const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
@@ -126,6 +130,16 @@ interface WebhookConfig {
 	timeout?: string | number;
 }
 
+type DeliveryMode = "wake" | "fork";
+type HandlerNotifyMode = "ack-and-summary" | "summary" | "none";
+
+interface DeliveryConfig {
+	mode: DeliveryMode;
+	notify: HandlerNotifyMode;
+	triggerParentOnSummary: boolean;
+	piCommand?: string;
+}
+
 interface IncomingWebhookCondition extends Record<string, unknown> {
 	type: "webhook";
 	path?: string;
@@ -163,6 +177,8 @@ interface ReturnOnJob {
 	allowExec?: boolean;
 	every?: string | number;
 	webhook?: WebhookConfig;
+	delivery?: DeliveryConfig;
+	handlerRunId?: string;
 	latches: Record<string, LeafLatch>;
 	leafState: Record<string, LeafState>;
 	fireReason?: string;
@@ -170,9 +186,39 @@ interface ReturnOnJob {
 	cancelledAt?: number;
 }
 
+interface ReturnOnHandlerRun {
+	id: string;
+	jobId: string;
+	label: string;
+	cwd: string;
+	parentSessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
+	parentIntercomTarget?: string;
+	status: "starting" | "running" | "complete" | "failed";
+	pid?: number;
+	startedAt: number;
+	endedAt?: number;
+	exitCode?: number | null;
+	signal?: NodeJS.Signals | null;
+	dir: string;
+	eventPath: string;
+	promptPath: string;
+	stdoutPath: string;
+	stderrPath: string;
+	sessionDir: string;
+	summary?: string;
+	error?: string;
+}
+
 interface JobsState {
 	version: 1;
 	jobs: ReturnOnJob[];
+}
+
+interface HandlersState {
+	version: 1;
+	handlers: ReturnOnHandlerRun[];
 }
 
 interface EvalResult {
@@ -201,6 +247,7 @@ interface DirectWaitMatch {
 }
 
 let jobs: ReturnOnJob[] = [];
+let handlerRuns: ReturnOnHandlerRun[] = [];
 let currentSessionFile: string | undefined;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
 let immediateTickTimer: ReturnType<typeof setTimeout> | undefined;
@@ -366,6 +413,26 @@ async function saveJobs(): Promise<void> {
 	await fsp.rename(tmp, JOBS_FILE);
 }
 
+async function loadHandlers(): Promise<void> {
+	try {
+		const raw = await fsp.readFile(HANDLERS_FILE, "utf8");
+		const parsed = JSON.parse(raw) as HandlersState;
+		handlerRuns = Array.isArray(parsed.handlers) ? parsed.handlers : [];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			console.error(`[${EXTENSION_NAME}] Failed to load handler runs:`, error);
+		}
+		handlerRuns = [];
+	}
+}
+
+async function saveHandlers(): Promise<void> {
+	await fsp.mkdir(STATE_DIR, { recursive: true });
+	const tmp = `${HANDLERS_FILE}.${process.pid}.${Date.now()}.tmp`;
+	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: handlerRuns.slice(-200) } satisfies HandlersState, null, 2), "utf8");
+	await fsp.rename(tmp, HANDLERS_FILE);
+}
+
 function activeJobsForCurrentSession(): ReturnOnJob[] {
 	return jobs.filter((job) => job.status === "active" && (!job.sessionFile || !currentSessionFile || job.sessionFile === currentSessionFile));
 }
@@ -439,6 +506,34 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 	return config;
 }
 
+function normalizeDelivery(input: unknown): DeliveryConfig {
+	const defaultMode: DeliveryMode = process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake";
+	const base: DeliveryConfig = {
+		mode: defaultMode,
+		notify: "ack-and-summary",
+		triggerParentOnSummary: process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
+	};
+	if (input === undefined || input === null || input === false) return base;
+	if (input === true) return { ...base, mode: "fork" };
+	if (typeof input === "string") {
+		if (input !== "wake" && input !== "fork") throw new Error("delivery string must be 'wake' or 'fork'");
+		return { ...base, mode: input };
+	}
+	if (!isObject(input)) throw new Error("delivery must be an object, boolean, or 'wake'/'fork'");
+	const mode = input.mode === undefined ? base.mode : input.mode;
+	if (mode !== "wake" && mode !== "fork") throw new Error("delivery.mode must be 'wake' or 'fork'");
+	const notify = input.notify === undefined ? base.notify : input.notify;
+	if (notify !== "ack-and-summary" && notify !== "summary" && notify !== "none") throw new Error("delivery.notify must be 'ack-and-summary', 'summary', or 'none'");
+	const triggerParentOnSummary = input.triggerParentOnSummary === undefined ? base.triggerParentOnSummary : Boolean(input.triggerParentOnSummary);
+	const piCommand = input.piCommand === undefined ? undefined : String(input.piCommand).trim();
+	return {
+		mode,
+		notify,
+		triggerParentOnSummary,
+		...(piCommand ? { piCommand } : {}),
+	};
+}
+
 function normalizeCondition(input: unknown): Condition {
 	if (!isObject(input)) throw new Error("condition must be an object");
 	if (Array.isArray(input.any)) {
@@ -458,7 +553,24 @@ function normalizeCondition(input: unknown): Condition {
 		if (op === "not" && childrenInput.length !== 1) throw new Error("not group requires exactly one child");
 		return { ...input, op, children: childrenInput.map(normalizeCondition) } as Condition;
 	}
-	if (input.type === "timer") return input as TimerCondition;
+	if (input.type === undefined) {
+		if (input.timer !== undefined) {
+			if (typeof input.timer !== "string" && typeof input.timer !== "number") throw new Error("timer shorthand requires a duration string or number");
+			const { timer, ...rest } = input;
+			return normalizeCondition({ ...rest, type: "timer", after: timer });
+		}
+		if (input.exec !== undefined) {
+			if (typeof input.exec !== "string") throw new Error("exec shorthand requires a command string");
+			const { exec, ...rest } = input;
+			return normalizeCondition({ ...rest, type: "exec", command: exec });
+		}
+	}
+	if (input.type === "timer") {
+		const timer = { ...input } as TimerCondition & { duration?: string | number };
+		if (timer.after === undefined && timer.at === undefined && timer.duration !== undefined) timer.after = timer.duration;
+		if (timer.after === undefined && timer.at === undefined) throw new Error("timer condition requires after, at, or duration");
+		return timer;
+	}
 	if (input.type === "file") {
 		if (typeof input.path !== "string" || !input.path.trim()) throw new Error("file condition requires path");
 		return input as FileCondition;
@@ -1080,6 +1192,281 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 	}
 }
 
+function getParentSessionId(ctx = latestCtx): string | undefined {
+	try {
+		const sessionManager = ctx?.sessionManager as { getSessionId?: () => string } | undefined;
+		return sessionManager?.getSessionId?.();
+	} catch {
+		return undefined;
+	}
+}
+
+function getParentSessionName(pi: ExtensionAPI): string | undefined {
+	try {
+		return pi.getSessionName?.();
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveParentIntercomTarget(pi: ExtensionAPI, ctx = latestCtx): string | undefined {
+	const name = getParentSessionName(pi)?.trim();
+	if (name) return name;
+	const sessionId = getParentSessionId(ctx);
+	if (!sessionId) return undefined;
+	const normalized = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
+	return `subagent-chat-${normalized.slice(0, 8)}`;
+}
+
+function makeHandlerId(job: ReturnOnJob): string {
+	return `roh_${job.id.replace(/^ro_/, "")}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function buildReturnEventPayload(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun): Record<string, unknown> {
+	return {
+		event: "return_on.fired",
+		id: job.id,
+		label: job.label,
+		reason,
+		createdAt: job.createdAt,
+		firedAt: job.firedAt,
+		cwd: job.cwd,
+		parentSessionFile: job.sessionFile,
+		parentSessionId: run.parentSessionId,
+		parentSessionName: run.parentSessionName,
+		parentIntercomTarget: run.parentIntercomTarget,
+		resume: job.resume,
+		condition: job.condition,
+		latches: job.latches,
+		handler: {
+			id: run.id,
+			dir: run.dir,
+			eventPath: run.eventPath,
+			stdoutPath: run.stdoutPath,
+			stderrPath: run.stderrPath,
+			sessionDir: run.sessionDir,
+		},
+	};
+}
+
+function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun, eventJson: string): string {
+	const parentContact = run.parentIntercomTarget
+		? `Parent intercom target, if pi-intercom is available: ${run.parentIntercomTarget}`
+		: "No parent intercom target was resolved; rely on your final summary.";
+	return [
+		"You are a background return_on handler running in a fork/sibling Pi session.",
+		"The parent chat should stay undistracted. Handle the fired event as independently as safely possible.",
+		"",
+		"Operating rules:",
+		"- Treat the inherited session/context as a snapshot, not live state.",
+		"- You may use normal Pi tools and extensions available in this top-level session, including subagent(...) if it is available and useful.",
+		"- Do not ask the parent routine completion questions. Only contact the parent for a blocker, risky action, approval, or user decision.",
+		"- If you do contact the parent, keep it brief and include the handler id.",
+		"- Prefer producing a concise final summary. The return_on extension will relay that final output to the parent session.",
+		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting.",
+		"",
+		parentContact,
+		`Handler id: ${run.id}`,
+		`Event JSON path: ${run.eventPath}`,
+		"",
+		"Return event payload:",
+		"```json",
+		eventJson,
+		"```",
+		"",
+		"Resume instruction:",
+		job.resume,
+	].join("\n");
+}
+
+function buildHandlerArgs(job: ReturnOnJob, run: ReturnOnHandlerRun): string[] {
+	const args = ["-p", "--session-dir", run.sessionDir];
+	if (job.sessionFile) args.push("--fork", job.sessionFile);
+	args.push(`@${run.promptPath}`);
+	return args;
+}
+
+function getHandlerCommand(delivery: DeliveryConfig): string {
+	return delivery.piCommand || process.env.PI_RETURN_ON_PI_BIN || "pi";
+}
+
+async function readOptionalText(filePath: string): Promise<string> {
+	try {
+		return await fsp.readFile(filePath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+		throw error;
+	}
+}
+
+function closeFdBestEffort(fd: number | undefined): void {
+	if (fd === undefined) return;
+	try {
+		fs.closeSync(fd);
+	} catch {
+		// Best effort cleanup; the child owns duplicated stdio fds after spawn succeeds.
+	}
+}
+
+function formatHandlerAck(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
+	return [
+		`return_on fired: ${job.label} (${job.id})`,
+		`Launched background fork handler ${run.id}${run.pid ? ` (pid ${run.pid})` : ""}.`,
+		"The parent thread will not be triggered unless the handler summary is configured to trigger it.",
+		`Handler dir: ${run.dir}`,
+	].join("\n");
+}
+
+function formatHandlerSummary(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
+	const status = run.status === "complete" ? "completed" : "failed";
+	const output = run.summary?.trim() || run.error || "(no handler output)";
+	return [
+		`return_on handler ${status}: ${job.label} (${job.id})`,
+		`Handler: ${run.id}`,
+		`Exit: ${run.exitCode ?? "signal " + (run.signal ?? "unknown")}`,
+		`Output: ${run.stdoutPath}`,
+		`Errors: ${run.stderrPath}`,
+		"",
+		truncateText(output, HANDLER_SUMMARY_LIMIT_BYTES),
+	].join("\n");
+}
+
+async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: string, code: number | null, signal: NodeJS.Signals | null, notify: HandlerNotifyMode, triggerParent: boolean): Promise<void> {
+	await loadHandlers();
+	const run = handlerRuns.find((candidate) => candidate.id === runId);
+	if (!run) return;
+	run.endedAt = Date.now();
+	run.exitCode = code;
+	run.signal = signal;
+	const stdout = await readOptionalText(run.stdoutPath);
+	const stderr = await readOptionalText(run.stderrPath);
+	run.summary = truncateText(stdout.trim() || stderr.trim(), HANDLER_SUMMARY_LIMIT_BYTES);
+	run.status = code === 0 ? "complete" : "failed";
+	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
+	await saveHandlers();
+	try {
+		pi.appendEntry?.("return-on-handler-finished", { id: run.id, jobId: run.jobId, status: run.status, exitCode: code, signal, endedAt: run.endedAt });
+	} catch {
+		// Best-effort audit trail.
+	}
+	if (notify === "summary" || notify === "ack-and-summary") {
+		pi.sendMessage(
+			{
+				customType: HANDLER_MESSAGE_TYPE,
+				content: formatHandlerSummary(job, run),
+				display: true,
+				details: { id: job.id, handlerRunId: run.id, label: job.label, status: run.status, exitCode: code, signal },
+			},
+			{ triggerTurn: triggerParent },
+		);
+	}
+}
+
+async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig): Promise<boolean> {
+	await loadHandlers();
+	const id = makeHandlerId(job);
+	const dir = path.join(HANDLERS_DIR, id);
+	const run: ReturnOnHandlerRun = {
+		id,
+		jobId: job.id,
+		label: job.label,
+		cwd: job.cwd,
+		...(job.sessionFile ? { parentSessionFile: job.sessionFile } : {}),
+		...(getParentSessionId() ? { parentSessionId: getParentSessionId() } : {}),
+		...(getParentSessionName(pi) ? { parentSessionName: getParentSessionName(pi) } : {}),
+		...(resolveParentIntercomTarget(pi) ? { parentIntercomTarget: resolveParentIntercomTarget(pi) } : {}),
+		status: "starting",
+		startedAt: Date.now(),
+		dir,
+		eventPath: path.join(dir, "event.json"),
+		promptPath: path.join(dir, "prompt.md"),
+		stdoutPath: path.join(dir, "stdout.log"),
+		stderrPath: path.join(dir, "stderr.log"),
+		sessionDir: path.join(dir, "sessions"),
+	};
+	const eventJson = JSON.stringify(buildReturnEventPayload(job, reason, run), null, 2);
+	await fsp.mkdir(run.sessionDir, { recursive: true });
+	await fsp.writeFile(run.eventPath, `${eventJson}\n`, "utf8");
+	await fsp.writeFile(run.promptPath, buildHandlerPrompt(job, reason, run, eventJson), "utf8");
+	handlerRuns.push(run);
+	job.handlerRunId = run.id;
+	await saveHandlers();
+	await saveJobs();
+
+	const command = getHandlerCommand(delivery);
+	const args = buildHandlerArgs(job, run);
+	let stdoutFd: number | undefined;
+	let stderrFd: number | undefined;
+	try {
+		stdoutFd = fs.openSync(run.stdoutPath, "a");
+		stderrFd = fs.openSync(run.stderrPath, "a");
+		const child = spawn(command, args, {
+			cwd: job.cwd,
+			detached: true,
+			env: {
+				...process.env,
+				PI_RETURN_ON_HANDLER: "1",
+				PI_RETURN_ON_HANDLER_RUN_ID: run.id,
+				...(job.sessionFile ? { PI_RETURN_ON_PARENT_SESSION_FILE: job.sessionFile } : {}),
+			},
+			stdio: ["ignore", stdoutFd, stderrFd],
+		});
+		closeFdBestEffort(stdoutFd);
+		closeFdBestEffort(stderrFd);
+		stdoutFd = undefined;
+		stderrFd = undefined;
+		child.unref();
+		run.pid = child.pid;
+		run.status = "running";
+		await saveHandlers();
+		child.once("error", async (error) => {
+			await loadHandlers();
+			const failed = handlerRuns.find((candidate) => candidate.id === run.id);
+			if (failed) {
+				failed.status = "failed";
+				failed.endedAt = Date.now();
+				failed.error = error instanceof Error ? error.message : String(error);
+				await saveHandlers();
+			}
+			pi.sendMessage(
+				{
+					customType: HANDLER_MESSAGE_TYPE,
+					content: `Failed to launch return_on handler ${run.id}: ${error instanceof Error ? error.message : String(error)}`,
+					display: true,
+					details: { id: job.id, handlerRunId: run.id, label: job.label, status: "failed" },
+				},
+				{ triggerTurn: true },
+			);
+		});
+		child.once("close", (code, signal) => {
+			void markHandlerFinished(pi, job, run.id, code, signal, delivery.notify, delivery.triggerParentOnSummary).catch((error) => {
+				console.error(`[${EXTENSION_NAME}] Failed to finish handler ${run.id}:`, error);
+			});
+		});
+		if (delivery.notify === "ack-and-summary") {
+			pi.sendMessage(
+				{
+					customType: HANDLER_MESSAGE_TYPE,
+					content: formatHandlerAck(job, run),
+					display: true,
+					details: { id: job.id, handlerRunId: run.id, label: job.label, status: "running" },
+				},
+				{ triggerTurn: false },
+			);
+		}
+		return true;
+	} catch (error) {
+		closeFdBestEffort(stdoutFd);
+		closeFdBestEffort(stderrFd);
+		run.status = "failed";
+		run.endedAt = Date.now();
+		run.error = error instanceof Error ? error.message : String(error);
+		await saveHandlers();
+		console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, error);
+		return false;
+	}
+}
+
 async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Promise<void> {
 	if (job.status !== "active") return;
 	job.status = "fired";
@@ -1087,7 +1474,6 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	job.updatedAt = job.firedAt;
 	job.fireReason = reason;
 	await saveJobs();
-	const message = formatFireMessage(job, reason);
 	try {
 		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt });
 	} catch {
@@ -1096,6 +1482,12 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	void sendWebhook(job, reason).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Webhook failed for ${job.id}:`, error);
 	});
+	const delivery = job.delivery ?? normalizeDelivery(undefined);
+	if (delivery.mode === "fork") {
+		const launched = await launchReturnHandler(pi, job, reason, delivery);
+		if (launched) return;
+	}
+	const message = formatFireMessage(job, reason);
 	pi.sendMessage(
 		{
 			customType: EXTENSION_NAME,
@@ -1162,7 +1554,9 @@ function formatFireMessage(job: ReturnOnJob, reason: string): string {
 
 function summarizeJob(job: ReturnOnJob): string {
 	const timeout = job.timeoutAt ? ` timeout=${nowIso(job.timeoutAt)}` : "";
-	return `${job.id} [${job.status}] ${job.label}${timeout} cwd=${job.cwd}`;
+	const delivery = job.delivery?.mode ? ` delivery=${job.delivery.mode}` : "";
+	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
+	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler} cwd=${job.cwd}`;
 }
 
 function commandReply(content: string): void {
@@ -1177,6 +1571,9 @@ function commandReply(content: string): void {
 export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer?.(EXTENSION_NAME, (message, _options, theme) => {
 		return new Text(theme.fg("accent", "⏰ return_on\n") + message.content, 0, 0);
+	});
+	pi.registerMessageRenderer?.(HANDLER_MESSAGE_TYPE, (message, _options, theme) => {
+		return new Text(theme.fg("accent", "⏰ return_on handler\n") + message.content, 0, 0);
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -1196,6 +1593,7 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = ctx;
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
+		await loadHandlers();
 		ensureTicker(pi);
 		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
 			ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
@@ -1238,6 +1636,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("return-on-handlers", {
+		description: "List background return_on fork handlers",
+		handler: async (_args, ctx) => {
+			latestCtx = ctx;
+			await loadHandlers();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const relevant = handlerRuns.filter((run) => !session || !run.parentSessionFile || run.parentSessionFile === session);
+			const text = relevant.length
+				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
+				: "No return_on handler runs for this session.";
+			ctx.ui.notify(text, "info");
+		},
+	});
+
 	pi.registerCommand("return-on-cancel", {
 		description: "Cancel a return_on job: /return-on-cancel <id>",
 		handler: async (args, ctx) => {
@@ -1277,6 +1689,7 @@ export default function (pi: ExtensionAPI) {
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
+			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1297,6 +1710,7 @@ export default function (pi: ExtensionAPI) {
 
 			const timeoutMs = parseDuration(params.timeout);
 			const webhook = normalizeWebhook(params.webhook);
+			const delivery = normalizeDelivery(params.delivery);
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
@@ -1311,6 +1725,7 @@ export default function (pi: ExtensionAPI) {
 				allowExec,
 				...(params.every !== undefined ? { every: params.every } : {}),
 				...(webhook ? { webhook } : {}),
+				...(params.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
 				latches: {},
 				leafState: {},
 			};
@@ -1367,6 +1782,24 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: relevant.length ? relevant.map(summarizeJob).join("\n") : `No ${status} return_on jobs.` }],
 				details: { jobs: relevant },
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on_handlers",
+		label: "List Return On Handlers",
+		description: "List background fork/sibling handlers launched for fired return_on jobs.",
+		parameters: Type.Object({ status: Type.Optional(StringEnum(["starting", "running", "complete", "failed", "all"] as const)) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			await loadHandlers();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const status = params.status ?? "all";
+			const relevant = handlerRuns.filter((run) => (!session || !run.parentSessionFile || run.parentSessionFile === session) && (status === "all" || run.status === status));
+			const text = relevant.length
+				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
+				: `No ${status} return_on handlers.`;
+			return { content: [{ type: "text", text }], details: { handlers: relevant } };
 		},
 	});
 }

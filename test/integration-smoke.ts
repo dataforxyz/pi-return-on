@@ -204,6 +204,69 @@ async function testTimer(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testForkDelivery(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-pi.mjs");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nconsole.log("fake return_on handler summary");\n`, { mode: 0o755 });
+  const label = "smoke fork delivery";
+  const resume = "fork delivery resume";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume,
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const handlerMessages = harness.messages.filter((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId);
+    const ack = handlerMessages.find((entry) => entry.message?.details?.status === "running");
+    const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
+    if (ack && summary) {
+      if (ack.options?.triggerTurn !== false) throw new Error("fork delivery ack should not trigger parent turn");
+      if (summary.options?.triggerTurn !== false) throw new Error("fork delivery summary should not trigger parent turn by default");
+      if (!String(summary.message?.content ?? "").includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
+}
+
+async function testCommonShorthandAccepted(harness: Harness) {
+  const tool = harness.tools.get("return_on");
+  if (!tool) throw new Error("missing return_on tool");
+
+  const timer = await tool.execute("timer-shorthand", {
+    label: "timer shorthand",
+    condition: { timer: "10s" },
+    resume: "timer shorthand resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const timerJob = timer.details.job;
+  allJobIds.push(timerJob.id);
+  if (timerJob.condition.type !== "timer" || timerJob.condition.after !== "10s") throw new Error(`timer shorthand was not normalized: ${JSON.stringify(timerJob.condition)}`);
+  await harness.cancel(timerJob.id);
+
+  const duration = await tool.execute("timer-duration", {
+    label: "timer duration alias",
+    condition: { type: "timer", duration: "10s" },
+    resume: "timer duration resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const durationJob = duration.details.job;
+  allJobIds.push(durationJob.id);
+  if (durationJob.condition.type !== "timer" || durationJob.condition.after !== "10s") throw new Error(`timer duration alias was not normalized: ${JSON.stringify(durationJob.condition)}`);
+  await harness.cancel(durationJob.id);
+
+  const exec = await tool.execute("exec-shorthand", {
+    label: "exec shorthand",
+    condition: { exec: "exit 1", failure: true, every: "2s" },
+    allowExec: true,
+    resume: "exec shorthand resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const execJob = exec.details.job;
+  allJobIds.push(execJob.id);
+  if (execJob.condition.type !== "exec" || execJob.condition.command !== "exit 1") throw new Error(`exec shorthand was not normalized: ${JSON.stringify(execJob.condition)}`);
+  await harness.cancel(execJob.id);
+}
+
 async function testLogContains(harness: Harness) {
   const label = "smoke log";
   const resume = "log resume";
@@ -579,7 +642,9 @@ const harness = createHarness("main-session");
 await harness.emit("session_start");
 
 await testDirectWaitPolicy(harness);
+await testCommonShorthandAccepted(harness);
 await testTimer(harness);
+await testForkDelivery(harness);
 await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);
 await testLogContains(harness);
