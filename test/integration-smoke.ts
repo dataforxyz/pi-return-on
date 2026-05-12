@@ -169,9 +169,14 @@ async function testDirectWaitPolicy(harness: Harness) {
     throw new Error(`direct wait guidance was not injected into the system prompt: ${systemPrompt}`);
   }
 
-  const blockedSleep = await harness.toolCall("bash", { command: "sleep 30" });
+  const blockedSleep = await harness.toolCall("bash", { command: "sleep 10" });
   if (!blockedSleep?.block || !String(blockedSleep.reason).includes("return_on")) {
-    throw new Error(`long sleep was not blocked with return_on guidance: ${JSON.stringify(blockedSleep)}`);
+    throw new Error(`10 second sleep was not blocked with return_on guidance: ${JSON.stringify(blockedSleep)}`);
+  }
+
+  const longerSleep = await harness.toolCall("bash", { command: "sleep 30" });
+  if (!longerSleep?.block || !String(longerSleep.reason).includes("return_on")) {
+    throw new Error(`long sleep was not blocked with return_on guidance: ${JSON.stringify(longerSleep)}`);
   }
 
   const blockedTail = await harness.toolCall("bash", { command: "tail -f server.log" });
@@ -184,8 +189,8 @@ async function testDirectWaitPolicy(harness: Harness) {
     throw new Error(`foreground dev server was not blocked: ${JSON.stringify(blockedDevServer)}`);
   }
 
-  const shortSleep = await harness.toolCall("bash", { command: "sleep 1" });
-  if (shortSleep?.block) throw new Error(`short sleep should not be blocked: ${JSON.stringify(shortSleep)}`);
+  const shortSleep = await harness.toolCall("bash", { command: "sleep 9" });
+  if (shortSleep?.block) throw new Error(`sleep under 10 seconds should not be blocked: ${JSON.stringify(shortSleep)}`);
 
   const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
   if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);

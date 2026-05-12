@@ -27,11 +27,11 @@ const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
-const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 5_000;
+const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
-	"- Do not block the conversation with direct waits such as long sleep commands, tail -f, watch, infinite polling loops, or foreground dev servers.",
+	"- Do not block the conversation with direct waits such as sleep commands of 10 seconds or longer, tail -f, watch, infinite polling loops, or foreground dev servers.",
 	"- For long-running work, start the command in the background, capture logs/pid files, then register a return_on watcher for the file, process, port, URL, webhook, or timer that means it is ready/done.",
 	"- After registering return_on, end the turn and let return_on wake the session instead of polling manually.",
 ].join("\n");
@@ -1265,7 +1265,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
-			"Do not use direct waits like long sleep commands, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
+			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
 			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only after user approval.",

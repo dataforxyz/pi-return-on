@@ -13,7 +13,7 @@ Prefer this pattern:
 
 Avoid this pattern:
 
-1. Run a direct wait such as `sleep 60`, `tail -f`, `watch`, an infinite polling loop, or a foreground dev server.
+1. Run a direct wait such as `sleep 10` or longer, `tail -f`, `watch`, an infinite polling loop, or a foreground dev server.
 2. Keep the assistant turn busy until the wait completes or times out.
 
 ## Chosen options
@@ -26,7 +26,7 @@ Add system prompt guidance and tool prompt guidelines that tell agents not to wa
 
 Block obvious direct waits in bash tool calls and return an actionable reason. The first implementation blocks high-confidence patterns only:
 
-- long `sleep` commands
+- `sleep` commands of 10 seconds or longer
 - `tail -f` / `tail --follow`
 - `journalctl -f` / `journalctl --follow`
 - `kubectl logs -f` / `kubectl logs --follow`
