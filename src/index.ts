@@ -2218,6 +2218,27 @@ function handlerVisibleForSession(run: ReturnOnHandlerRun, session: string | und
 	return !session || !run.parentSessionFile || run.parentSessionFile === session || (!!currentHandlerRunId && run.id === currentHandlerRunId);
 }
 
+async function findJobForCommand(args: string, ctx: ExtensionContext): Promise<ReturnOnJob | undefined> {
+	latestCtx = ctx;
+	await loadJobs();
+	const id = args.trim();
+	const session = ctx.sessionManager.getSessionFile() ?? undefined;
+	const job = jobs.find((candidate) => candidate.id === id && jobVisibleForSession(candidate, session));
+	if (!job) {
+		ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
+		return undefined;
+	}
+	return job;
+}
+
+async function notifyDirectWaitAudit(args: string, ctx: ExtensionContext): Promise<void> {
+	latestCtx = ctx;
+	const requestedLimit = Number.parseInt(args.trim(), 10);
+	const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
+	const entries = await readDirectWaitAudit(limit);
+	ctx.ui.notify(formatDirectWaitAudit(entries), "info");
+}
+
 function isPathInside(parent: string, candidate: string): boolean {
 	const relative = path.relative(path.resolve(parent), path.resolve(candidate));
 	return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
@@ -2314,15 +2335,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("return-on-status", {
 		description: "Show details for a return_on job: /return-on-status <id>",
 		handler: async (args, ctx) => {
-			latestCtx = ctx;
-			await loadJobs();
-			const id = args.trim();
-			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const job = jobs.find((candidate) => candidate.id === id && jobVisibleForSession(candidate, session));
-			if (!job) {
-				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
-				return;
-			}
+			const job = await findJobForCommand(args, ctx);
+			if (!job) return;
 			ctx.ui.notify(formatJobDetails(job), "info");
 		},
 	});
@@ -2380,44 +2394,25 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("return-on-cancel", {
 		description: "Cancel a return_on job: /return-on-cancel <id>",
 		handler: async (args, ctx) => {
-			latestCtx = ctx;
-			await loadJobs();
-			const id = args.trim();
-			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const job = jobs.find((candidate) => candidate.id === id && jobVisibleForSession(candidate, session));
-			if (!job) {
-				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
-				return;
-			}
+			const job = await findJobForCommand(args, ctx);
+			if (!job) return;
 			job.status = "cancelled";
 			job.cancelledAt = Date.now();
 			job.updatedAt = job.cancelledAt;
 			await saveJobs();
 			ensureTicker(pi);
-			ctx.ui.notify(`Cancelled ${id}`, "info");
+			ctx.ui.notify(`Cancelled ${job.id}`, "info");
 		},
 	});
 
 	pi.registerCommand("return-on-direct-waits", {
 		description: "Show the direct-wait policy audit log: /return-on-direct-waits [limit]",
-		handler: async (args, ctx) => {
-			latestCtx = ctx;
-			const requestedLimit = Number.parseInt(args.trim(), 10);
-			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
-			const entries = await readDirectWaitAudit(limit);
-			ctx.ui.notify(formatDirectWaitAudit(entries), "info");
-		},
+		handler: notifyDirectWaitAudit,
 	});
 
 	pi.registerCommand("return-on-audit", {
 		description: "Alias for /return-on-direct-waits",
-		handler: async (args, ctx) => {
-			latestCtx = ctx;
-			const requestedLimit = Number.parseInt(args.trim(), 10);
-			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
-			const entries = await readDirectWaitAudit(limit);
-			ctx.ui.notify(formatDirectWaitAudit(entries), "info");
-		},
+		handler: notifyDirectWaitAudit,
 	});
 
 	pi.registerTool({
