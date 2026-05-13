@@ -273,11 +273,14 @@ async function testForkDelivery(harness: Harness) {
       const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
       const systemPromptIndex = args.indexOf("--append-system-prompt");
       if (systemPromptIndex === -1) throw new Error("fork delivery did not pass a handler system prompt");
-      if (!String(args[systemPromptIndex + 1] ?? "").includes("intercom.send")) throw new Error("handler system prompt missed intercom policy");
+      const handlerSystemPrompt = String(args[systemPromptIndex + 1] ?? "");
+      if (!handlerSystemPrompt.includes("intercom.send")) throw new Error("handler system prompt missed intercom policy");
+      if (!handlerSystemPrompt.includes("delegated authority")) throw new Error("handler system prompt missed delegated authority policy");
       const promptArg = args.find((arg: string) => arg.startsWith("@"));
       if (!promptArg) throw new Error("fork delivery did not pass a prompt file");
       const prompt = await fs.readFile(promptArg.slice(1), "utf8");
       if (!prompt.includes("intercom.send") || !prompt.includes("intercom.ask")) throw new Error("handler prompt missed intercom policy");
+      if (!prompt.includes("delegated") || !prompt.includes("low confidence")) throw new Error("handler prompt missed delegated authority boundaries");
       return;
     }
     await sleep(50);

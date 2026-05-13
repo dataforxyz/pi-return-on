@@ -532,9 +532,13 @@ async function loadJobs(): Promise<void> {
 	}
 }
 
+function atomicTempPath(target: string): string {
+	return `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+}
+
 async function saveJobs(): Promise<void> {
 	await fsp.mkdir(STATE_DIR, { recursive: true });
-	const tmp = `${JOBS_FILE}.${process.pid}.${Date.now()}.tmp`;
+	const tmp = atomicTempPath(JOBS_FILE);
 	await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
 	await fsp.rename(tmp, JOBS_FILE);
 }
@@ -554,7 +558,7 @@ async function loadHandlers(): Promise<void> {
 
 async function saveHandlers(): Promise<void> {
 	await fsp.mkdir(STATE_DIR, { recursive: true });
-	const tmp = `${HANDLERS_FILE}.${process.pid}.${Date.now()}.tmp`;
+	const tmp = atomicTempPath(HANDLERS_FILE);
 	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: handlerRuns.slice(-200) } satisfies HandlersState, null, 2), "utf8");
 	await fsp.rename(tmp, HANDLERS_FILE);
 }
@@ -1490,7 +1494,8 @@ function buildReturnEventPayload(job: ReturnOnJob, reason: string, run: ReturnOn
 		parentIntercomTarget: run.parentIntercomTarget,
 		intercom: {
 			parentTarget: run.parentIntercomTarget,
-			policy: "Use intercom.send for non-blocking progress/blocker notices. Use intercom.ask only when a parent decision is required and this handler cannot safely continue without it.",
+			policy: "You have delegated authority to handle routine intercom work from this event. Use intercom.send for non-blocking progress/blocker notices. Use intercom.ask only when a parent decision is required and this handler cannot safely continue without it.",
+			authority: "Answer or act directly when the needed response is derivable from the event, inherited context, repo state, or prior user instructions. Escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
 		},
 		resume: job.resume,
 		condition: job.condition,
@@ -1516,6 +1521,9 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		"",
 		"Operating rules:",
 		"- Treat the inherited session/context as a snapshot, not live state.",
+		"- You are delegated to handle this return event directly when safe; do not defer routine work back to the parent.",
+		"- You may answer or act when the needed response is derivable from the event, inherited context, repo state, or prior user instructions.",
+		"- Escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
 		"- You may use normal Pi tools and extensions available in this top-level session, including subagent(...) if it is available and useful.",
 		"- Do not ask the parent routine completion questions. Only contact the parent for a blocker, risky action, approval, or user decision.",
 		"- If pi-intercom is available and a parent target is provided, use intercom.send for non-blocking progress, blocker, or escalation notices.",
@@ -1544,6 +1552,7 @@ function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 		"You are a background return_on handler in a sibling Pi process.",
 		"Your only task is to handle the return_on event capsule supplied in the latest user message.",
 		"Do not continue unrelated inherited parent work. Treat inherited conversation as context only.",
+		"You have delegated authority to handle routine work when safe; escalate only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
 		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
 		"If pi-intercom is available, use intercom.send for non-blocking parent notices and intercom.ask only for true blocking parent decisions.",
 		...(run.parentIntercomTarget ? [`Parent intercom target: ${run.parentIntercomTarget}`] : []),
