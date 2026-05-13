@@ -115,8 +115,12 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     return tool;
   }
 
+  async function callTool(name: string, params: any) {
+    return requireTool(name).execute("call", params, new AbortController().signal, () => {}, ctx);
+  }
+
   async function register(params: any) {
-    const result = await requireTool("return_on").execute("call", params, new AbortController().signal, () => {}, ctx);
+    const result = await callTool("return_on", params);
     if (!result?.terminate) throw new Error("return_on registration should terminate the current turn");
     const id = result.details.job.id as string;
     allJobIds.push(id);
@@ -133,7 +137,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
-  return { beforeAgentStart, commands, ctx, emit, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
+  return { beforeAgentStart, callTool, commands, ctx, emit, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
 }
 
 function wakeEntries(harness: Harness, jobId: string) {
@@ -229,9 +233,26 @@ async function testTimer(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testRegisterWithoutEndingTurn(harness: Harness) {
+  const result = await harness.callTool("return_on", {
+    label: "smoke continue registration",
+    condition: { type: "timer", after: "50ms" },
+    resume: "continue registration resume",
+    endTurn: false,
+  });
+  if (result.terminate !== false) throw new Error("endTurn:false should not terminate the current turn");
+  if (result.details.job.endTurn !== false) throw new Error("endTurn:false should be persisted on the job");
+  if (!String(result.content?.[0]?.text ?? "").includes("Continuing this turn")) throw new Error("endTurn:false response did not explain continuing");
+  const jobId = result.details.job.id;
+  allJobIds.push(jobId);
+  await waitForWake(harness, { jobId, label: "smoke continue registration", resume: "continue registration resume" }, 1_500);
+}
+
 async function testForkDelivery(harness: Harness) {
   const fakePi = path.join(cwd, "fake-pi.mjs");
-  await fs.writeFile(fakePi, `#!/usr/bin/env node\nconsole.log("fake return_on handler summary");\n`, { mode: 0o755 });
+  const fakePiArgs = path.join(cwd, "fake-pi-args.json");
+  process.env.PI_RETURN_ON_FAKE_PI_ARGS = fakePiArgs;
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(process.env.PI_RETURN_ON_FAKE_PI_ARGS, JSON.stringify(process.argv.slice(2)));\nconsole.log("fake return_on handler summary");\n`, { mode: 0o755 });
   const label = "smoke fork delivery";
   const resume = "fork delivery resume";
   const jobId = await harness.register({
@@ -249,6 +270,14 @@ async function testForkDelivery(harness: Harness) {
       if (ack.options?.triggerTurn !== false) throw new Error("fork delivery ack should not trigger parent turn");
       if (summary.options?.triggerTurn !== false) throw new Error("fork delivery summary should not trigger parent turn by default");
       if (!String(summary.message?.content ?? "").includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
+      const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
+      const systemPromptIndex = args.indexOf("--append-system-prompt");
+      if (systemPromptIndex === -1) throw new Error("fork delivery did not pass a handler system prompt");
+      if (!String(args[systemPromptIndex + 1] ?? "").includes("intercom.send")) throw new Error("handler system prompt missed intercom policy");
+      const promptArg = args.find((arg: string) => arg.startsWith("@"));
+      if (!promptArg) throw new Error("fork delivery did not pass a prompt file");
+      const prompt = await fs.readFile(promptArg.slice(1), "utf8");
+      if (!prompt.includes("intercom.send") || !prompt.includes("intercom.ask")) throw new Error("handler prompt missed intercom policy");
       return;
     }
     await sleep(50);
@@ -719,6 +748,7 @@ await harness.emit("session_start");
 await testDirectWaitPolicy(harness);
 await testCommonShorthandAccepted(harness);
 await testTimer(harness);
+await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
 await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);

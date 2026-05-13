@@ -180,6 +180,7 @@ interface ReturnOnJob {
 	every?: string | number;
 	webhook?: WebhookConfig;
 	delivery?: DeliveryConfig;
+	endTurn?: boolean;
 	handlerRunId?: string;
 	latches: Record<string, LeafLatch>;
 	leafState: Record<string, LeafState>;
@@ -1487,6 +1488,10 @@ function buildReturnEventPayload(job: ReturnOnJob, reason: string, run: ReturnOn
 		parentSessionId: run.parentSessionId,
 		parentSessionName: run.parentSessionName,
 		parentIntercomTarget: run.parentIntercomTarget,
+		intercom: {
+			parentTarget: run.parentIntercomTarget,
+			policy: "Use intercom.send for non-blocking progress/blocker notices. Use intercom.ask only when a parent decision is required and this handler cannot safely continue without it.",
+		},
 		resume: job.resume,
 		condition: job.condition,
 		latches: job.latches,
@@ -1513,9 +1518,12 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		"- Treat the inherited session/context as a snapshot, not live state.",
 		"- You may use normal Pi tools and extensions available in this top-level session, including subagent(...) if it is available and useful.",
 		"- Do not ask the parent routine completion questions. Only contact the parent for a blocker, risky action, approval, or user decision.",
+		"- If pi-intercom is available and a parent target is provided, use intercom.send for non-blocking progress, blocker, or escalation notices.",
+		"- Use intercom.ask only when you cannot safely continue without a parent decision; it blocks this handler until reply or timeout.",
 		"- If you do contact the parent, keep it brief and include the handler id.",
 		"- Prefer producing a concise final summary. The return_on extension will relay that final output to the parent session.",
-		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting.",
+		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting for an external event.",
+		"- Never wait for this handler's own pid or status. If return_on_handlers shows this handler as running, that is expected while you are executing; summarize that observation instead of waiting.",
 		"",
 		parentContact,
 		`Handler id: ${run.id}`,
@@ -1531,9 +1539,25 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 	].join("\n");
 }
 
+function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
+	return [
+		"You are a background return_on handler in a sibling Pi process.",
+		"Your only task is to handle the return_on event capsule supplied in the latest user message.",
+		"Do not continue unrelated inherited parent work. Treat inherited conversation as context only.",
+		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
+		"If pi-intercom is available, use intercom.send for non-blocking parent notices and intercom.ask only for true blocking parent decisions.",
+		...(run.parentIntercomTarget ? [`Parent intercom target: ${run.parentIntercomTarget}`] : []),
+		`Handler id: ${run.id}`,
+	].join("\n");
+}
+
 function buildHandlerArgs(job: ReturnOnJob, run: ReturnOnHandlerRun): string[] {
-	const args = ["-p", "--session-dir", run.sessionDir];
-	if (job.sessionFile) args.push("--fork", job.sessionFile);
+	const args = ["-p", "--session-dir", run.sessionDir, "--append-system-prompt", buildHandlerSystemPrompt(run)];
+	// If registration did not end the parent turn, the parent session file may still be
+	// actively changing when the watcher fires. Forking that live transcript can make
+	// the handler follow the parent turn instead of handling only the return event.
+	// Use a fresh capsule-only handler in that case.
+	if (job.endTurn !== false && job.sessionFile) args.push("--fork", job.sessionFile);
 	args.push(`@${run.promptPath}`);
 	return args;
 }
@@ -1958,6 +1982,11 @@ function formatJobDetails(job: ReturnOnJob): string {
 	return lines.join("\n");
 }
 
+function handlerVisibleForSession(run: ReturnOnHandlerRun, session: string | undefined): boolean {
+	const currentHandlerRunId = process.env.PI_RETURN_ON_HANDLER_RUN_ID;
+	return !session || !run.parentSessionFile || run.parentSessionFile === session || (!!currentHandlerRunId && run.id === currentHandlerRunId);
+}
+
 function commandReply(content: string): void {
 	try {
 		// Commands are for humans, but showing the result in the transcript is useful.
@@ -2062,7 +2091,7 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadHandlers();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const relevant = handlerRuns.filter((run) => !session || !run.parentSessionFile || run.parentSessionFile === session);
+			const relevant = handlerRuns.filter((run) => handlerVisibleForSession(run, session));
 			const text = relevant.length
 				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
 				: "No return_on handler runs for this session.";
@@ -2132,6 +2161,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
 			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
+			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2168,6 +2198,7 @@ export default function (pi: ExtensionAPI) {
 				...(params.every !== undefined ? { every: params.every } : {}),
 				...(webhook ? { webhook } : {}),
 				...(params.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
+				...(params.endTurn === false ? { endTurn: false } : {}),
 				latches: {},
 				leafState: {},
 			};
@@ -2182,10 +2213,11 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
+			const endTurn = params.endTurn !== false;
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}\nI will wake the session when it fires; do not poll or wait manually.${webhookText}` }],
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
 				details: { job, incomingWebhooks },
-				terminate: true,
+				terminate: endTurn,
 			};
 		},
 	});
@@ -2237,7 +2269,7 @@ export default function (pi: ExtensionAPI) {
 			await loadHandlers();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
 			const status = params.status ?? "all";
-			const relevant = handlerRuns.filter((run) => (!session || !run.parentSessionFile || run.parentSessionFile === session) && (status === "all" || run.status === status));
+			const relevant = handlerRuns.filter((run) => handlerVisibleForSession(run, session) && (status === "all" || run.status === status));
 			const text = relevant.length
 				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
 				: `No ${status} return_on handlers.`;

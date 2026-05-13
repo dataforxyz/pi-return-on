@@ -54,6 +54,7 @@ Diagnostics:
   "timeout": "30m",
   "webhook": "https://example.com/pi-return-on-hook",
   "delivery": { "mode": "fork", "notify": "ack-and-summary" },
+  "endTurn": true,
   "allowExec": false
 }
 ```
@@ -67,6 +68,7 @@ Diagnostics:
 | `timeout` | no | Wake anyway after this duration. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
 | `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
+| `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
@@ -83,7 +85,9 @@ Legacy delivery wakes the same parent session with `triggerTurn: true`. For even
 }
 ```
 
-When the watcher fires, the extension writes an event capsule under `~/.local/state/pi-return-on/handlers/<id>/`, starts `pi -p --fork <parent-session> @prompt.md` as a sibling/background Pi process, and posts a brief ack plus final handler summary back into the parent transcript. The fork inherits normal Pi extension discovery, so tools such as `subagent(...)` are available when they are installed for top-level Pi sessions.
+When the watcher fires, the extension writes an event capsule under `~/.local/state/pi-return-on/handlers/<id>/`, starts a sibling/background Pi process, and posts a brief ack plus final handler summary back into the parent transcript. By default it can fork the parent session for context; when `endTurn:false` keeps the parent turn active, the handler uses the capsule-only prompt to avoid inheriting live parent work. The handler inherits normal Pi extension discovery, so tools such as `subagent(...)` and `intercom(...)` are available when they are installed for top-level Pi sessions.
+
+If pi-intercom is available, the handler prompt includes the parent intercom target and an explicit policy: use `intercom.send` for non-blocking progress, blocker, or escalation notices; use `intercom.ask` only when a parent decision is required and the handler cannot safely continue without it. Routine completion should still be returned as the final handler summary.
 
 Useful delivery options:
 
