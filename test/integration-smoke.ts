@@ -288,6 +288,40 @@ async function testForkDelivery(harness: Harness) {
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
 }
 
+async function testAgentArtifactForkDelivery(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-agent-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-agent-pi-args.json");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(fakePiArgs)}, JSON.stringify(process.argv.slice(2)));\nconsole.log("agent result triaged");\n`, { mode: 0o755 });
+  const resultPath = path.join(cwd, "review-result.json");
+  const label = "smoke subagent result ready";
+  const resume = "A review subagent result file is ready. Read it, extract blockers, and summarize only the relevant completion triage.";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "review-result.json", exists: true },
+    resume,
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+  await sleep(100);
+  await fs.writeFile(resultPath, JSON.stringify({ status: "complete", summary: "review ok" }), "utf8");
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const handlerMessages = harness.messages.filter((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId);
+    const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
+    if (summary) {
+      if (!String(summary.message?.content ?? "").includes("agent result triaged")) throw new Error("agent artifact fork summary missed fake handler output");
+      const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
+      const promptArg = args.find((arg: string) => arg.startsWith("@"));
+      if (!promptArg) throw new Error("agent artifact fork did not pass a prompt file");
+      const prompt = await fs.readFile(promptArg.slice(1), "utf8");
+      if (!prompt.includes("review subagent result file is ready") || !prompt.includes("completion triage")) throw new Error("agent artifact prompt missed subagent triage instruction");
+      if (!prompt.includes("delegated")) throw new Error("agent artifact prompt missed delegated authority guidance");
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for agent artifact fork handler");
+}
+
 async function testCommonShorthandAccepted(harness: Harness) {
   const tool = harness.tools.get("return_on");
   if (!tool) throw new Error("missing return_on tool");
@@ -778,6 +812,7 @@ await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
+await testAgentArtifactForkDelivery(harness);
 await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);
 await testLogContains(harness);
