@@ -39,8 +39,27 @@ type Harness = ReturnType<typeof createHarness>;
 
 const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-smoke-"));
 const stateDir = path.join(process.env.HOME!, ".local", "state", "pi-return-on");
+const projectSettingsDir = path.join(cwd, ".pi");
+const projectSettingsPath = path.join(projectSettingsDir, "settings.json");
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const allJobIds: string[] = [];
+
+async function withProjectSettings(settings: unknown, fn: () => Promise<void>): Promise<void> {
+  let previous: string | undefined;
+  try {
+    previous = await fs.readFile(projectSettingsPath, "utf8");
+  } catch {
+    previous = undefined;
+  }
+  await fs.mkdir(projectSettingsDir, { recursive: true });
+  await fs.writeFile(projectSettingsPath, JSON.stringify(settings, null, 2), "utf8");
+  try {
+    await fn();
+  } finally {
+    if (previous === undefined) await fs.rm(projectSettingsPath, { force: true });
+    else await fs.writeFile(projectSettingsPath, previous, "utf8");
+  }
+}
 
 function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean } = {}) {
   const tools = new Map<string, Tool>();
@@ -673,6 +692,43 @@ async function testTimeoutWake(harness: Harness) {
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
 }
 
+async function testDefaultTimeoutAndMax(harness: Harness) {
+  await withProjectSettings({ returnOn: { defaultTimeout: "700ms", maxTimeout: "1s" } }, async () => {
+    const label = "smoke default timeout";
+    const resume = "default timeout resume";
+    const result = await harness.callTool("return_on", {
+      label,
+      condition: { type: "file", path: "never-default-timeout.txt", exists: true, every: "100ms" },
+      resume,
+    });
+    const jobId = result.details.job.id as string;
+    allJobIds.push(jobId);
+    if (typeof result.details.job.timeoutAt !== "number") throw new Error("default timeout did not set timeoutAt");
+    if (!String(result.content?.[0]?.text ?? "").includes("Timeout: 700ms")) throw new Error("registration did not display effective default timeout");
+    const entry = await waitForWake(harness, { jobId, label, resume }, 2_500);
+    if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("default timeout wake did not include timeout reason");
+
+    const jobsPath = path.join(stateDir, "jobs.json");
+    const beforeJobs = await fs.readFile(jobsPath, "utf8").then((text) => JSON.parse(text).jobs as any[], () => []);
+    let rejected = false;
+    try {
+      await harness.callTool("return_on", {
+        label: "too long timeout",
+        condition: { type: "timer", after: "10s" },
+        timeout: "2s",
+        resume: "should reject",
+      });
+    } catch (error) {
+      rejected = /exceeds max/i.test(String(error));
+    }
+    if (!rejected) throw new Error("return_on accepted a timeout above configured max");
+    const afterJobs = await fs.readFile(jobsPath, "utf8").then((text) => JSON.parse(text).jobs as any[], () => []);
+    if (afterJobs.length !== beforeJobs.length || afterJobs.some((job) => job.label === "too long timeout")) {
+      throw new Error("rejected over-max timeout persisted a job");
+    }
+  });
+}
+
 async function testExecConfirmationAndValidation() {
   const noUi = createHarness("no-ui-exec", { hasUI: false });
   await noUi.emit("session_start");
@@ -1031,6 +1087,7 @@ await testEmptyGroupRejected(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
+await testDefaultTimeoutAndMax(harness);
 await harness.emit("session_shutdown");
 await testExecConfirmationAndValidation();
 await testListToolAndCommands();

@@ -85,13 +85,30 @@ Diagnostics:
 | `condition` | yes | Condition tree or leaf condition. |
 | `resume` | yes | Instruction included in the wake message. |
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
-| `timeout` | no | Wake anyway after this duration. |
+| `timeout` | no | Wake anyway after this duration. If omitted, `returnOn.defaultTimeout` applies. Values above `returnOn.maxTimeout` are rejected. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
 | `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
 | `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
+
+## Timeout policy
+
+New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 10 minutes.
+
+Configure these limits in Pi settings (`~/.pi/agent/settings.json` globally or `.pi/settings.json` per project):
+
+```json
+{
+  "returnOn": {
+    "defaultTimeout": "10m",
+    "maxTimeout": "10m"
+  }
+}
+```
+
+`defaultTimeoutMs` and `maxTimeoutMs` are also accepted as millisecond numbers. The default must be positive and cannot exceed the max. Environment variables `PI_RETURN_ON_DEFAULT_TIMEOUT` and `PI_RETURN_ON_MAX_TIMEOUT` can override the settings for debugging or local experiments.
 
 ## Background fork handlers
 

@@ -30,6 +30,8 @@ const DEFAULT_PORT_TIMEOUT_MS = 1000;
 const DEFAULT_URL_TIMEOUT_MS = 5000;
 const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1";
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
+const DEFAULT_RETURN_ON_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_RETURN_ON_MAX_TIMEOUT_MS = 10 * 60_000;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
@@ -166,6 +168,18 @@ interface LeafState {
 	stableSince?: number;
 	lastSummary?: string;
 	lastValue?: boolean;
+}
+
+interface ReturnOnSettings {
+	defaultTimeout?: string | number;
+	defaultTimeoutMs?: number;
+	maxTimeout?: string | number;
+	maxTimeoutMs?: number;
+}
+
+interface ReturnOnTimeoutConfig {
+	defaultTimeoutMs: number;
+	maxTimeoutMs: number;
 }
 
 interface ReturnOnJob {
@@ -375,6 +389,47 @@ function parseDuration(input: string | number | undefined, fallbackMs?: number):
 
 function getPollingInterval(job: ReturnOnJob, conditionEvery: string | number | undefined, fallbackMs: number, minMs = 0): number {
 	return Math.max(parseDuration(conditionEvery ?? job.every, fallbackMs) ?? fallbackMs, minMs);
+}
+
+function expandHome(input: string): string {
+	return input === "~" || input.startsWith("~/") ? path.join(os.homedir(), input.slice(2)) : input;
+}
+
+async function readJsonObject(file: string): Promise<Record<string, unknown> | undefined> {
+	try {
+		const parsed = JSON.parse(await fsp.readFile(file, "utf8"));
+		return isObject(parsed) ? parsed : undefined;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function parsePositiveDurationSetting(value: unknown, fallbackMs: number, name: string): number {
+	const parsed = parseDuration(typeof value === "string" || typeof value === "number" ? value : undefined, fallbackMs);
+	if (parsed === undefined || parsed <= 0) throw new Error(`${name} must be a positive duration`);
+	return parsed;
+}
+
+async function loadReturnOnTimeoutConfig(cwd: string): Promise<ReturnOnTimeoutConfig> {
+	let settings: ReturnOnSettings = {};
+	for (const file of [path.join(os.homedir(), ".pi", "agent", "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
+		const parsed = await readJsonObject(expandHome(file));
+		if (isObject(parsed?.returnOn)) settings = { ...settings, ...parsed.returnOn };
+	}
+	const defaultSource = process.env.PI_RETURN_ON_DEFAULT_TIMEOUT ?? settings.defaultTimeout ?? settings.defaultTimeoutMs;
+	const maxSource = process.env.PI_RETURN_ON_MAX_TIMEOUT ?? settings.maxTimeout ?? settings.maxTimeoutMs;
+	const maxTimeoutMs = parsePositiveDurationSetting(maxSource, DEFAULT_RETURN_ON_MAX_TIMEOUT_MS, "returnOn.maxTimeout");
+	const defaultTimeoutMs = parsePositiveDurationSetting(defaultSource, DEFAULT_RETURN_ON_TIMEOUT_MS, "returnOn.defaultTimeout");
+	if (defaultTimeoutMs > maxTimeoutMs) throw new Error(`returnOn.defaultTimeout (${formatDuration(defaultTimeoutMs)}) must not exceed returnOn.maxTimeout (${formatDuration(maxTimeoutMs)})`);
+	return { defaultTimeoutMs, maxTimeoutMs };
+}
+
+function parseRequestedJobTimeout(input: unknown, config: ReturnOnTimeoutConfig): number {
+	const timeoutMs = input === undefined ? config.defaultTimeoutMs : parseDuration(typeof input === "string" || typeof input === "number" ? input : undefined);
+	if (timeoutMs === undefined || timeoutMs <= 0) throw new Error("return_on timeout must be a positive duration");
+	if (timeoutMs > config.maxTimeoutMs) throw new Error(`return_on timeout ${formatDuration(timeoutMs)} exceeds max ${formatDuration(config.maxTimeoutMs)}. Configure returnOn.maxTimeout in pi settings if a longer watcher is required.`);
+	return timeoutMs;
 }
 
 function parseAt(input: string | number | undefined, createdAt: number): number | undefined {
@@ -2422,6 +2477,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
+			"Every return_on watcher has an effective timeout. If no timeout is provided, the configured default applies; explicit timeouts cannot exceed the configured maximum.",
 			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
@@ -2432,7 +2488,7 @@ export default function (pi: ExtensionAPI) {
 			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/process/port/url/webhook/exec." }),
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
-			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional max time before waking anyway, e.g. '30m' or milliseconds" })),
+			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
 			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
 			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
@@ -2454,7 +2510,8 @@ export default function (pi: ExtensionAPI) {
 				if (!allowExec) throw new Error("User did not approve exec watcher.");
 			}
 
-			const timeoutMs = parseDuration(params.timeout);
+			const timeoutConfig = await loadReturnOnTimeoutConfig(ctx.cwd);
+			const timeoutMs = parseRequestedJobTimeout(params.timeout, timeoutConfig);
 			const webhook = normalizeWebhook(params.webhook);
 			const delivery = normalizeDelivery(params.delivery);
 			const job: ReturnOnJob = {
@@ -2467,7 +2524,7 @@ export default function (pi: ExtensionAPI) {
 				status: "active",
 				condition,
 				resume: params.resume,
-				...(timeoutMs !== undefined ? { timeoutAt: Date.now() + timeoutMs } : {}),
+				timeoutAt: Date.now() + timeoutMs,
 				allowExec,
 				...(params.every !== undefined ? { every: params.every } : {}),
 				...(webhook ? { webhook } : {}),
@@ -2487,9 +2544,10 @@ export default function (pi: ExtensionAPI) {
 			ensureTicker(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
+			const timeoutText = `\nTimeout: ${formatDuration(timeoutMs)} (max ${formatDuration(timeoutConfig.maxTimeoutMs)})`;
 			const endTurn = params.endTurn !== false;
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}${timeoutText}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
 				details: { job, incomingWebhooks },
 				terminate: endTurn,
 			};
