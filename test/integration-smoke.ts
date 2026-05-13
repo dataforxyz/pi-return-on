@@ -413,7 +413,12 @@ async function testFileWatchImmediate(harness: Harness) {
   });
   await sleep(1_300); // let polling observe the missing text; without fs.watch, the 1h interval would now suppress re-checks.
   await fs.appendFile(log, "EVENT_READY\n", "utf8");
-  await waitForWake(harness, { jobId, label, resume }, 1_500);
+  const wake = await waitForWake(harness, { jobId, label, resume }, 1_500);
+  const latch = wake.message?.details?.latches?.root;
+  const matchedLines = latch?.details?.matchedLines;
+  if (!Array.isArray(matchedLines) || matchedLines[0]?.text !== "EVENT_READY" || matchedLines[0]?.line !== 2) {
+    throw new Error(`file marker latch did not include matched line details: ${JSON.stringify(latch)}`);
+  }
 }
 
 async function testFileStable(harness: Harness) {

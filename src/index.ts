@@ -971,6 +971,21 @@ function truncateText(value: string, limit = OUTPUT_LIMIT_BYTES): string {
 	return `${buf.subarray(0, limit).toString("utf8")}\n[truncated ${buf.length - limit} bytes]`;
 }
 
+function matchingFileLines(text: string, condition: FileCondition): Array<{ line: number; text: string }> {
+	if (condition.contains === undefined && condition.matches === undefined) return [];
+	const matcher = condition.matches !== undefined ? new RegExp(condition.matches) : undefined;
+	const result: Array<{ line: number; text: string }> = [];
+	const lines = text.split(/\r?\n/);
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		const contains = condition.contains !== undefined && line.includes(condition.contains);
+		const matches = matcher !== undefined && matcher.test(line);
+		if (contains || matches) result.push({ line: index + 1, text: truncateText(line, 500) });
+		if (result.length >= 5) break;
+	}
+	return result;
+}
+
 async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root", latchLeaves = true): Promise<EvalResult> {
 	if (isGroupCondition(condition)) {
 		const op = condition.op;
@@ -1079,6 +1094,7 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 		}
 	}
 
+	let matchDetails: Record<string, unknown> | undefined;
 	if (condition.contains !== undefined || condition.matches !== undefined) {
 		let text = "";
 		try {
@@ -1088,13 +1104,19 @@ async function evaluateFile(job: ReturnOnJob, condition: FileCondition, key: str
 		}
 		if (condition.contains !== undefined) checks.push({ ok: text.includes(condition.contains), label: `${condition.path} contains '${condition.contains}'` });
 		if (condition.matches !== undefined) checks.push({ ok: new RegExp(condition.matches).test(text), label: `${condition.path} matches /${condition.matches}/` });
+		matchDetails = {
+			sizeBytes: Buffer.byteLength(text),
+			...(condition.contains !== undefined ? { contains: condition.contains } : {}),
+			...(condition.matches !== undefined ? { matches: condition.matches } : {}),
+			matchedLines: matchingFileLines(text, condition),
+		};
 	}
 
 	const ok = checks.length > 0 && checks.every((check) => check.ok);
 	const summary = checks.map((check) => `${check.ok ? "✓" : "·"} ${check.label}`).join(", ") || `file ${condition.path}`;
 	state.lastSummary = summary;
 	state.lastValue = ok;
-	return { value: ok, summary, details: { path: filePath } };
+	return { value: ok, summary, details: { path: filePath, ...matchDetails } };
 }
 
 async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: string): Promise<EvalResult> {
