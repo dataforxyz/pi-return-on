@@ -41,6 +41,12 @@ Visibility:
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
 - `/return-on-fired-events` and `return_on_fired_events` show pending/delivered/failed fired capsules for restart-safe delivery debugging.
 
+Design notes:
+
+- [Direct wait policy](./docs/direct-wait-policy.md)
+- [Background worker clarifying questions](./docs/background-worker-clarifying-questions.md)
+- [Background event router and handler ledger](./docs/background-event-router.md)
+
 Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
