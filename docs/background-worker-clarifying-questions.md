@@ -4,9 +4,23 @@ This document captures the original open design questions for strengthening `pi-
 
 > Clarification: the immediate problem is not that `return_on` blocks itself. The immediate problem is that agents sometimes choose direct blocking waits instead of starting background work and using `return_on`. The chosen first step is documented in [Direct Wait Policy](./direct-wait-policy.md): Option A prompt guidance plus Option C high-confidence blocking. Background-worker questions remain useful for future hardening, but they are not the first implementation target.
 
+## Current decision
+
+We are **not** adding an always-running background worker/daemon for now.
+
+The accepted scope is restart-safe persistence:
+
+- Jobs persist in `~/.local/state/pi-return-on/jobs.json` and resume checking when the matching Pi session starts again.
+- Fired-event capsules persist in `~/.local/state/pi-return-on/fired/<job-id>.json` so a fired event can be delivered after a restart/session reopen.
+- The extension remains responsible for evaluation while Pi is open, UI/status/listing, cancellation, and wake/handler delivery.
+
+This is intentionally simpler than an always-on evaluator. It does **not** guarantee that files/ports/URLs are watched while Pi is closed, and that is acceptable for the current product direction.
+
+Revisit a detached worker only if users later need conditions to keep evaluating while Pi is not running.
+
 ## How we will decide
 
-For each major question, we will review four concrete options, pick a recommended default, and record the decision before implementation.
+For each future major question, review concrete options, pick a recommended default, and record the decision before implementation.
 
 ## 1. Background process / self-blocking
 
