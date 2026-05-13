@@ -55,8 +55,10 @@ Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
 - By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
-- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, direct-wait audit JSONL, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
-- Startup cleanup keeps active jobs, pending/failed fired events, and running handlers, while pruning terminal jobs, delivered fired-event capsules, completed handler artifacts, and old direct-wait audit entries after 30 days by default. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window.
+- `npm run audit:direct-waits` summarizes the structured direct-wait audit plus raw textual candidates in local Pi session logs.
+- `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, direct-wait audit/corpus files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Startup cleanup keeps active jobs, pending/failed fired events, running handlers, and direct-wait example corpora, while pruning terminal jobs, delivered fired-event capsules, completed handler artifacts, and old direct-wait audit entries after 30 days by default. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window.
 
 ## `return_on` parameters
 
