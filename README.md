@@ -99,6 +99,130 @@ Useful delivery options:
 
 Set `PI_RETURN_ON_DELIVERY_MODE=fork` before starting Pi to make fork handling the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
 
+## Orchestration recipes
+
+These patterns keep the parent session available while a watcher or fork handler handles the wait.
+
+### Continue working while a background command runs
+
+Start the command yourself, capture logs/pid, and register a watcher with `endTurn:false` if there is still useful work to do in the same turn.
+
+```bash
+mkdir -p .return-on
+npm test > .return-on/test.log 2>&1 & echo $! > .return-on/test.pid
+```
+
+```json
+{
+  "label": "test process finished",
+  "condition": { "type": "process", "pid": 12345, "exited": true },
+  "resume": "The test process exited. Inspect .return-on/test.log and summarize failures or success.",
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" },
+  "endTurn": false
+}
+```
+
+Use `endTurn:true` or omit it when the next useful action really depends on the process result.
+
+### Wait for a log marker
+
+Use file `contains` or `matches` when a process writes a clear readiness, success, failure, or attention marker.
+
+```json
+{
+  "label": "dev server ready",
+  "condition": { "type": "file", "path": ".return-on/server.log", "contains": "Server ready" },
+  "resume": "The dev server log says it is ready. Verify the URL if needed and continue.",
+  "delivery": { "mode": "fork", "notify": "summary" }
+}
+```
+
+For failure-first routing, use `any` with separate marker conditions and let the fork handler inspect the log around the match.
+
+```json
+{
+  "label": "agent log reached terminal marker",
+  "condition": {
+    "any": [
+      { "type": "file", "path": ".return-on/worker.log", "contains": "COMPLETE" },
+      { "type": "file", "path": ".return-on/worker.log", "matches": "ERROR|needs_attention|BLOCKED" }
+    ]
+  },
+  "resume": "Triage the worker log marker. If it is routine, summarize; if blocked or risky, escalate with the smallest needed question.",
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+}
+```
+
+### Wait for async subagents or other agent artifacts
+
+`return_on` does not need to own the subagent runtime. Watch the artifacts the orchestrator already knows about: result files, `events.jsonl`, progress files, output logs, or child processes.
+
+```json
+{
+  "label": "review subagent result ready",
+  "condition": { "type": "file", "path": "/tmp/pi-subagents-user/results/review-run.json", "exists": true },
+  "resume": "A review subagent result file is ready. Read it, extract the decision and blockers, and report only the relevant summary.",
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+}
+```
+
+For several workers, combine conditions:
+
+```json
+{
+  "label": "all workers finished",
+  "condition": {
+    "all": [
+      { "type": "file", "path": ".return-on/worker-a.done", "exists": true },
+      { "type": "file", "path": ".return-on/worker-b.done", "exists": true },
+      { "type": "file", "path": ".return-on/worker-c.done", "exists": true }
+    ]
+  },
+  "resume": "All workers finished. Compare their outputs, summarize agreement/disagreement, and ask the parent only if a decision is required.",
+  "delivery": { "mode": "fork", "notify": "summary" }
+}
+```
+
+### Wait for service readiness
+
+Use port or URL checks instead of sleeping or polling manually.
+
+```json
+{
+  "label": "local app ready",
+  "condition": { "type": "url", "url": "http://127.0.0.1:3000/health", "ok": true, "bodyContains": "ok" },
+  "resume": "The local app health check is passing. Continue with browser/API verification.",
+  "every": "2s",
+  "timeout": "2m",
+  "delivery": { "mode": "fork", "notify": "summary" }
+}
+```
+
+### Let external systems wake Pi
+
+Use incoming webhooks for CI, deploy providers, remote machines, or humans clicking a callback URL. Pair them with fork delivery when the callback payload may need triage before the parent sees it.
+
+```json
+{
+  "label": "CI callback",
+  "condition": { "type": "webhook", "bodyMatches": "success|failure|cancelled" },
+  "resume": "CI called back. Inspect the payload and linked logs if present; summarize status and next action.",
+  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+}
+```
+
+### Intercom-style delegated handling
+
+When a fired event implies an intercom response, the fork handler has delegated authority to answer routine questions from the event/context. It should send non-blocking notices with `intercom.send`, reserve `intercom.ask` for true parent decisions, and include a compact audit trail in the final summary.
+
+```text
+Answered worker ask from handler roh_...:
+- Asked: whether to keep API v1 compatibility while fixing tests
+- Answered: yes, preserve the public error shape
+- Basis: issue instructions and existing README contract
+- Parent action: none
+```
+
 ## Incoming webhooks
 
 Use a `webhook` condition when an external system should wake Pi by making an HTTP request. The extension starts a local HTTP server bound to `127.0.0.1` by default, generates a random path/token if you do not provide them, and returns the callable URL in the tool result.
