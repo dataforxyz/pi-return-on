@@ -244,6 +244,7 @@ interface FiredEventState {
 	job: ReturnOnJob;
 	deliveryStatus: FiredEventDeliveryStatus;
 	deliveredAt?: number;
+	lastAttemptAt?: number;
 	handlerRunId?: string;
 	error?: string;
 }
@@ -587,7 +588,7 @@ function firedEventPath(jobId: string): string {
 	return path.join(FIRED_DIR, `${jobId}.json`);
 }
 
-async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "handlerRunId" | "error">> = {}): Promise<string> {
+async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "lastAttemptAt" | "handlerRunId" | "error">> = {}): Promise<string> {
 	await fsp.mkdir(FIRED_DIR, { recursive: true });
 	const eventPath = firedEventPath(job.id);
 	const event: FiredEventState = {
@@ -605,6 +606,7 @@ async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partia
 		job,
 		deliveryStatus: updates.deliveryStatus ?? "pending",
 		...(updates.deliveredAt ? { deliveredAt: updates.deliveredAt } : {}),
+		...(updates.lastAttemptAt ? { lastAttemptAt: updates.lastAttemptAt } : {}),
 		...(updates.handlerRunId ? { handlerRunId: updates.handlerRunId } : {}),
 		...(updates.error ? { error: updates.error } : {}),
 	};
@@ -637,13 +639,27 @@ async function readFiredEventFiles(): Promise<Array<{ path: string; event: Fired
 }
 
 async function readPendingFiredEvents(): Promise<Array<{ path: string; event: FiredEventState }>> {
-	return (await readFiredEventFiles()).filter(({ event }) => !event.deliveredAt);
+	return (await readFiredEventFiles()).filter(({ event }) => !event.deliveredAt || event.deliveryStatus === "failed");
 }
 
 function terminalJobTime(job: ReturnOnJob): number | undefined {
 	if (job.status === "fired") return job.firedAt ?? job.updatedAt;
 	if (job.status === "cancelled") return job.cancelledAt ?? job.updatedAt;
 	return undefined;
+}
+
+function parseNonNegativeNumber(value: string, name: string): number {
+	if (!/^(?:\d+|\d*\.\d+)$/.test(value)) throw new Error(`${name} must be a non-negative number`);
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative number`);
+	return parsed;
+}
+
+function parseNonNegativeInteger(value: string, name: string): number {
+	if (!/^\d+$/.test(value)) throw new Error(`${name} must be a non-negative integer`);
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+	return parsed;
 }
 
 function parsePruneCommandArgs(args: string): PruneOptions {
@@ -657,17 +673,19 @@ function parsePruneCommandArgs(args: string): PruneOptions {
 			continue;
 		}
 		if (part.startsWith("--days=")) {
-			const days = Number.parseFloat(part.slice("--days=".length));
-			if (Number.isFinite(days) && days >= 0) retentionMs = Math.round(days * 86_400_000);
+			const days = parseNonNegativeNumber(part.slice("--days=".length), "--days");
+			retentionMs = Math.round(days * 86_400_000);
 			continue;
 		}
 		if (part.startsWith("--audit-max=")) {
-			const max = Number.parseInt(part.slice("--audit-max=".length), 10);
-			if (Number.isFinite(max) && max >= 0) auditMaxEntries = max;
+			auditMaxEntries = parseNonNegativeInteger(part.slice("--audit-max=".length), "--audit-max");
 			continue;
 		}
-		const days = Number.parseFloat(part);
-		if (Number.isFinite(days) && days >= 0 && retentionMs === undefined) retentionMs = Math.round(days * 86_400_000);
+		if (/^(?:\d+|\d*\.\d+)$/.test(part) && retentionMs === undefined) {
+			retentionMs = Math.round(Number(part) * 86_400_000);
+			continue;
+		}
+		throw new Error(`Unknown return_on prune argument: ${part}`);
 	}
 	return { dryRun, ...(retentionMs !== undefined ? { retentionMs } : {}), ...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}) };
 }
@@ -758,6 +776,10 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	if (!dryRun && handlersPruned > 0) {
 		const prunedRuns = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id));
 		for (const run of prunedRuns) {
+			if (!isPathInside(HANDLERS_DIR, run.dir)) {
+				console.error(`[${EXTENSION_NAME}] Refusing to prune handler dir outside state directory: ${run.dir}`);
+				continue;
+			}
 			try {
 				await fsp.rm(run.dir, { recursive: true, force: true });
 				handlerDirsPruned += 1;
@@ -768,7 +790,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		handlerRuns = keptHandlers;
 		await saveHandlers();
 	} else if (dryRun) {
-		handlerDirsPruned = handlersPruned;
+		handlerDirsPruned = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id) && isPathInside(HANDLERS_DIR, run.dir)).length;
 	}
 
 	const auditEntriesPruned = await pruneDirectWaitAudit(cutoff, auditMaxEntries, dryRun);
@@ -781,9 +803,11 @@ function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
 }
 
 async function markFiredEventDelivered(eventPath: string, reason: string, status: FiredEventDeliveryStatus, job: ReturnOnJob, error?: unknown): Promise<void> {
+	const now = Date.now();
 	await writeFiredEvent(job, reason, {
 		deliveryStatus: status,
-		deliveredAt: Date.now(),
+		lastAttemptAt: now,
+		...(status === "failed" ? {} : { deliveredAt: now }),
 		...(job.handlerRunId ? { handlerRunId: job.handlerRunId } : {}),
 		...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
 	});
@@ -841,7 +865,7 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 }
 
 function activeJobsForCurrentSession(): ReturnOnJob[] {
-	return jobs.filter((job) => job.status === "active" && (!job.sessionFile || !currentSessionFile || job.sessionFile === currentSessionFile));
+	return jobs.filter((job) => job.status === "active" && jobVisibleForSession(job, currentSessionFile));
 }
 
 function updateStatus(ctx = latestCtx): void {
@@ -2145,9 +2169,10 @@ function summarizeJob(job: ReturnOnJob): string {
 
 function formatFiredEventLine(event: FiredEventState): string {
 	const delivered = event.deliveredAt ? ` delivered=${nowIso(event.deliveredAt)}` : "";
+	const attempted = !event.deliveredAt && event.lastAttemptAt ? ` lastAttempt=${nowIso(event.lastAttemptAt)}` : "";
 	const handler = event.handlerRunId ? ` handler=${event.handlerRunId}` : "";
 	const error = event.error ? ` error=${truncateInline(event.error, 80)}` : "";
-	return `${event.jobId} [${event.deliveryStatus}] ${event.label} fired=${nowIso(event.firedAt)}${delivered}${handler} reason=${truncateInline(event.reason, 100)}${error}`;
+	return `${event.jobId} [${event.deliveryStatus}] ${event.label} fired=${nowIso(event.firedAt)}${delivered}${attempted}${handler} reason=${truncateInline(event.reason, 100)}${error}`;
 }
 
 function formatFiredEvents(events: FiredEventState[]): string {
@@ -2184,9 +2209,18 @@ function formatJobDetails(job: ReturnOnJob): string {
 	return lines.join("\n");
 }
 
+function jobVisibleForSession(job: ReturnOnJob, session: string | undefined): boolean {
+	return !session || !job.sessionFile || job.sessionFile === session;
+}
+
 function handlerVisibleForSession(run: ReturnOnHandlerRun, session: string | undefined): boolean {
 	const currentHandlerRunId = process.env.PI_RETURN_ON_HANDLER_RUN_ID;
 	return !session || !run.parentSessionFile || run.parentSessionFile === session || (!!currentHandlerRunId && run.id === currentHandlerRunId);
+}
+
+function isPathInside(parent: string, candidate: string): boolean {
+	const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+	return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function commandReply(content: string): void {
@@ -2271,7 +2305,7 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadJobs();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const relevant = jobs.filter((job) => !job.sessionFile || !session || job.sessionFile === session);
+			const relevant = jobs.filter((job) => jobVisibleForSession(job, session));
 			const text = relevant.length ? relevant.map(summarizeJob).join("\n") : "No return_on jobs for this session.";
 			ctx.ui.notify(text, "info");
 		},
@@ -2283,7 +2317,8 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadJobs();
 			const id = args.trim();
-			const job = jobs.find((candidate) => candidate.id === id);
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const job = jobs.find((candidate) => candidate.id === id && jobVisibleForSession(candidate, session));
 			if (!job) {
 				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
 				return;
@@ -2310,9 +2345,16 @@ export default function (pi: ExtensionAPI) {
 		description: "Prune old return_on state: /return-on-prune [--dry-run] [--days=N] [--audit-max=N]",
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
+			let options: PruneOptions;
+			try {
+				options = parsePruneCommandArgs(args);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+				return;
+			}
 			await loadJobs();
 			await loadHandlers();
-			const summary = await pruneState(parsePruneCommandArgs(args));
+			const summary = await pruneState(options);
 			ctx.ui.notify(formatPruneSummary(summary), "info");
 		},
 	});
@@ -2328,7 +2370,7 @@ export default function (pi: ExtensionAPI) {
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
 			const events = (await readFiredEventFiles())
 				.filter(({ event }) => !event.sessionFile || !session || event.sessionFile === session)
-				.filter(({ event }) => status === "all" || (status === "pending" ? !event.deliveredAt : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
+				.filter(({ event }) => status === "all" || (status === "pending" ? event.deliveryStatus === "pending" : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
 				.slice(0, limit)
 				.map(({ event }) => event);
 			ctx.ui.notify(formatFiredEvents(events), "info");
@@ -2341,7 +2383,8 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadJobs();
 			const id = args.trim();
-			const job = jobs.find((candidate) => candidate.id === id);
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const job = jobs.find((candidate) => candidate.id === id && jobVisibleForSession(candidate, session));
 			if (!job) {
 				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
 				return;
@@ -2466,7 +2509,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			await loadJobs();
-			const job = jobs.find((candidate) => candidate.id === params.id);
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const job = jobs.find((candidate) => candidate.id === params.id && jobVisibleForSession(candidate, session));
 			if (!job) throw new Error(`No return_on job found for '${params.id}'`);
 			job.status = "cancelled";
 			job.cancelledAt = Date.now();
@@ -2487,7 +2531,7 @@ export default function (pi: ExtensionAPI) {
 			await loadJobs();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
 			const status = params.status ?? "active";
-			const relevant = jobs.filter((job) => (!job.sessionFile || !session || job.sessionFile === session) && (status === "all" || job.status === status));
+			const relevant = jobs.filter((job) => jobVisibleForSession(job, session) && (status === "all" || job.status === status));
 			return {
 				content: [{ type: "text", text: relevant.length ? relevant.map(summarizeJob).join("\n") : `No ${status} return_on jobs.` }],
 				details: { jobs: relevant },
@@ -2508,8 +2552,14 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadJobs();
 			await loadHandlers();
-			const retentionDays = typeof params.retentionDays === "number" && Number.isFinite(params.retentionDays) && params.retentionDays >= 0 ? params.retentionDays : undefined;
-			const auditMaxEntries = typeof params.auditMaxEntries === "number" && Number.isFinite(params.auditMaxEntries) && params.auditMaxEntries >= 0 ? Math.floor(params.auditMaxEntries) : undefined;
+			if (params.retentionDays !== undefined && (typeof params.retentionDays !== "number" || !Number.isFinite(params.retentionDays) || params.retentionDays < 0)) {
+				throw new Error("retentionDays must be a non-negative number");
+			}
+			if (params.auditMaxEntries !== undefined && (typeof params.auditMaxEntries !== "number" || !Number.isSafeInteger(params.auditMaxEntries) || params.auditMaxEntries < 0)) {
+				throw new Error("auditMaxEntries must be a non-negative integer");
+			}
+			const retentionDays = params.retentionDays;
+			const auditMaxEntries = params.auditMaxEntries;
 			const summary = await pruneState({
 				dryRun: params.dryRun === true,
 				...(retentionDays !== undefined ? { retentionMs: Math.round(retentionDays * 86_400_000) } : {}),
@@ -2528,7 +2578,7 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			await loadJobs();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const job = jobs.find((candidate) => candidate.id === params.id && (!candidate.sessionFile || !session || candidate.sessionFile === session));
+			const job = jobs.find((candidate) => candidate.id === params.id && jobVisibleForSession(candidate, session));
 			if (!job) throw new Error(`No return_on job found for '${params.id}'`);
 			return { content: [{ type: "text", text: formatJobDetails(job) }], details: { job } };
 		},
@@ -2565,7 +2615,7 @@ export default function (pi: ExtensionAPI) {
 			const limit = requestedLimit !== undefined && Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
 			const events = (await readFiredEventFiles())
 				.filter(({ event }) => !event.sessionFile || !session || event.sessionFile === session)
-				.filter(({ event }) => status === "all" || (status === "pending" ? !event.deliveredAt : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
+				.filter(({ event }) => status === "all" || (status === "pending" ? event.deliveryStatus === "pending" : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
 				.slice(0, limit)
 				.map(({ event }) => event);
 			return { content: [{ type: "text", text: formatFiredEvents(events) }], details: { firedEvents: events } };

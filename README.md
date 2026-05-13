@@ -34,6 +34,8 @@ Slash commands:
 - `/return-on-handlers`
 - `/return-on-fired-events [pending|delivered|failed|all] [limit]`
 - `/return-on-prune [--dry-run] [--days=N] [--audit-max=N]`
+- `/return-on-direct-waits [limit]`
+- `/return-on-audit [limit]`
 
 Visibility:
 
@@ -268,7 +270,7 @@ Optional condition fields: `path`, `token`, `method`, `bodyContains`, and `bodyM
 
 ## Outgoing webhooks
 
-A watcher can also notify an external HTTP endpoint when it fires. The Pi session wake still happens normally; the webhook is best-effort and does not replace the wake message.
+A watcher can also notify an external HTTP endpoint when it fires. The webhook is best-effort and does not replace return_on delivery; delivery may be a same-session wake message or a forked handler depending on the watcher `delivery` settings.
 
 ```json
 {

@@ -41,7 +41,7 @@ function getFreePort(): Promise<number> {
   });
 }
 
-function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>) } = {}) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
@@ -81,8 +81,9 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
       events.set(event, handlers);
       return () => events.set(event, handlers.filter((candidate) => candidate !== handler));
     },
-    sendMessage(message: unknown, options: unknown) {
-      messages.push({ message, options, at: Date.now() });
+    sendMessage(message: unknown, sendOptions: unknown) {
+      if (options.failSendMessage) throw new Error("simulated sendMessage failure");
+      messages.push({ message, options: sendOptions, at: Date.now() });
     },
   };
 
@@ -823,12 +824,15 @@ async function testRetentionPrune() {
   const handlersDir = path.join(stateDir, "handlers");
   const oldHandlerDir = path.join(handlersDir, "old-handler");
   const runningHandlerDir = path.join(handlersDir, "running-handler");
+  const unsafeHandlerDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-unsafe-handler-"));
   await fs.mkdir(oldHandlerDir, { recursive: true });
   await fs.mkdir(runningHandlerDir, { recursive: true });
   await fs.writeFile(path.join(oldHandlerDir, "stdout.log"), "old", "utf8");
+  await fs.writeFile(path.join(unsafeHandlerDir, "sentinel"), "do not remove", "utf8");
   const handlerBase = { jobId: "job", label: "handler", cwd, parentSessionFile: harness.sessionFile, pid: 123, eventPath: "event.json", promptPath: "prompt.md", stdoutPath: "stdout.log", stderrPath: "stderr.log", sessionDir: "session" };
   await fs.writeFile(path.join(stateDir, "handlers.json"), JSON.stringify({ version: 1, handlers: [
     { ...handlerBase, id: "old-handler", status: "complete", startedAt: old, endedAt: old, dir: oldHandlerDir },
+    { ...handlerBase, id: "unsafe-handler", status: "complete", startedAt: old, endedAt: old, dir: unsafeHandlerDir },
     { ...handlerBase, id: "running-handler", status: "running", startedAt: old, dir: runningHandlerDir },
   ] }, null, 2), "utf8");
 
@@ -836,9 +840,12 @@ async function testRetentionPrune() {
   const auditEntry = (timestamp: number, command: string) => JSON.stringify({ version: 1, event: "direct_wait", timestamp, cwd, sessionFile: harness.sessionFile, toolName: "bash", command, thresholdMs: 10_000, action: "blocked", kind: "long sleep", detail: command });
   await fs.writeFile(auditPath, [auditEntry(old, "sleep 10"), auditEntry(old, "sleep 11"), auditEntry(recent, "sleep 12"), auditEntry(recent + 1, "sleep 13"), auditEntry(recent + 2, "sleep 14")].join("\n") + "\n", "utf8");
 
+  await harness.runCommand("return-on-prune", "--days=1junk");
+  const invalidText = harness.notifications.at(-1)?.message ?? "";
+  if (!invalidText.includes("--days must be a non-negative number")) throw new Error(`invalid prune arg did not warn: ${invalidText}`);
   await harness.runCommand("return-on-prune", "dry-run --days=1 --audit-max=2");
   const dryRunText = harness.notifications.at(-1)?.message ?? "";
-  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 1") || !dryRunText.includes("Fired events pruned: 1")) {
+  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 1") || !dryRunText.includes("Fired events pruned: 1") || !dryRunText.includes("Handlers pruned: 2; handler dirs pruned: 1")) {
     throw new Error(`prune dry-run summary was wrong: ${dryRunText}`);
   }
   if (!(await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false))) throw new Error("dry-run removed old fired event");
@@ -847,7 +854,7 @@ async function testRetentionPrune() {
   if (!pruneTool) throw new Error("missing return_on_prune tool");
   const result = await pruneTool.execute("prune", { retentionDays: 1, auditMaxEntries: 2 }, new AbortController().signal, () => {}, harness.ctx);
   const text = String(result.content?.[0]?.text ?? "");
-  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 1") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 1") || !text.includes("Direct-wait audit entries pruned: 3")) {
+  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 1") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 2; handler dirs pruned: 1") || !text.includes("Direct-wait audit entries pruned: 3")) {
     throw new Error(`prune summary was wrong: ${text}`);
   }
   const jobsState = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8"));
@@ -859,10 +866,92 @@ async function testRetentionPrune() {
     if (!(await fs.stat(path.join(firedDir, name)).then(() => true, () => false))) throw new Error(`prune removed protected fired event ${name}`);
   }
   if (await fs.stat(oldHandlerDir).then(() => true, () => false)) throw new Error("old handler dir was not pruned");
+  if (!(await fs.stat(path.join(unsafeHandlerDir, "sentinel")).then(() => true, () => false))) throw new Error("unsafe handler dir outside state was pruned");
   if (!(await fs.stat(runningHandlerDir).then(() => true, () => false))) throw new Error("running handler dir was pruned");
   const auditLines = (await fs.readFile(auditPath, "utf8")).trim().split("\n");
   if (auditLines.length !== 2 || !auditLines[0].includes("sleep 13") || !auditLines[1].includes("sleep 14")) throw new Error(`audit prune kept wrong lines: ${auditLines.join(" | ")}`);
   await harness.emit("session_shutdown");
+}
+
+async function testFailedFiredEventRetries() {
+  const jobId = "pending_retry_job";
+  const label = "pending retry label";
+  const resume = "pending retry resume";
+  const session = createHarness("pending-retry");
+  const now = Date.now();
+  const job = { id: jobId, label, cwd, sessionFile: session.sessionFile, createdAt: now, updatedAt: now, status: "fired", condition: { type: "timer", after: "1ms" }, resume, firedAt: now, latches: {}, leafState: {} };
+  await fs.mkdir(path.join(stateDir, "fired"), { recursive: true });
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [job] }, null, 2), "utf8");
+  const firedPath = path.join(stateDir, "fired", `${jobId}.json`);
+  await fs.writeFile(firedPath, JSON.stringify({
+    version: 1,
+    event: "return_on.fired",
+    id: jobId,
+    jobId,
+    label,
+    reason: "retry test",
+    createdAt: now,
+    firedAt: now,
+    cwd,
+    sessionFile: session.sessionFile,
+    resume,
+    job,
+    deliveryStatus: "pending",
+  }, null, 2), "utf8");
+
+  const failing = createHarness("pending-retry", { failSendMessage: true });
+  await failing.emit("session_start");
+  const failed = JSON.parse(await fs.readFile(firedPath, "utf8"));
+  if (failed.deliveryStatus !== "failed" || failed.deliveredAt || !failed.lastAttemptAt || !String(failed.error ?? "").includes("simulated sendMessage failure")) {
+    throw new Error(`failed fired event was not left retryable: ${JSON.stringify(failed)}`);
+  }
+  await failing.emit("session_shutdown");
+
+  const retrying = createHarness("pending-retry");
+  await retrying.emit("session_start");
+  const entries = wakeEntries(retrying, jobId);
+  if (entries.length !== 1) throw new Error(`failed fired event did not retry exactly once: ${entries.length}`);
+  assertWake(entries[0], { jobId, label, resume });
+  const delivered = JSON.parse(await fs.readFile(firedPath, "utf8"));
+  if (delivered.deliveryStatus !== "wake-sent" || !delivered.deliveredAt) {
+    throw new Error(`retried fired event was not marked delivered: ${JSON.stringify(delivered)}`);
+  }
+  await retrying.emit("session_shutdown");
+}
+
+async function testStatusCancelSessionIsolation() {
+  const sessionA = createHarness("status-cancel-a");
+  await sessionA.emit("session_start");
+  const statusJob = await sessionA.register({ label: "private status", condition: { type: "timer", after: "1h" }, resume: "private status resume" });
+  const cancelJob = await sessionA.register({ label: "private cancel", condition: { type: "timer", after: "1h" }, resume: "private cancel resume" });
+  await sessionA.emit("session_shutdown");
+
+  const sessionB = createHarness("status-cancel-b");
+  await sessionB.emit("session_start");
+  await sessionB.runCommand("return-on-status", statusJob);
+  const statusText = sessionB.notifications.at(-1)?.message ?? "";
+  if (!statusText.includes("No return_on job found") || statusText.includes("private status resume")) {
+    throw new Error(`cross-session status command leaked job details: ${statusText}`);
+  }
+  await sessionB.runCommand("return-on-cancel", cancelJob);
+  const cancelText = sessionB.notifications.at(-1)?.message ?? "";
+  if (!cancelText.includes("No return_on job found")) throw new Error(`cross-session cancel command unexpectedly found job: ${cancelText}`);
+  try {
+    await sessionB.callTool("return_on_cancel", { id: cancelJob });
+    throw new Error("cross-session cancel tool unexpectedly succeeded");
+  } catch (error) {
+    if (!String(error).includes("No return_on job found")) throw error;
+  }
+  await sessionB.emit("session_shutdown");
+
+  const sessionAAgain = createHarness("status-cancel-a");
+  await sessionAAgain.emit("session_start");
+  const result = await sessionAAgain.callTool("return_on_status", { id: cancelJob });
+  const text = String(result.content?.[0]?.text ?? "");
+  if (!text.includes("private cancel") || text.includes("[cancelled]")) throw new Error(`owner session could not see uncancelled job: ${text}`);
+  await sessionAAgain.cancel(statusJob);
+  await sessionAAgain.cancel(cancelJob);
+  await sessionAAgain.emit("session_shutdown");
 }
 
 async function testSessionIsolation() {
@@ -913,7 +1002,9 @@ await testExecConfirmationAndValidation();
 await testListToolAndCommands();
 await testRestartResume();
 await testPendingFiredEventDelivery();
+await testFailedFiredEventRetries();
 await testSessionIsolation();
+await testStatusCancelSessionIsolation();
 await testRetentionPrune();
 
 const duplicateIds = allJobIds.filter((id, index) => allJobIds.indexOf(id) !== index);
