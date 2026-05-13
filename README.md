@@ -41,7 +41,7 @@ Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
 - By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
-- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, `handlers.json`, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
 
 ## `return_on` parameters
 
@@ -72,6 +72,8 @@ Diagnostics:
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
 
 ## Background fork handlers
+
+When a watcher fires, the extension writes an idempotent fired-event capsule to `~/.local/state/pi-return-on/fired/<job-id>.json` before delivery. If a future/background evaluator writes a pending capsule while Pi is not active, the extension will deliver it on the next matching `session_start` and mark it delivered.
 
 Legacy delivery wakes the same parent session with `triggerTurn: true`. For events that should be handled without distracting the parent, pass:
 

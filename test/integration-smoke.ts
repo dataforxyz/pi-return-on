@@ -21,6 +21,7 @@ type WakeExpectation = {
 type Harness = ReturnType<typeof createHarness>;
 
 const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-smoke-"));
+const stateDir = path.join(process.env.HOME!, ".local", "state", "pi-return-on");
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const allJobIds: string[] = [];
 
@@ -201,7 +202,7 @@ async function testDirectWaitPolicy(harness: Harness) {
   const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
   if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);
 
-  const auditFile = path.join(process.env.HOME!, ".local", "state", "pi-return-on", "direct-wait-audit.jsonl");
+  const auditFile = path.join(stateDir, "direct-wait-audit.jsonl");
   const auditLines = (await fs.readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   if (!auditLines.some((entry) => entry.action === "blocked" && entry.detail === "sleep 10s")) {
     throw new Error(`blocked sleep was not audited: ${JSON.stringify(auditLines)}`);
@@ -647,6 +648,52 @@ async function testRestartResume() {
   await second.emit("session_shutdown");
 }
 
+async function testPendingFiredEventDelivery() {
+  const label = "pending fired event";
+  const resume = "pending fired resume";
+  const reason = "simulated worker fired";
+  const first = createHarness("pending-fired-event");
+  await first.emit("session_start");
+  const jobId = await first.register({ label, condition: { type: "timer", after: "1h" }, resume });
+  await first.emit("session_shutdown");
+
+  const jobsPath = path.join(stateDir, "jobs.json");
+  const jobsState = JSON.parse(await fs.readFile(jobsPath, "utf8"));
+  const job = jobsState.jobs.find((candidate: any) => candidate.id === jobId);
+  if (!job) throw new Error(`missing saved job ${jobId}`);
+  const firedAt = Date.now();
+  const firedJob = { ...job, status: "fired", firedAt, updatedAt: firedAt, fireReason: reason };
+  const firedDir = path.join(stateDir, "fired");
+  await fs.mkdir(firedDir, { recursive: true });
+  const firedPath = path.join(firedDir, `${jobId}.json`);
+  await fs.writeFile(firedPath, JSON.stringify({
+    version: 1,
+    event: "return_on.fired",
+    id: jobId,
+    jobId,
+    label,
+    reason,
+    createdAt: job.createdAt,
+    firedAt,
+    cwd,
+    sessionFile: first.sessionFile,
+    resume,
+    job: firedJob,
+    deliveryStatus: "pending",
+  }, null, 2), "utf8");
+
+  const second = createHarness("pending-fired-event");
+  await second.emit("session_start");
+  const entries = wakeEntries(second, jobId);
+  if (entries.length !== 1) throw new Error(`pending fired event was not delivered exactly once: ${entries.length}`);
+  assertWake(entries[0], { jobId, label, resume });
+  const delivered = JSON.parse(await fs.readFile(firedPath, "utf8"));
+  if (delivered.deliveryStatus !== "wake-sent" || !delivered.deliveredAt) {
+    throw new Error(`pending fired event was not marked delivered: ${JSON.stringify(delivered)}`);
+  }
+  await second.emit("session_shutdown");
+}
+
 async function testSessionIsolation() {
   const label = "smoke session isolation";
   const resume = "session isolation resume";
@@ -692,6 +739,7 @@ await harness.emit("session_shutdown");
 await testExecConfirmationAndValidation();
 await testListToolAndCommands();
 await testRestartResume();
+await testPendingFiredEventDelivery();
 await testSessionIsolation();
 
 const duplicateIds = allJobIds.filter((id, index) => allJobIds.indexOf(id) !== index);

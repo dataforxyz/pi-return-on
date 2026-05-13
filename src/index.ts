@@ -15,6 +15,7 @@ const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
 const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
+const FIRED_DIR = path.join(STATE_DIR, "fired");
 const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
 const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
 const DIRECT_WAIT_AUDIT_FILE = path.join(STATE_DIR, "direct-wait-audit.jsonl");
@@ -220,6 +221,27 @@ interface JobsState {
 interface HandlersState {
 	version: 1;
 	handlers: ReturnOnHandlerRun[];
+}
+
+type FiredEventDeliveryStatus = "pending" | "wake-sent" | "handler-launched" | "skipped-cancelled" | "failed";
+
+interface FiredEventState {
+	version: 1;
+	event: "return_on.fired";
+	id: string;
+	jobId: string;
+	label: string;
+	reason: string;
+	createdAt: number;
+	firedAt: number;
+	cwd: string;
+	sessionFile?: string;
+	resume: string;
+	job: ReturnOnJob;
+	deliveryStatus: FiredEventDeliveryStatus;
+	deliveredAt?: number;
+	handlerRunId?: string;
+	error?: string;
 }
 
 interface EvalResult {
@@ -534,6 +556,124 @@ async function saveHandlers(): Promise<void> {
 	const tmp = `${HANDLERS_FILE}.${process.pid}.${Date.now()}.tmp`;
 	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: handlerRuns.slice(-200) } satisfies HandlersState, null, 2), "utf8");
 	await fsp.rename(tmp, HANDLERS_FILE);
+}
+
+function firedEventPath(jobId: string): string {
+	return path.join(FIRED_DIR, `${jobId}.json`);
+}
+
+async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "handlerRunId" | "error">> = {}): Promise<string> {
+	await fsp.mkdir(FIRED_DIR, { recursive: true });
+	const eventPath = firedEventPath(job.id);
+	const event: FiredEventState = {
+		version: 1,
+		event: "return_on.fired",
+		id: job.id,
+		jobId: job.id,
+		label: job.label,
+		reason,
+		createdAt: job.createdAt,
+		firedAt: job.firedAt ?? Date.now(),
+		cwd: job.cwd,
+		...(job.sessionFile ? { sessionFile: job.sessionFile } : {}),
+		resume: job.resume,
+		job,
+		deliveryStatus: updates.deliveryStatus ?? "pending",
+		...(updates.deliveredAt ? { deliveredAt: updates.deliveredAt } : {}),
+		...(updates.handlerRunId ? { handlerRunId: updates.handlerRunId } : {}),
+		...(updates.error ? { error: updates.error } : {}),
+	};
+	const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
+	await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
+	await fsp.rename(tmp, eventPath);
+	return eventPath;
+}
+
+async function readPendingFiredEvents(): Promise<Array<{ path: string; event: FiredEventState }>> {
+	let entries: fs.Dirent[];
+	try {
+		entries = await fsp.readdir(FIRED_DIR, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	const pending: Array<{ path: string; event: FiredEventState }> = [];
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const eventPath = path.join(FIRED_DIR, entry.name);
+		try {
+			const parsed = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
+			if (parsed?.event === "return_on.fired" && !parsed.deliveredAt) pending.push({ path: eventPath, event: parsed });
+		} catch (error) {
+			console.error(`[${EXTENSION_NAME}] Failed to read fired event ${eventPath}:`, error);
+		}
+	}
+	return pending;
+}
+
+function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
+	const eventSession = event.sessionFile ?? event.job?.sessionFile;
+	return !eventSession || !currentSessionFile || eventSession === currentSessionFile;
+}
+
+async function markFiredEventDelivered(eventPath: string, reason: string, status: FiredEventDeliveryStatus, job: ReturnOnJob, error?: unknown): Promise<void> {
+	await writeFiredEvent(job, reason, {
+		deliveryStatus: status,
+		deliveredAt: Date.now(),
+		...(job.handlerRunId ? { handlerRunId: job.handlerRunId } : {}),
+		...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
+	});
+	if (eventPath !== firedEventPath(job.id)) {
+		await fsp.rm(eventPath, { force: true });
+	}
+}
+
+async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
+	const pending = await readPendingFiredEvents();
+	for (const { path: eventPath, event } of pending) {
+		if (!firedEventMatchesCurrentSession(event)) continue;
+		const job = jobs.find((candidate) => candidate.id === event.jobId) ?? event.job;
+		if (job.status === "cancelled") {
+			await markFiredEventDelivered(eventPath, event.reason, "skipped-cancelled", job);
+			continue;
+		}
+		let changed = false;
+		if (job.status === "active") {
+			job.status = "fired";
+			job.firedAt = event.firedAt;
+			job.updatedAt = event.firedAt;
+			job.fireReason = event.reason;
+			changed = true;
+		}
+		if (!jobs.some((candidate) => candidate.id === job.id)) {
+			jobs.push(job);
+			changed = true;
+		}
+		if (changed) await saveJobs();
+		try {
+			const delivery = job.delivery ?? normalizeDelivery(undefined);
+			if (delivery.mode === "fork") {
+				const launched = await launchReturnHandler(pi, job, event.reason, delivery);
+				if (launched) {
+					await markFiredEventDelivered(eventPath, event.reason, "handler-launched", job);
+					continue;
+				}
+			}
+			pi.sendMessage(
+				{
+					customType: EXTENSION_NAME,
+					content: formatFireMessage(job, event.reason),
+					display: true,
+					details: { id: job.id, label: job.label, reason: event.reason, latches: job.latches, firedEventPath: eventPath },
+				},
+				{ triggerTurn: true },
+			);
+			await markFiredEventDelivered(eventPath, event.reason, "wake-sent", job);
+		} catch (error) {
+			await markFiredEventDelivered(eventPath, event.reason, "failed", job, error);
+			console.error(`[${EXTENSION_NAME}] Failed to deliver fired event ${eventPath}:`, error);
+		}
+	}
 }
 
 function activeJobsForCurrentSession(): ReturnOnJob[] {
@@ -1586,8 +1726,14 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	job.updatedAt = job.firedAt;
 	job.fireReason = reason;
 	await saveJobs();
+	let eventPath: string | undefined;
 	try {
-		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt });
+		eventPath = await writeFiredEvent(job, reason);
+	} catch (error) {
+		console.error(`[${EXTENSION_NAME}] Failed to write fired event for ${job.id}:`, error);
+	}
+	try {
+		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt, eventPath });
 	} catch {
 		// Best-effort audit trail.
 	}
@@ -1597,7 +1743,10 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	const delivery = job.delivery ?? normalizeDelivery(undefined);
 	if (delivery.mode === "fork") {
 		const launched = await launchReturnHandler(pi, job, reason, delivery);
-		if (launched) return;
+		if (launched) {
+			if (eventPath) await markFiredEventDelivered(eventPath, reason, "handler-launched", job);
+			return;
+		}
 	}
 	const message = formatFireMessage(job, reason);
 	pi.sendMessage(
@@ -1605,10 +1754,11 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 			customType: EXTENSION_NAME,
 			content: message,
 			display: true,
-			details: { id: job.id, label: job.label, reason, latches: job.latches },
+			details: { id: job.id, label: job.label, reason, latches: job.latches, eventPath },
 		},
 		{ triggerTurn: true },
 	);
+	if (eventPath) await markFiredEventDelivered(eventPath, reason, "wake-sent", job);
 }
 
 async function sendWebhook(job: ReturnOnJob, reason: string): Promise<void> {
@@ -1863,6 +2013,7 @@ export default function (pi: ExtensionAPI) {
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
 		await loadHandlers();
+		await deliverPendingFiredEvents(pi);
 		ensureTicker(pi);
 		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
 			ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
