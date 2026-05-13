@@ -594,7 +594,7 @@ async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partia
 	return eventPath;
 }
 
-async function readPendingFiredEvents(): Promise<Array<{ path: string; event: FiredEventState }>> {
+async function readFiredEventFiles(): Promise<Array<{ path: string; event: FiredEventState }>> {
 	let entries: fs.Dirent[];
 	try {
 		entries = await fsp.readdir(FIRED_DIR, { withFileTypes: true });
@@ -602,18 +602,22 @@ async function readPendingFiredEvents(): Promise<Array<{ path: string; event: Fi
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
 	}
-	const pending: Array<{ path: string; event: FiredEventState }> = [];
+	const events: Array<{ path: string; event: FiredEventState }> = [];
 	for (const entry of entries) {
 		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
 		const eventPath = path.join(FIRED_DIR, entry.name);
 		try {
 			const parsed = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
-			if (parsed?.event === "return_on.fired" && !parsed.deliveredAt) pending.push({ path: eventPath, event: parsed });
+			if (parsed?.event === "return_on.fired") events.push({ path: eventPath, event: parsed });
 		} catch (error) {
 			console.error(`[${EXTENSION_NAME}] Failed to read fired event ${eventPath}:`, error);
 		}
 	}
-	return pending;
+	return events.sort((a, b) => (b.event.firedAt ?? 0) - (a.event.firedAt ?? 0));
+}
+
+async function readPendingFiredEvents(): Promise<Array<{ path: string; event: FiredEventState }>> {
+	return (await readFiredEventFiles()).filter(({ event }) => !event.deliveredAt);
 }
 
 function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
@@ -1984,6 +1988,18 @@ function summarizeJob(job: ReturnOnJob): string {
 	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
 }
 
+function formatFiredEventLine(event: FiredEventState): string {
+	const delivered = event.deliveredAt ? ` delivered=${nowIso(event.deliveredAt)}` : "";
+	const handler = event.handlerRunId ? ` handler=${event.handlerRunId}` : "";
+	const error = event.error ? ` error=${truncateInline(event.error, 80)}` : "";
+	return `${event.jobId} [${event.deliveryStatus}] ${event.label} fired=${nowIso(event.firedAt)}${delivered}${handler} reason=${truncateInline(event.reason, 100)}${error}`;
+}
+
+function formatFiredEvents(events: FiredEventState[]): string {
+	if (events.length === 0) return "No return_on fired events.";
+	return [`return_on fired events (${events.length})`, ...events.map(formatFiredEventLine)].join("\n");
+}
+
 function formatJobDetails(job: ReturnOnJob): string {
 	const lines = [
 		`return_on job ${job.id}`,
@@ -2127,6 +2143,24 @@ export default function (pi: ExtensionAPI) {
 				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
 				: "No return_on handler runs for this session.";
 			ctx.ui.notify(text, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-fired-events", {
+		description: "List durable return_on fired-event capsules: /return-on-fired-events [pending|delivered|failed|all] [limit]",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const status = parts[0] === "pending" || parts[0] === "delivered" || parts[0] === "failed" || parts[0] === "all" ? parts.shift() : "all";
+			const requestedLimit = Number.parseInt(parts[0] ?? "", 10);
+			const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const events = (await readFiredEventFiles())
+				.filter(({ event }) => !event.sessionFile || !session || event.sessionFile === session)
+				.filter(({ event }) => status === "all" || (status === "pending" ? !event.deliveredAt : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
+				.slice(0, limit)
+				.map(({ event }) => event);
+			ctx.ui.notify(formatFiredEvents(events), "info");
 		},
 	});
 
@@ -2291,6 +2325,21 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "return_on_status",
+		label: "Return On Status",
+		description: "Show detailed status for a return_on watcher by id, including condition tree, leaf checks, latches, delivery, and resume instruction.",
+		parameters: Type.Object({ id: Type.String() }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			await loadJobs();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const job = jobs.find((candidate) => candidate.id === params.id && (!candidate.sessionFile || !session || candidate.sessionFile === session));
+			if (!job) throw new Error(`No return_on job found for '${params.id}'`);
+			return { content: [{ type: "text", text: formatJobDetails(job) }], details: { job } };
+		},
+	});
+
+	pi.registerTool({
 		name: "return_on_handlers",
 		label: "List Return On Handlers",
 		description: "List background fork/sibling handlers launched for fired return_on jobs.",
@@ -2305,6 +2354,26 @@ export default function (pi: ExtensionAPI) {
 				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
 				: `No ${status} return_on handlers.`;
 			return { content: [{ type: "text", text }], details: { handlers: relevant } };
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on_fired_events",
+		label: "List Return On Fired Events",
+		description: "List durable fired-event capsules used for restart-safe return_on delivery.",
+		parameters: Type.Object({ status: Type.Optional(StringEnum(["pending", "delivered", "failed", "all"] as const)), limit: Type.Optional(Type.Number()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const status = params.status ?? "all";
+			const requestedLimit = typeof params.limit === "number" ? params.limit : undefined;
+			const limit = requestedLimit !== undefined && Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 1000) : 50;
+			const events = (await readFiredEventFiles())
+				.filter(({ event }) => !event.sessionFile || !session || event.sessionFile === session)
+				.filter(({ event }) => status === "all" || (status === "pending" ? !event.deliveredAt : status === "delivered" ? !!event.deliveredAt : event.deliveryStatus === "failed"))
+				.slice(0, limit)
+				.map(({ event }) => event);
+			return { content: [{ type: "text", text: formatFiredEvents(events) }], details: { firedEvents: events } };
 		},
 	});
 }

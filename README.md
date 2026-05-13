@@ -20,8 +20,10 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 
 - `return_on` — register a watcher and terminate the current LLM turn.
 - `return_on_list` — list watcher jobs for the current session.
+- `return_on_status` — show detailed status for one watcher by id.
 - `return_on_cancel` — cancel a watcher by id.
 - `return_on_handlers` — list background fork/sibling handlers launched for fired watchers.
+- `return_on_fired_events` — list durable fired-event capsules used for restart-safe delivery.
 
 Slash commands:
 
@@ -29,13 +31,15 @@ Slash commands:
 - `/return-on-status <id>`
 - `/return-on-cancel <id>`
 - `/return-on-handlers`
+- `/return-on-fired-events [pending|delivered|failed|all] [limit]`
 
 Visibility:
 
 - Active waits update the Pi status footer with compact tags such as `⏰ build · port 127.0.0.1:3000 open` or `⏰ 2 waiting: build · render`.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
 - The `return_on` registration result includes a `Waiting for:` line so the agent and user can immediately verify the watcher target.
-- `/return-on-status <id>` includes the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
+- `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
+- `/return-on-fired-events` and `return_on_fired_events` show pending/delivered/failed fired capsules for restart-safe delivery debugging.
 
 Diagnostics:
 

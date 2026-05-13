@@ -658,6 +658,14 @@ async function testListToolAndCommands() {
   if (!activeText.includes(activeId) || activeText.includes(cancelId) || !activeText.includes("waiting:") || !activeText.includes("condition:")) throw new Error(`active list had wrong jobs or missing wait detail: ${activeText}`);
   if (!cancelledText.includes(cancelId) || cancelledText.includes(activeId) || !cancelledText.includes("waiting:")) throw new Error(`cancelled list had wrong jobs or missing wait detail: ${cancelledText}`);
 
+  const statusTool = harness.tools.get("return_on_status");
+  if (!statusTool) throw new Error("missing return_on_status tool");
+  const status = await statusTool.execute("status", { id: cancelId }, new AbortController().signal, () => {}, harness.ctx);
+  const statusText = String(status.content?.[0]?.text ?? "");
+  if (!statusText.includes(cancelId) || !statusText.includes("Condition tree:") || !statusText.includes("Leaf checks:")) {
+    throw new Error(`return_on_status tool did not return rich job details: ${statusText}`);
+  }
+
   await harness.commands.get("return-on-status")?.handler(cancelId, harness.ctx);
   if (!harness.notifications.some((entry) => entry.message.includes(cancelId) && entry.message.includes("cancelled") && entry.message.includes("Condition tree:") && entry.message.includes("Leaf checks:"))) {
     throw new Error("return-on-status command did not notify rich cancelled job details");
@@ -727,6 +735,18 @@ async function testPendingFiredEventDelivery() {
   const delivered = JSON.parse(await fs.readFile(firedPath, "utf8"));
   if (delivered.deliveryStatus !== "wake-sent" || !delivered.deliveredAt) {
     throw new Error(`pending fired event was not marked delivered: ${JSON.stringify(delivered)}`);
+  }
+  await second.commands.get("return-on-fired-events")?.handler("delivered 5", second.ctx);
+  const firedNotification = second.notifications.at(-1)?.message ?? "";
+  if (!firedNotification.includes(jobId) || !firedNotification.includes("wake-sent")) {
+    throw new Error(`return-on-fired-events command did not show delivered event: ${firedNotification}`);
+  }
+  const firedTool = second.tools.get("return_on_fired_events");
+  if (!firedTool) throw new Error("missing return_on_fired_events tool");
+  const firedResult = await firedTool.execute("fired", { status: "delivered", limit: 5 }, new AbortController().signal, () => {}, second.ctx);
+  const firedText = String(firedResult.content?.[0]?.text ?? "");
+  if (!firedText.includes(jobId) || !firedText.includes("wake-sent")) {
+    throw new Error(`return_on_fired_events tool did not show delivered event: ${firedText}`);
   }
   await second.emit("session_shutdown");
 }
