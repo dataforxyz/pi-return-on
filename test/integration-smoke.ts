@@ -4,7 +4,24 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import * as net from "node:net";
 
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("failed to reserve a local port")));
+        return;
+      }
+      const port = address.port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
 process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-home-"));
+process.env.PI_RETURN_ON_WEBHOOK_PORT ??= String(await getFreePort());
 
 const { default: extension } = await import("../src/index.ts");
 
@@ -24,22 +41,6 @@ const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-smoke-"));
 const stateDir = path.join(process.env.HOME!, ".local", "state", "pi-return-on");
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const allJobIds: string[] = [];
-
-function getFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("failed to reserve a local port")));
-        return;
-      }
-      const port = address.port;
-      server.close(() => resolve(port));
-    });
-  });
-}
 
 function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean } = {}) {
   const tools = new Map<string, Tool>();
@@ -373,6 +374,38 @@ async function testLogContains(harness: Harness) {
   await expectNoWake(harness, jobId, 800, "log fired before READY was appended");
   await fs.appendFile(log, "READY\n", "utf8");
   await waitForWake(harness, { jobId, label, resume }, 2_500);
+}
+
+async function testIncomingWebhookServerStartupFailure(harness: Harness) {
+  const label = "failed incoming webhook startup";
+  const webhookPort = Number(process.env.PI_RETURN_ON_WEBHOOK_PORT);
+  if (!Number.isInteger(webhookPort) || webhookPort <= 0) throw new Error(`invalid smoke webhook port: ${process.env.PI_RETURN_ON_WEBHOOK_PORT}`);
+  const jobsPath = path.join(stateDir, "jobs.json");
+  const beforeJobs = await fs.readFile(jobsPath, "utf8").then((text) => JSON.parse(text).jobs as any[], () => []);
+  const blocker = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    blocker.once("error", reject);
+    blocker.listen(webhookPort, "127.0.0.1", () => resolve());
+  });
+  try {
+    let rejected = false;
+    try {
+      await harness.callTool("return_on", {
+        label,
+        condition: { type: "webhook" },
+        resume: "should not persist",
+      });
+    } catch (error) {
+      rejected = /EADDRINUSE|listen/i.test(String(error));
+    }
+    if (!rejected) throw new Error("incoming webhook registration did not fail when the webhook server port was occupied");
+  } finally {
+    await new Promise<void>((resolve) => blocker.close(() => resolve()));
+  }
+  const afterJobs = await fs.readFile(jobsPath, "utf8").then((text) => JSON.parse(text).jobs as any[], () => []);
+  if (afterJobs.length !== beforeJobs.length || afterJobs.some((job) => job.label === label)) {
+    throw new Error(`failed incoming webhook registration persisted a job: before=${beforeJobs.length} after=${afterJobs.length}`);
+  }
 }
 
 async function testIncomingWebhookWake(harness: Harness) {
@@ -982,6 +1015,7 @@ await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
 await testAgentArtifactForkDelivery(harness);
+await testIncomingWebhookServerStartupFailure(harness);
 await testIncomingWebhookWake(harness);
 await testWebhookOnFire(harness);
 await testLogContains(harness);

@@ -2476,6 +2476,7 @@ export default function (pi: ExtensionAPI) {
 				latches: {},
 				leafState: {},
 			};
+			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
 			try {
@@ -2484,7 +2485,6 @@ export default function (pi: ExtensionAPI) {
 				// Best-effort audit trail.
 			}
 			ensureTicker(pi);
-			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
 			const endTurn = params.endTurn !== false;

@@ -61,6 +61,7 @@ Use the scanner script outside Pi to summarize the audit log and scan Pi session
 npm run audit:direct-waits
 node scripts/scan-direct-waits.mjs --json
 node scripts/scan-direct-waits.mjs ~/.pi/agent/sessions
+node scripts/scan-direct-waits.mjs --json --audit-only /path/to/direct-wait-audit.jsonl
 ```
 
 The scanner reports structured audit counts plus text-log candidates such as long sleeps, streaming waits, polling loops, and foreground dev servers that may not have gone through the current blocker.

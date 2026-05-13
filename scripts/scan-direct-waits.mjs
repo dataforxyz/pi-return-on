@@ -144,14 +144,28 @@ function addCount(map, key) {
 }
 
 const roots = explicitPaths.length > 0 ? explicitPaths.map((p) => path.resolve(p)) : defaultRoots;
-const auditEntries = await readAudit(defaultAuditFile);
+const auditFiles = new Set([path.resolve(defaultAuditFile)]);
+for (const root of roots) {
+  try {
+    const stat = await fs.stat(root);
+    if (!stat.isFile() || stat.size > maxFileBytes) continue;
+    const entries = await readAudit(root);
+    if (entries.length > 0) auditFiles.add(path.resolve(root));
+  } catch {
+    // Ignore missing/inaccessible explicit paths.
+  }
+}
+const auditEntries = [];
+for (const file of auditFiles) {
+  auditEntries.push(...await readAudit(file));
+}
 const scanHits = [];
 
 if (!auditOnly) {
   for (const root of roots) {
     if (!(await exists(root))) continue;
     for await (const file of walk(root)) {
-      if (file === defaultAuditFile) continue;
+      if (auditFiles.has(path.resolve(file))) continue;
       let raw;
       try {
         raw = await fs.readFile(file, "utf8");
@@ -187,6 +201,7 @@ function countsObject(map) {
 
 const result = {
   auditFile: defaultAuditFile,
+  auditFiles: [...auditFiles],
   auditEntries: auditEntries.length,
   auditByAction: countsObject(auditByAction),
   auditByKind: countsObject(auditByKind),
