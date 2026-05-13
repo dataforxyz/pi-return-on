@@ -24,6 +24,7 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 - `return_on_cancel` — cancel a watcher by id.
 - `return_on_handlers` — list background fork/sibling handlers launched for fired watchers.
 - `return_on_fired_events` — list durable fired-event capsules used for restart-safe delivery.
+- `return_on_prune` — prune old retained jobs, fired-event capsules, handler artifacts, and direct-wait audit entries.
 
 Slash commands:
 
@@ -32,6 +33,7 @@ Slash commands:
 - `/return-on-cancel <id>`
 - `/return-on-handlers`
 - `/return-on-fired-events [pending|delivered|failed|all] [limit]`
+- `/return-on-prune [--dry-run] [--days=N] [--audit-max=N]`
 
 Visibility:
 
@@ -40,6 +42,7 @@ Visibility:
 - The `return_on` registration result includes a `Waiting for:` line so the agent and user can immediately verify the watcher target.
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
 - `/return-on-fired-events` and `return_on_fired_events` show pending/delivered/failed fired capsules for restart-safe delivery debugging.
+- `/return-on-prune --dry-run` previews retention cleanup before deleting old state.
 
 Design notes:
 
@@ -52,7 +55,8 @@ Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
 - By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
-- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, direct-wait audit JSONL, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Startup cleanup keeps active jobs, pending/failed fired events, and running handlers, while pruning terminal jobs, delivered fired-event capsules, completed handler artifacts, and old direct-wait audit entries after 30 days by default. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window.
 
 ## `return_on` parameters
 

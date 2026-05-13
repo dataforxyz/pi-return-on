@@ -34,6 +34,9 @@ const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
+const DEFAULT_RETENTION_DAYS = 30;
+const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
+const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
@@ -243,6 +246,23 @@ interface FiredEventState {
 	deliveredAt?: number;
 	handlerRunId?: string;
 	error?: string;
+}
+
+interface PruneOptions {
+	retentionMs?: number;
+	auditMaxEntries?: number;
+	dryRun?: boolean;
+}
+
+interface PruneSummary {
+	dryRun: boolean;
+	retentionMs: number;
+	auditMaxEntries: number;
+	jobsPruned: number;
+	firedEventsPruned: number;
+	handlersPruned: number;
+	handlerDirsPruned: number;
+	auditEntriesPruned: number;
 }
 
 interface EvalResult {
@@ -618,6 +638,141 @@ async function readFiredEventFiles(): Promise<Array<{ path: string; event: Fired
 
 async function readPendingFiredEvents(): Promise<Array<{ path: string; event: FiredEventState }>> {
 	return (await readFiredEventFiles()).filter(({ event }) => !event.deliveredAt);
+}
+
+function terminalJobTime(job: ReturnOnJob): number | undefined {
+	if (job.status === "fired") return job.firedAt ?? job.updatedAt;
+	if (job.status === "cancelled") return job.cancelledAt ?? job.updatedAt;
+	return undefined;
+}
+
+function parsePruneCommandArgs(args: string): PruneOptions {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	let dryRun = false;
+	let retentionMs: number | undefined;
+	let auditMaxEntries: number | undefined;
+	for (const part of parts) {
+		if (part === "--dry-run" || part === "dry-run" || part === "dryrun") {
+			dryRun = true;
+			continue;
+		}
+		if (part.startsWith("--days=")) {
+			const days = Number.parseFloat(part.slice("--days=".length));
+			if (Number.isFinite(days) && days >= 0) retentionMs = Math.round(days * 86_400_000);
+			continue;
+		}
+		if (part.startsWith("--audit-max=")) {
+			const max = Number.parseInt(part.slice("--audit-max=".length), 10);
+			if (Number.isFinite(max) && max >= 0) auditMaxEntries = max;
+			continue;
+		}
+		const days = Number.parseFloat(part);
+		if (Number.isFinite(days) && days >= 0 && retentionMs === undefined) retentionMs = Math.round(days * 86_400_000);
+	}
+	return { dryRun, ...(retentionMs !== undefined ? { retentionMs } : {}), ...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}) };
+}
+
+function formatPruneSummary(summary: PruneSummary): string {
+	return [
+		`return_on prune ${summary.dryRun ? "dry run" : "complete"}`,
+		`Retention: ${formatDuration(summary.retentionMs)}; audit max entries: ${summary.auditMaxEntries}`,
+		`Jobs pruned: ${summary.jobsPruned}`,
+		`Fired events pruned: ${summary.firedEventsPruned}`,
+		`Handlers pruned: ${summary.handlersPruned}; handler dirs pruned: ${summary.handlerDirsPruned}`,
+		`Direct-wait audit entries pruned: ${summary.auditEntriesPruned}`,
+	].join("\n");
+}
+
+async function pruneDirectWaitAudit(cutoff: number, maxEntries: number, dryRun: boolean): Promise<number> {
+	let raw: string;
+	try {
+		raw = await fsp.readFile(DIRECT_WAIT_AUDIT_FILE, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+		throw error;
+	}
+	const keptMalformed: string[] = [];
+	const keptEntries: DirectWaitAuditEntry[] = [];
+	let parsedCount = 0;
+	for (const line of raw.split("\n").filter(Boolean)) {
+		try {
+			const entry = JSON.parse(line) as DirectWaitAuditEntry;
+			parsedCount += 1;
+			if (!entry.timestamp || entry.timestamp >= cutoff) keptEntries.push(entry);
+		} catch {
+			keptMalformed.push(line);
+		}
+	}
+	const trimmedEntries = keptEntries.slice(-maxEntries);
+	const pruned = parsedCount - trimmedEntries.length;
+	if (!dryRun && pruned > 0) {
+		await fsp.mkdir(STATE_DIR, { recursive: true });
+		const tmp = atomicTempPath(DIRECT_WAIT_AUDIT_FILE);
+		const lines = [...keptMalformed, ...trimmedEntries.map((entry) => JSON.stringify(entry))];
+		await fsp.writeFile(tmp, lines.length ? `${lines.join("\n")}\n` : "", "utf8");
+		await fsp.rename(tmp, DIRECT_WAIT_AUDIT_FILE);
+	}
+	return pruned;
+}
+
+async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
+	const retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
+	const auditMaxEntries = options.auditMaxEntries ?? DEFAULT_AUDIT_MAX_ENTRIES;
+	const dryRun = options.dryRun === true;
+	const cutoff = Date.now() - retentionMs;
+	const firedEvents = await readFiredEventFiles();
+	const protectedJobIds = new Set(firedEvents.filter(({ event }) => !event.deliveredAt || event.deliveryStatus === "failed").map(({ event }) => event.jobId));
+
+	let jobsPruned = 0;
+	const keptJobs = jobs.filter((job) => {
+		if (job.status === "active") return true;
+		if (protectedJobIds.has(job.id)) return true;
+		const terminalAt = terminalJobTime(job);
+		const prune = terminalAt !== undefined && terminalAt < cutoff;
+		if (prune) jobsPruned += 1;
+		return !prune;
+	});
+	if (!dryRun && jobsPruned > 0) {
+		jobs = keptJobs;
+		await saveJobs();
+	}
+
+	let firedEventsPruned = 0;
+	for (const { path: eventPath, event } of firedEvents) {
+		const deliveredAt = event.deliveredAt;
+		const prune = deliveredAt !== undefined && deliveredAt < cutoff && event.deliveryStatus !== "failed";
+		if (!prune) continue;
+		firedEventsPruned += 1;
+		if (!dryRun) await fsp.rm(eventPath, { force: true });
+	}
+
+	let handlersPruned = 0;
+	let handlerDirsPruned = 0;
+	const keptHandlers = handlerRuns.filter((run) => {
+		if (run.status === "starting" || run.status === "running") return true;
+		const endedAt = run.endedAt ?? run.startedAt;
+		const prune = endedAt < cutoff;
+		if (prune) handlersPruned += 1;
+		return !prune;
+	});
+	if (!dryRun && handlersPruned > 0) {
+		const prunedRuns = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id));
+		for (const run of prunedRuns) {
+			try {
+				await fsp.rm(run.dir, { recursive: true, force: true });
+				handlerDirsPruned += 1;
+			} catch (error) {
+				console.error(`[${EXTENSION_NAME}] Failed to remove handler dir ${run.dir}:`, error);
+			}
+		}
+		handlerRuns = keptHandlers;
+		await saveHandlers();
+	} else if (dryRun) {
+		handlerDirsPruned = handlersPruned;
+	}
+
+	const auditEntriesPruned = await pruneDirectWaitAudit(cutoff, auditMaxEntries, dryRun);
+	return { dryRun, retentionMs, auditMaxEntries, jobsPruned, firedEventsPruned, handlersPruned, handlerDirsPruned, auditEntriesPruned };
 }
 
 function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
@@ -2089,6 +2244,11 @@ export default function (pi: ExtensionAPI) {
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
 		await loadHandlers();
+		try {
+			await pruneState();
+		} catch (error) {
+			console.error(`[${EXTENSION_NAME}] Failed to prune retained state:`, error);
+		}
 		await deliverPendingFiredEvents(pi);
 		ensureTicker(pi);
 		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
@@ -2143,6 +2303,17 @@ export default function (pi: ExtensionAPI) {
 				? relevant.map((run) => `${run.id} [${run.status}] job=${run.jobId} pid=${run.pid ?? "-"} dir=${run.dir}`).join("\n")
 				: "No return_on handler runs for this session.";
 			ctx.ui.notify(text, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-prune", {
+		description: "Prune old return_on state: /return-on-prune [--dry-run] [--days=N] [--audit-max=N]",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			await loadJobs();
+			await loadHandlers();
+			const summary = await pruneState(parsePruneCommandArgs(args));
+			ctx.ui.notify(formatPruneSummary(summary), "info");
 		},
 	});
 
@@ -2321,6 +2492,30 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: relevant.length ? relevant.map(summarizeJob).join("\n") : `No ${status} return_on jobs.` }],
 				details: { jobs: relevant },
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "return_on_prune",
+		label: "Prune Return On State",
+		description: "Prune old retained return_on jobs, delivered fired-event capsules, completed handler runs/artifacts, and direct-wait audit entries. Defaults to 30 days and 5000 audit entries.",
+		parameters: Type.Object({
+			dryRun: Type.Optional(Type.Boolean()),
+			retentionDays: Type.Optional(Type.Number()),
+			auditMaxEntries: Type.Optional(Type.Number()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
+			await loadJobs();
+			await loadHandlers();
+			const retentionDays = typeof params.retentionDays === "number" && Number.isFinite(params.retentionDays) && params.retentionDays >= 0 ? params.retentionDays : undefined;
+			const auditMaxEntries = typeof params.auditMaxEntries === "number" && Number.isFinite(params.auditMaxEntries) && params.auditMaxEntries >= 0 ? Math.floor(params.auditMaxEntries) : undefined;
+			const summary = await pruneState({
+				dryRun: params.dryRun === true,
+				...(retentionDays !== undefined ? { retentionMs: Math.round(retentionDays * 86_400_000) } : {}),
+				...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}),
+			});
+			return { content: [{ type: "text", text: formatPruneSummary(summary) }], details: { summary } };
 		},
 	});
 

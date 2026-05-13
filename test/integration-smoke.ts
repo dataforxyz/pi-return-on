@@ -785,6 +785,86 @@ async function testPendingFiredEventDelivery() {
   await second.emit("session_shutdown");
 }
 
+async function testRetentionPrune() {
+  const harness = createHarness("retention-prune");
+  await harness.emit("session_start");
+  const now = Date.now();
+  const old = now - 40 * 86_400_000;
+  const recent = now - 60_000;
+  const activeJob = { id: "prune_active", label: "active", cwd, sessionFile: harness.sessionFile, createdAt: old, updatedAt: old, status: "active", condition: { type: "timer", after: "1h" }, resume: "active resume", latches: {}, leafState: {} };
+  const oldCancelled = { id: "prune_old_cancelled", label: "old cancelled", cwd, sessionFile: harness.sessionFile, createdAt: old, updatedAt: old, status: "cancelled", condition: { type: "timer", after: "1h" }, resume: "old resume", cancelledAt: old, latches: {}, leafState: {} };
+  const recentFired = { id: "prune_recent_fired", label: "recent fired", cwd, sessionFile: harness.sessionFile, createdAt: recent, updatedAt: recent, status: "fired", condition: { type: "timer", after: "1h" }, resume: "recent resume", firedAt: recent, latches: {}, leafState: {} };
+  await fs.mkdir(stateDir, { recursive: true });
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [activeJob, oldCancelled, recentFired] }, null, 2), "utf8");
+
+  const firedDir = path.join(stateDir, "fired");
+  await fs.mkdir(firedDir, { recursive: true });
+  const eventFor = (id: string, deliveryStatus: string, firedAt: number, deliveredAt?: number) => ({
+    version: 1,
+    event: "return_on.fired",
+    id,
+    jobId: id,
+    label: id,
+    reason: "test",
+    createdAt: firedAt,
+    firedAt,
+    cwd,
+    sessionFile: harness.sessionFile,
+    resume: "resume",
+    job: { ...recentFired, id, label: id, firedAt, updatedAt: firedAt },
+    deliveryStatus,
+    ...(deliveredAt ? { deliveredAt } : {}),
+  });
+  await fs.writeFile(path.join(firedDir, "old-delivered.json"), JSON.stringify(eventFor("old-delivered", "wake-sent", old, old), null, 2), "utf8");
+  await fs.writeFile(path.join(firedDir, "recent-delivered.json"), JSON.stringify(eventFor("recent-delivered", "wake-sent", recent, recent), null, 2), "utf8");
+  await fs.writeFile(path.join(firedDir, "old-pending.json"), JSON.stringify(eventFor("old-pending", "pending", old), null, 2), "utf8");
+  await fs.writeFile(path.join(firedDir, "old-failed.json"), JSON.stringify(eventFor("old-failed", "failed", old, old), null, 2), "utf8");
+
+  const handlersDir = path.join(stateDir, "handlers");
+  const oldHandlerDir = path.join(handlersDir, "old-handler");
+  const runningHandlerDir = path.join(handlersDir, "running-handler");
+  await fs.mkdir(oldHandlerDir, { recursive: true });
+  await fs.mkdir(runningHandlerDir, { recursive: true });
+  await fs.writeFile(path.join(oldHandlerDir, "stdout.log"), "old", "utf8");
+  const handlerBase = { jobId: "job", label: "handler", cwd, parentSessionFile: harness.sessionFile, pid: 123, eventPath: "event.json", promptPath: "prompt.md", stdoutPath: "stdout.log", stderrPath: "stderr.log", sessionDir: "session" };
+  await fs.writeFile(path.join(stateDir, "handlers.json"), JSON.stringify({ version: 1, handlers: [
+    { ...handlerBase, id: "old-handler", status: "complete", startedAt: old, endedAt: old, dir: oldHandlerDir },
+    { ...handlerBase, id: "running-handler", status: "running", startedAt: old, dir: runningHandlerDir },
+  ] }, null, 2), "utf8");
+
+  const auditPath = path.join(stateDir, "direct-wait-audit.jsonl");
+  const auditEntry = (timestamp: number, command: string) => JSON.stringify({ version: 1, event: "direct_wait", timestamp, cwd, sessionFile: harness.sessionFile, toolName: "bash", command, thresholdMs: 10_000, action: "blocked", kind: "long sleep", detail: command });
+  await fs.writeFile(auditPath, [auditEntry(old, "sleep 10"), auditEntry(old, "sleep 11"), auditEntry(recent, "sleep 12"), auditEntry(recent + 1, "sleep 13"), auditEntry(recent + 2, "sleep 14")].join("\n") + "\n", "utf8");
+
+  await harness.runCommand("return-on-prune", "dry-run --days=1 --audit-max=2");
+  const dryRunText = harness.notifications.at(-1)?.message ?? "";
+  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 1") || !dryRunText.includes("Fired events pruned: 1")) {
+    throw new Error(`prune dry-run summary was wrong: ${dryRunText}`);
+  }
+  if (!(await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false))) throw new Error("dry-run removed old fired event");
+
+  const pruneTool = harness.tools.get("return_on_prune");
+  if (!pruneTool) throw new Error("missing return_on_prune tool");
+  const result = await pruneTool.execute("prune", { retentionDays: 1, auditMaxEntries: 2 }, new AbortController().signal, () => {}, harness.ctx);
+  const text = String(result.content?.[0]?.text ?? "");
+  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 1") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 1") || !text.includes("Direct-wait audit entries pruned: 3")) {
+    throw new Error(`prune summary was wrong: ${text}`);
+  }
+  const jobsState = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8"));
+  if (jobsState.jobs.some((job: any) => job.id === "prune_old_cancelled") || !jobsState.jobs.some((job: any) => job.id === "prune_active")) {
+    throw new Error(`prune kept/removed wrong jobs: ${JSON.stringify(jobsState)}`);
+  }
+  if (await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false)) throw new Error("old delivered fired event was not pruned");
+  for (const name of ["recent-delivered.json", "old-pending.json", "old-failed.json"]) {
+    if (!(await fs.stat(path.join(firedDir, name)).then(() => true, () => false))) throw new Error(`prune removed protected fired event ${name}`);
+  }
+  if (await fs.stat(oldHandlerDir).then(() => true, () => false)) throw new Error("old handler dir was not pruned");
+  if (!(await fs.stat(runningHandlerDir).then(() => true, () => false))) throw new Error("running handler dir was pruned");
+  const auditLines = (await fs.readFile(auditPath, "utf8")).trim().split("\n");
+  if (auditLines.length !== 2 || !auditLines[0].includes("sleep 13") || !auditLines[1].includes("sleep 14")) throw new Error(`audit prune kept wrong lines: ${auditLines.join(" | ")}`);
+  await harness.emit("session_shutdown");
+}
+
 async function testSessionIsolation() {
   const label = "smoke session isolation";
   const resume = "session isolation resume";
@@ -834,6 +914,7 @@ await testListToolAndCommands();
 await testRestartResume();
 await testPendingFiredEventDelivery();
 await testSessionIsolation();
+await testRetentionPrune();
 
 const duplicateIds = allJobIds.filter((id, index) => allJobIds.indexOf(id) !== index);
 if (duplicateIds.length > 0) throw new Error(`duplicate job ids: ${duplicateIds.join(", ")}`);
