@@ -46,6 +46,7 @@ Design notes:
 - [Direct wait policy](./docs/direct-wait-policy.md)
 - [Background worker clarifying questions](./docs/background-worker-clarifying-questions.md)
 - [Background event router and handler ledger](./docs/background-event-router.md)
+- [Inbound intercom fork channel](./docs/intercom-fork-channel.md)
 
 Diagnostics:
 
