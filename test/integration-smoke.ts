@@ -574,6 +574,30 @@ async function testProcessGone(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 6_000);
 }
 
+async function testProcessPidFile(harness: Harness) {
+  const label = "smoke process pidFile";
+  const resume = "process pidFile resume";
+  const child = spawn("sleep", ["3"], { stdio: "ignore" });
+  const pidFile = path.join(cwd, "pidfile.pid");
+  await fs.writeFile(pidFile, `${child.pid}\n`, "utf8");
+  const jobId = await harness.register({
+    label,
+    condition: { type: "process", pidFile: "pidfile.pid", exited: true, every: "500ms" },
+    resume,
+  });
+  await expectNoWake(harness, jobId, 1_500, "pidFile watcher fired while process was alive");
+  await waitForWake(harness, { jobId, label, resume }, 6_000);
+
+  const missingLabel = "smoke process pidFile missing";
+  const missingResume = "process pidFile missing resume";
+  const missingJobId = await harness.register({
+    label: missingLabel,
+    condition: { type: "process", pidFile: "absent.pid", exited: true, every: "500ms" },
+    resume: missingResume,
+  });
+  await waitForWake(harness, { jobId: missingJobId, label: missingLabel, resume: missingResume }, 4_000);
+}
+
 async function testPortOpen(harness: Harness) {
   const label = "smoke port open";
   const resume = "port open resume";
@@ -1191,6 +1215,7 @@ await testLogContains(harness);
 await testFileWatchImmediate(harness);
 await testFileStable(harness);
 await testProcessGone(harness);
+await testProcessPidFile(harness);
 await testPortOpen(harness);
 await testUrlReady(harness);
 await testFileExistsFalse(harness);
