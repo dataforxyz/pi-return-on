@@ -58,6 +58,7 @@ Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
 - By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
+- Use `--since <iso>` and/or `--until <iso>` to filter errors by their session-log timestamp, e.g. `npm run scan-errors -- --since 2026-05-15T22:30:00Z` to ignore errors logged before a fix shipped. `--json` emits a machine-readable summary (counts, top errors, top condition shapes, example file paths) suitable for appending to a history file.
 - `npm run audit:direct-waits` summarizes the structured direct-wait audit plus raw textual candidates in local Pi session logs.
 - `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
 - `npm run review:direct-waits` summarizes/dedupes that corpus, samples unreviewed examples, and can append human verdicts to the sidecar `~/.local/state/pi-return-on/direct-wait-example-reviews.jsonl` without mutating session logs.

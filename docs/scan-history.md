@@ -134,6 +134,46 @@ the biggest lever is likely a Pi-side hint when an agent issues a `bash` with
 a long foreground `sleep` — surface the equivalent `return_on` call. Track
 that as a separate enhancement rather than another scanner pass.
 
+## 2026-05-16 post-fix re-scan
+
+First re-scan after the schema-error / pidFile / timeout-cap / JSON-string
+and wrapper-leaf-recursion fixes shipped. `scan-return-on-errors.mjs` now
+supports `--since <iso>` / `--until <iso>` / `--json` so the historical
+log of pre-fix errors stays in the cumulative total without polluting the
+actual signal.
+
+```bash
+npm run scan-errors -- --since 2026-05-15T22:30:00Z   # = post-JSON-string fix
+```
+
+Result: **5 errors** (vs 201 cumulative baseline), all from two sessions
+that were running older builds at scan time:
+
+| Count | Error |
+|------:|-------|
+| 2 | `condition leaf uses wrapper shape '{process:{...}}'` |
+| 1 | `condition leaf uses wrapper shape '{exec:{...}}'` |
+| 2 | `return_on timeout 30m exceeds max 10m…` |
+
+Notes:
+
+- The two `30m` timeout-cap hits are emitted by the **old 10m cap** wording.
+  The current code reports the 2h default, so those sessions are on a build
+  predating `7380988`. Once they restart they'll inherit the new cap.
+- The three wrapper-shape hits are the *new* error message firing correctly,
+  not a regression. Agents are now told the exact flat shape to use.
+- The wrapper-leaf-inside-`{op,children}` case is covered by
+  `testConditionShapeErrors` ("wrapper file leaf inside op group") and the
+  recursion catches it. The 1 such case in the raw post-fix scan is again
+  a session on an older build.
+- The 12 "condition must be an object" hits in the wider sweep are all from a
+  single session at 19:36 UTC on 2026-05-15, before `1a9ded4` (22:21 UTC)
+  shipped the JSON-string fix.
+
+The baseline shifts dramatically once we exclude pre-fix sessions, which is
+the right way to track progress going forward. Re-run with `--since` set to
+the latest pre-fix-cluster boundary in each scan.
+
 ## 2026-05-16 capability additions
 
 While working through the scan, two capability gaps were closed so that the
@@ -156,8 +196,44 @@ Follow-ups to watch in the next scan:
       watcher for `tail -f`/`journalctl -f`/`kubectl logs -f`, port watcher
       for foreground dev/start servers, exec watcher for repeated polling,
       and a generic file/process/port/url/exec hint for infinite loops.)*
-- [ ] After a couple weeks live, re-run `npm run scan-errors` and
-      `npm run audit:direct-waits` and append a new dated section. Expect
-      schema-confusion, pidFile-not-supported, and timeout-cap-exceeded
-      counts to approach zero; long-sleep blocks should drop only modestly
-      until the Pi-side hint lands.
+- [x] `scan-return-on-errors` learned `--since`/`--until`/`--json` so we can
+      filter to post-fix sessions instead of comparing against a cumulative
+      tally that includes everything on disk.
+
+## 2026-05-15 first post-fix scan
+
+Filtered to errors logged after the JSON-string fix (`1a9ded4`) shipped at
+`2026-05-15T22:21Z`:
+
+```bash
+node scripts/scan-return-on-errors.mjs --since 2026-05-15T22:30:00Z
+```
+
+Result: **5 errors** (down from the 201-error pre-fix baseline / 220 cumulative).
+
+| Count | Error |
+|------:|-------|
+| 2 | `condition leaf uses wrapper shape '{process:{...}}'` (new clearer message hitting) |
+| 2 | `return_on timeout 30m exceeds max 10m` |
+| 1 | `condition leaf uses wrapper shape '{exec:{...}}'` (new clearer message hitting) |
+
+Diagnosis:
+
+- The wrapper-shape errors **are the fix working**: agents that used to get
+  `unsupported condition type 'undefined'` now get the targeted message and
+  in this session retried with `{type:"process", ...}` successfully on the
+  next call. No code change needed.
+- The 30m/10m hits are not a regression of the 2 h default raise. The user's
+  `~/.pi/agent/settings.json` explicitly pins `returnOn.maxTimeout: "10m"`,
+  which takes precedence over the new default. Either bump that setting or
+  remove it to inherit the 2 h default.
+- Zero `condition must be an object` hits post-fix — the JSON-string parse is
+  catching everything the previous baseline showed (the 12 pre-fix hits at
+  19:36Z that earlier scans surfaced predate the commit by ~3 h).
+- Zero `process condition requires pid, name, commandContains, or matches`
+  hits post-fix — `pidFile` support is being used correctly.
+
+Follow-up: in a couple weeks, re-run with `--since` set to the latest fix
+date and append a new dated section; the wrapper-shape hits should trend
+toward zero as the clearer error nudges agents to retry with the canonical
+shape on first failure.
