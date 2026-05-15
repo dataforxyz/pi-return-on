@@ -87,3 +87,49 @@ npm run scan-errors
 and append a new dated section to this file with the resulting tally. Goal:
 schema-confusion / pidFile / timeout-cap counts should approach zero. If they
 don't, the error messages still aren't pointing agents at the right shape.
+
+## 2026-05-16 direct-wait audit
+
+The complementary direct-wait scan (`npm run audit:direct-waits`) looks at
+bash tool calls that **should** have been a `return_on` watcher but instead
+blocked the agent's turn. Filtered to actual bash `toolCall` entries (not
+incidental log mentions):
+
+| Count | Kind |
+|------:|------|
+| 479 | long `sleep` (≥10s) in foreground |
+|   8 | `watch` / repeated polling |
+|   1 | `npm/yarn/pnpm dev` style dev server |
+|   1 | `while true; do …; done` polling loop |
+
+Duration distribution for the 479 long sleeps:
+
+| Count | Duration |
+|------:|----------|
+| 208 | 30–60 s |
+| 189 | 10–30 s |
+|  81 | 1–5 m |
+|   1 | 5–30 m |
+
+Observed patterns (representative samples):
+
+- `sleep 20; ssh … 'systemctl is-active …; docker ps …'` — wait for a
+  remote service restart, then probe. Better as
+  `{type:"url"}` health-check or `{type:"exec"}` with `success:true` + `every`.
+- `for i in {1..20}; do ssh … || sleep 10; done` — manual retry loop. Better
+  as `{type:"exec", command:"ssh …", success:true, every:"10s"}` with a
+  timeout.
+- `sleep 30; journalctl --since '35 seconds ago' …` — drain logs after a
+  device/service event. Better as `{type:"file"}` watcher on the log path with
+  `stableFor` or `{type:"exec"}` against `journalctl --grep`.
+- `sleep 15; pgrep -af 'piker chart' && tail -20 …` — wait for a foreground
+  process to settle. Better as `{type:"process", name:"piker chart"}` or
+  `{type:"port"}` if it binds a port.
+
+False-positive note: the `watch`/`dev` arms over-match (e.g. `rg ... "watch
+party"`, `next-fixtures`); the 479 long-sleep number is the clean signal.
+
+Follow-up: the README "Canonical condition shapes" section should help, but
+the biggest lever is likely a Pi-side hint when an agent issues a `bash` with
+a long foreground `sleep` — surface the equivalent `return_on` call. Track
+that as a separate enhancement rather than another scanner pass.
