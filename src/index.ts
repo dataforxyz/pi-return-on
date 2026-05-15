@@ -567,12 +567,32 @@ function findDirectWait(command: string): DirectWaitMatch | undefined {
 	return analysis?.action === "blocked" ? analysis : undefined;
 }
 
+function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
+	if (match.kind === "long sleep" && match.durationMs !== undefined) {
+		const after = formatDuration(match.durationMs);
+		return `Use a timer watcher: return_on({condition:{type:"timer", after:"${after}"}, resume:"continue"}).`;
+	}
+	if (match.kind === "streaming log wait") {
+		return `Background the producer, then watch the log: return_on({condition:{type:"file", path:"<log>", contains:"<ready marker>", every:"2s"}, resume:"log ready"}).`;
+	}
+	if (match.kind === "foreground dev server" || match.kind === "foreground server") {
+		return `Start the server in the background (& with pid+log capture) and watch its port: return_on({condition:{type:"port", port:<n>, host:"127.0.0.1", every:"500ms"}, resume:"server up"}).`;
+	}
+	if (match.kind === "repeated polling") {
+		return `Replace the polling loop with a single watcher, e.g. return_on({condition:{type:"exec", command:"<check>", success:true, every:"5s"}, resume:"check passed"}).`;
+	}
+	if (match.kind === "infinite loop") {
+		return `Replace the infinite loop with a return_on watcher (file/process/port/url/exec) so the turn can end and resume when the real condition flips.`;
+	}
+	return `Background the work (& with pid+log capture) and call return_on on a file/process/port/url leaf for the readiness/completion signal.`;
+}
+
 function formatDirectWaitBlockReason(match: DirectWaitMatch): string {
 	return [
 		`Blocked direct wait (${match.kind}: ${match.detail}).`,
 		"Do not keep the agent turn busy waiting.",
-		"Start the long-running command in the background with logs/pid captured, then call return_on to wake on the readiness/completion signal.",
-		"Example pattern: mkdir -p .return-on && <command> > .return-on/task.log 2>&1 & echo $! > .return-on/task.pid; then return_on on a file/log/process/port/url condition.",
+		suggestReturnOnForDirectWait(match),
+		"Capture logs and pid under .return-on/ so the watcher can observe them.",
 	].join(" ");
 }
 

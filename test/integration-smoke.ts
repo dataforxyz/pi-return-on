@@ -241,15 +241,24 @@ async function testDirectWaitPolicy(harness: Harness) {
   if (!longerSleep?.block || !String(longerSleep.reason).includes("return_on")) {
     throw new Error(`long sleep was not blocked with return_on guidance: ${JSON.stringify(longerSleep)}`);
   }
+  if (!String(longerSleep.reason).includes("type:\"timer\"") || !String(longerSleep.reason).includes("30s")) {
+    throw new Error(`long sleep block did not suggest a timer watcher: ${JSON.stringify(longerSleep)}`);
+  }
 
   const blockedTail = await harness.toolCall("bash", { command: "tail -f server.log" });
   if (!blockedTail?.block || !String(blockedTail.reason).includes("tail -f")) {
     throw new Error(`tail -f was not blocked: ${JSON.stringify(blockedTail)}`);
   }
+  if (!String(blockedTail.reason).includes("type:\"file\"")) {
+    throw new Error(`tail block did not suggest a file watcher: ${JSON.stringify(blockedTail)}`);
+  }
 
   const blockedDevServer = await harness.toolCall("bash", { command: "npm run dev" });
   if (!blockedDevServer?.block || !String(blockedDevServer.reason).includes("background")) {
     throw new Error(`foreground dev server was not blocked: ${JSON.stringify(blockedDevServer)}`);
+  }
+  if (!String(blockedDevServer.reason).includes("type:\"port\"")) {
+    throw new Error(`dev server block did not suggest a port watcher: ${JSON.stringify(blockedDevServer)}`);
   }
 
   const shortSleep = await harness.toolCall("bash", { command: "sleep 9" });

@@ -150,9 +150,12 @@ waits or work around the tool:
 
 Follow-ups to watch in the next scan:
 
-- [ ] Surface a Pi-side hint when a foreground `sleep ≥10s` is issued,
-      suggesting the equivalent `return_on` call. (Biggest remaining lever
-      against the 479 long-sleep blocks.)
+- [x] Surface a Pi-side hint when a foreground `sleep ≥10s` is issued,
+      suggesting the equivalent `return_on` call. *(`formatDirectWaitBlockReason`
+      now emits a kind-specific suggestion: timer for long sleeps, file
+      watcher for `tail -f`/`journalctl -f`/`kubectl logs -f`, port watcher
+      for foreground dev/start servers, exec watcher for repeated polling,
+      and a generic file/process/port/url/exec hint for infinite loops.)*
 - [ ] After a couple weeks live, re-run `npm run scan-errors` and
       `npm run audit:direct-waits` and append a new dated section. Expect
       schema-confusion, pidFile-not-supported, and timeout-cap-exceeded
