@@ -175,11 +175,18 @@ interface ReturnOnSettings {
 	defaultTimeoutMs?: number;
 	maxTimeout?: string | number;
 	maxTimeoutMs?: number;
+	defaultDeliveryMode?: DeliveryMode;
+	deliveryMode?: DeliveryMode;
+	defaultDeliveryNotify?: HandlerNotifyMode;
+	triggerParentOnSummary?: boolean | string | number;
 }
 
-interface ReturnOnTimeoutConfig {
+interface ReturnOnConfig {
 	defaultTimeoutMs: number;
 	maxTimeoutMs: number;
+	defaultDeliveryMode: DeliveryMode;
+	defaultDeliveryNotify: HandlerNotifyMode;
+	triggerParentOnSummary: boolean;
 }
 
 interface ReturnOnJob {
@@ -411,7 +418,31 @@ function parsePositiveDurationSetting(value: unknown, fallbackMs: number, name: 
 	return parsed;
 }
 
-async function loadReturnOnTimeoutConfig(cwd: string): Promise<ReturnOnTimeoutConfig> {
+function parseDeliveryModeSetting(value: unknown, fallback: DeliveryMode, name: string): DeliveryMode {
+	if (value === undefined || value === null || value === "") return fallback;
+	if (value === "wake" || value === "fork") return value;
+	throw new Error(`${name} must be 'wake' or 'fork'`);
+}
+
+function parseNotifySetting(value: unknown, fallback: HandlerNotifyMode, name: string): HandlerNotifyMode {
+	if (value === undefined || value === null || value === "") return fallback;
+	if (value === "ack-and-summary" || value === "summary" || value === "none") return value;
+	throw new Error(`${name} must be 'ack-and-summary', 'summary', or 'none'`);
+}
+
+function parseBooleanSetting(value: unknown, fallback: boolean, name: string): boolean {
+	if (value === undefined || value === null || value === "") return fallback;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "number") return value !== 0;
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "1" || normalized === "true" || normalized === "yes") return true;
+		if (normalized === "0" || normalized === "false" || normalized === "no") return false;
+	}
+	throw new Error(`${name} must be a boolean`);
+}
+
+async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	let settings: ReturnOnSettings = {};
 	for (const file of [path.join(os.homedir(), ".pi", "agent", "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
 		const parsed = await readJsonObject(expandHome(file));
@@ -422,10 +453,13 @@ async function loadReturnOnTimeoutConfig(cwd: string): Promise<ReturnOnTimeoutCo
 	const maxTimeoutMs = parsePositiveDurationSetting(maxSource, DEFAULT_RETURN_ON_MAX_TIMEOUT_MS, "returnOn.maxTimeout");
 	const defaultTimeoutMs = parsePositiveDurationSetting(defaultSource, DEFAULT_RETURN_ON_TIMEOUT_MS, "returnOn.defaultTimeout");
 	if (defaultTimeoutMs > maxTimeoutMs) throw new Error(`returnOn.defaultTimeout (${formatDuration(defaultTimeoutMs)}) must not exceed returnOn.maxTimeout (${formatDuration(maxTimeoutMs)})`);
-	return { defaultTimeoutMs, maxTimeoutMs };
+	const defaultDeliveryMode = parseDeliveryModeSetting(process.env.PI_RETURN_ON_DELIVERY_MODE ?? settings.defaultDeliveryMode ?? settings.deliveryMode, "wake", "returnOn.defaultDeliveryMode");
+	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "ack-and-summary", "returnOn.defaultDeliveryNotify");
+	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, false, "returnOn.triggerParentOnSummary");
+	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary };
 }
 
-function parseRequestedJobTimeout(input: unknown, config: ReturnOnTimeoutConfig): number {
+function parseRequestedJobTimeout(input: unknown, config: ReturnOnConfig): number {
 	const timeoutMs = input === undefined ? config.defaultTimeoutMs : parseDuration(typeof input === "string" || typeof input === "number" ? input : undefined);
 	if (timeoutMs === undefined || timeoutMs <= 0) throw new Error("return_on timeout must be a positive duration");
 	if (timeoutMs > config.maxTimeoutMs) throw new Error(`return_on timeout ${formatDuration(timeoutMs)} exceeds max ${formatDuration(config.maxTimeoutMs)}. Configure returnOn.maxTimeout in pi settings if a longer watcher is required.`);
@@ -992,12 +1026,11 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 	return config;
 }
 
-function normalizeDelivery(input: unknown): DeliveryConfig {
-	const defaultMode: DeliveryMode = process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake";
+function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary">): DeliveryConfig {
 	const base: DeliveryConfig = {
-		mode: defaultMode,
-		notify: "ack-and-summary",
-		triggerParentOnSummary: process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
+		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake"),
+		notify: config?.defaultDeliveryNotify ?? "ack-and-summary",
+		triggerParentOnSummary: config?.triggerParentOnSummary ?? process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
 	};
 	if (input === undefined || input === null || input === false) return base;
 	if (input === true) return { ...base, mode: "fork" };
@@ -1961,28 +1994,33 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		stdoutFd = undefined;
 		stderrFd = undefined;
 		child.unref();
+
+		let launchError: unknown;
+		const spawned = await new Promise<boolean>((resolve) => {
+			const onSpawn = () => {
+				child.off("error", onError);
+				resolve(true);
+			};
+			const onError = (error: Error) => {
+				launchError = error;
+				child.off("spawn", onSpawn);
+				resolve(false);
+			};
+			child.once("spawn", onSpawn);
+			child.once("error", onError);
+		});
+		if (!spawned) {
+			run.status = "failed";
+			run.endedAt = Date.now();
+			run.error = launchError instanceof Error ? launchError.message : String(launchError);
+			await saveHandlers();
+			console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, launchError);
+			return false;
+		}
+
 		run.pid = child.pid;
 		run.status = "running";
 		await saveHandlers();
-		child.once("error", async (error) => {
-			await loadHandlers();
-			const failed = handlerRuns.find((candidate) => candidate.id === run.id);
-			if (failed) {
-				failed.status = "failed";
-				failed.endedAt = Date.now();
-				failed.error = error instanceof Error ? error.message : String(error);
-				await saveHandlers();
-			}
-			pi.sendMessage(
-				{
-					customType: HANDLER_MESSAGE_TYPE,
-					content: `Failed to launch return_on handler ${run.id}: ${error instanceof Error ? error.message : String(error)}`,
-					display: true,
-					details: { id: job.id, handlerRunId: run.id, label: job.label, status: "failed" },
-				},
-				{ triggerTurn: true },
-			);
-		});
 		child.once("close", (code, signal) => {
 			void markHandlerFinished(pi, job, run.id, code, signal, delivery.notify, delivery.triggerParentOnSummary).catch((error) => {
 				console.error(`[${EXTENSION_NAME}] Failed to finish handler ${run.id}:`, error);
@@ -2510,10 +2548,10 @@ export default function (pi: ExtensionAPI) {
 				if (!allowExec) throw new Error("User did not approve exec watcher.");
 			}
 
-			const timeoutConfig = await loadReturnOnTimeoutConfig(ctx.cwd);
-			const timeoutMs = parseRequestedJobTimeout(params.timeout, timeoutConfig);
+			const returnOnConfig = await loadReturnOnConfig(ctx.cwd);
+			const timeoutMs = parseRequestedJobTimeout(params.timeout, returnOnConfig);
 			const webhook = normalizeWebhook(params.webhook);
-			const delivery = normalizeDelivery(params.delivery);
+			const delivery = normalizeDelivery(params.delivery, returnOnConfig);
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
@@ -2544,7 +2582,7 @@ export default function (pi: ExtensionAPI) {
 			ensureTicker(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
-			const timeoutText = `\nTimeout: ${formatDuration(timeoutMs)} (max ${formatDuration(timeoutConfig.maxTimeoutMs)})`;
+			const timeoutText = `\nTimeout: ${formatDuration(timeoutMs)} (max ${formatDuration(returnOnConfig.maxTimeoutMs)})`;
 			const endTurn = params.endTurn !== false;
 			return {
 				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}${timeoutText}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],

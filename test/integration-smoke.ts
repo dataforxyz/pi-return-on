@@ -61,6 +61,23 @@ async function withProjectSettings(settings: unknown, fn: () => Promise<void>): 
   }
 }
 
+async function withEnv(overrides: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
@@ -307,6 +324,26 @@ async function testForkDelivery(harness: Harness) {
     await sleep(50);
   }
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
+}
+
+async function testForkLaunchFailureFallsBackToWake(harness: Harness) {
+  const label = "smoke fork launch fallback";
+  const resume = "fork launch fallback resume";
+  const missingPi = path.join(cwd, "missing-return-on-pi-command");
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume,
+    delivery: { mode: "fork", piCommand: missingPi },
+  });
+  const wake = await waitForWake(harness, { jobId, label, resume }, 2_500);
+  if (wake.message?.customType !== "return-on") throw new Error(`fork launch fallback did not wake parent: ${JSON.stringify(wake.message)}`);
+  const handlersPath = path.join(stateDir, "handlers.json");
+  const handlers = await fs.readFile(handlersPath, "utf8").then((text) => JSON.parse(text).handlers as any[]);
+  const handler = handlers.find((candidate) => candidate.jobId === jobId);
+  if (handler?.status !== "failed" || !String(handler.error ?? "").includes("ENOENT")) {
+    throw new Error(`fork launch failure was not recorded: ${JSON.stringify(handler)}`);
+  }
 }
 
 async function testAgentArtifactForkDelivery(harness: Harness) {
@@ -729,6 +766,25 @@ async function testDefaultTimeoutAndMax(harness: Harness) {
   });
 }
 
+async function testDefaultDeliverySettings(harness: Harness) {
+  await withEnv({ PI_RETURN_ON_DELIVERY_MODE: undefined, PI_RETURN_ON_DELIVERY_NOTIFY: undefined, PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY: undefined }, async () => {
+    await withProjectSettings({ returnOn: { defaultDeliveryMode: "fork", defaultDeliveryNotify: "summary", triggerParentOnSummary: true } }, async () => {
+      const result = await harness.callTool("return_on", {
+        label: "smoke default fork delivery",
+        condition: { type: "timer", after: "1h" },
+        timeout: "5s",
+        resume: "default fork delivery resume",
+      });
+      const job = result.details.job;
+      allJobIds.push(job.id as string);
+      if (job.delivery?.mode !== "fork" || job.delivery?.notify !== "summary" || job.delivery?.triggerParentOnSummary !== true) {
+        throw new Error(`settings default delivery was not applied: ${JSON.stringify(job.delivery)}`);
+      }
+      await harness.cancel(job.id as string);
+    });
+  });
+}
+
 async function testExecConfirmationAndValidation() {
   const noUi = createHarness("no-ui-exec", { hasUI: false });
   await noUi.emit("session_start");
@@ -1070,6 +1126,7 @@ await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
+await testForkLaunchFailureFallsBackToWake(harness);
 await testAgentArtifactForkDelivery(harness);
 await testIncomingWebhookServerStartupFailure(harness);
 await testIncomingWebhookWake(harness);
@@ -1088,6 +1145,7 @@ await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testDefaultTimeoutAndMax(harness);
+await testDefaultDeliverySettings(harness);
 await harness.emit("session_shutdown");
 await testExecConfirmationAndValidation();
 await testListToolAndCommands();
