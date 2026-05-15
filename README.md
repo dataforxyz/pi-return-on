@@ -94,6 +94,53 @@ Diagnostics:
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
 
+## Canonical condition shapes
+
+The biggest source of `return_on` errors in real sessions is using the wrong condition shape. Use these forms; everything else is rejected.
+
+Flat leaves always include `type`:
+
+```json
+{ "type": "file",    "path": "out/video.mp4", "exists": true }
+{ "type": "process", "pidFile": ".run/server.pid", "status": "exited" }
+{ "type": "port",    "host": "127.0.0.1", "port": 3000 }
+{ "type": "url",     "url": "http://localhost:3000/health" }
+{ "type": "timer",   "after": "30s" }
+{ "type": "exec",    "command": "test -f out/done" }
+```
+
+Groups wrap flat leaves; **never** wrap leaves inside `{file:{...}}` / `{process:{...}}`:
+
+```json
+{ "any": [ { "type": "file", "path": "done", "exists": true },
+           { "type": "process", "pidFile": "job.pid", "status": "exited" } ] }
+
+{ "all":  [ { "type": "timer", "after": "1s" },
+            { "type": "file",  "path": "out", "exists": true } ] }
+
+{ "not":  { "type": "file", "path": "lock", "exists": true } }
+
+{ "op": "or", "children": [ /* flat leaves or nested groups */ ] }
+```
+
+Common mistakes that will be rejected:
+
+```jsonc
+// wrong: wrapper-style leaf
+{ "file": { "path": "out", "exists": true } }
+
+// wrong: wrapper-style leaves inside a group
+{ "op": "or", "children": [
+  { "file":    { "path": "done",   "exists": true } },
+  { "process": { "pidFile": "job.pid", "status": "exited" } }
+] }
+
+// wrong: no type at all
+{ "path": "out", "exists": true }
+```
+
+`condition` may also be passed as a JSON-encoded string (useful for tool callers that flatten arguments); the extension will `JSON.parse` it before validating.
+
 ## Timeout policy
 
 New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours.

@@ -53,7 +53,7 @@ Hotspot session directories: `async-video-messaging`, `cargoviu-ai-agent`,
 
 ### Follow-ups
 
-- [ ] Improve `normalizeCondition` error messages so leaves like `{file:{...}}`
+- [x] Improve `normalizeCondition` error messages so leaves like `{file:{...}}`
       or untyped leaves inside `{op,children}` point at the correct
       `{type:"...", ...}` shape.
 - [x] Add `pidFile` support to process conditions (read pid from file, then
@@ -62,5 +62,28 @@ Hotspot session directories: `async-video-messaging`, `cargoviu-ai-agent`,
       a warning instead of erroring out. *(Default cap raised from 10 m to 2 h
       so DB dumps, build matrices, and remote renders work out of the box;
       operators can still lower it via `returnOn.maxTimeout`.)*
-- [ ] Expand README/tool description with the canonical flat-leaf examples
-      so new agents see the right shape first.
+- [x] Expand README/tool description with the canonical flat-leaf examples
+      so new agents see the right shape first. *(See README "Canonical
+      condition shapes".)*
+- [x] Accept `condition` as a JSON-encoded string and `JSON.parse` it before
+      validating. *(Fixes the 12 "condition must be an object" cases where
+      agents serialized the object first.)*
+
+### Notes on the 10 "condition must be an object" hits
+
+All were from one session passing `condition` as a stringified JSON object,
+e.g. `"{\"op\":\"or\",\"children\":[...]}"`. After the JSON-string fix the
+extension parses these automatically. The same session then retried with
+wrapper-style leaves, which the schema-error commit now flags clearly.
+
+### Re-scan checklist
+
+After the fixes have been live for a week or two, run:
+
+```bash
+npm run scan-errors
+```
+
+and append a new dated section to this file with the resulting tally. Goal:
+schema-confusion / pidFile / timeout-cap counts should approach zero. If they
+don't, the error messages still aren't pointing agents at the right shape.

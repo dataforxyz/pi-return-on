@@ -1057,7 +1057,17 @@ function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaul
 }
 
 function normalizeCondition(input: unknown): Condition {
-	if (!isObject(input)) throw new Error("condition must be an object");
+	if (typeof input === "string") {
+		const trimmed = input.trim();
+		if (trimmed.startsWith("{")) {
+			try {
+				input = JSON.parse(trimmed);
+			} catch (error) {
+				throw new Error(`condition was a string but not valid JSON: ${(error as Error).message}`);
+			}
+		}
+	}
+	if (!isObject(input)) throw new Error("condition must be an object (or a JSON-encoded object string)");
 	if (Array.isArray(input.any)) {
 		if (input.any.length === 0) throw new Error("any group requires children");
 		return { op: "or", children: input.any.map(normalizeCondition) };

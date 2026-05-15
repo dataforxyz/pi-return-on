@@ -727,6 +727,16 @@ async function testConditionShapeErrors(harness: Harness) {
       condition: { path: "/x", exists: true },
       match: /no 'type' field \(got keys: path, exists\)/,
     },
+    {
+      label: "non-JSON string",
+      condition: "not-an-object",
+      match: /condition must be an object/,
+    },
+    {
+      label: "invalid JSON string",
+      condition: "{not json}",
+      match: /condition was a string but not valid JSON/,
+    },
   ];
   for (const { label, condition, match } of cases) {
     let message = "";
@@ -738,6 +748,17 @@ async function testConditionShapeErrors(harness: Harness) {
     if (!message) throw new Error(`${label} was not rejected`);
     if (!match.test(message)) throw new Error(`${label} error message did not match ${match}: ${message}`);
   }
+}
+
+async function testConditionJsonString(harness: Harness) {
+  const label = "smoke condition json string";
+  const resume = "json string resume";
+  const jobId = await harness.register({
+    label,
+    condition: JSON.stringify({ type: "timer", after: "500ms" }) as any,
+    resume,
+  });
+  await waitForWake(harness, { jobId, label, resume }, 3_000);
 }
 
 async function testBooleanTree(harness: Harness) {
@@ -1289,6 +1310,7 @@ await testNotConditionAfterDelete(harness);
 await testNotExecAfterDelete(harness);
 await testEmptyGroupRejected(harness);
 await testConditionShapeErrors(harness);
+await testConditionJsonString(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
