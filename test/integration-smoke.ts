@@ -649,6 +649,36 @@ async function testEmptyGroupRejected(harness: Harness) {
   }
 }
 
+async function testConditionShapeErrors(harness: Harness) {
+  const cases: Array<{ label: string; condition: unknown; match: RegExp }> = [
+    {
+      label: "wrapper file leaf",
+      condition: { file: { path: "/x", exists: true } },
+      match: /wrapper shape '\{file:\{\.\.\.\}\}'.*\{type:"file"/,
+    },
+    {
+      label: "wrapper file leaf inside op group",
+      condition: { op: "or", children: [{ file: { path: "/x", exists: true } }] },
+      match: /wrapper shape '\{file:\{\.\.\.\}\}'.*\{type:"file"/,
+    },
+    {
+      label: "missing type with present keys",
+      condition: { path: "/x", exists: true },
+      match: /no 'type' field \(got keys: path, exists\)/,
+    },
+  ];
+  for (const { label, condition, match } of cases) {
+    let message = "";
+    try {
+      await harness.register({ label, condition: condition as any, resume: "should reject" });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    if (!message) throw new Error(`${label} was not rejected`);
+    if (!match.test(message)) throw new Error(`${label} error message did not match ${match}: ${message}`);
+  }
+}
+
 async function testBooleanTree(harness: Harness) {
   const label = "smoke boolean tree";
   const resume = "boolean resume";
@@ -1084,6 +1114,7 @@ await testFileExistsFalse(harness);
 await testNotConditionAfterDelete(harness);
 await testNotExecAfterDelete(harness);
 await testEmptyGroupRejected(harness);
+await testConditionShapeErrors(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);

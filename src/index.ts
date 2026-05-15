@@ -1040,16 +1040,29 @@ function normalizeCondition(input: unknown): Condition {
 		return { ...input, op, children: childrenInput.map(normalizeCondition) } as Condition;
 	}
 	if (input.type === undefined) {
-		if (input.timer !== undefined) {
-			if (typeof input.timer !== "string" && typeof input.timer !== "number") throw new Error("timer shorthand requires a duration string or number");
+		if (typeof input.timer === "string" || typeof input.timer === "number") {
 			const { timer, ...rest } = input;
 			return normalizeCondition({ ...rest, type: "timer", after: timer });
 		}
-		if (input.exec !== undefined) {
-			if (typeof input.exec !== "string") throw new Error("exec shorthand requires a command string");
+		if (typeof input.exec === "string") {
 			const { exec, ...rest } = input;
 			return normalizeCondition({ ...rest, type: "exec", command: exec });
 		}
+		if (input.timer !== undefined && !isObject(input.timer)) throw new Error("timer shorthand requires a duration string or number");
+		if (input.exec !== undefined && !isObject(input.exec)) throw new Error("exec shorthand requires a command string");
+		const WRAPPER_LEAF_KEYS = ["file", "process", "port", "url", "webhook", "exec", "timer"] as const;
+		for (const wrapperKey of WRAPPER_LEAF_KEYS) {
+			if (isObject(input[wrapperKey])) {
+				throw new Error(`condition leaf uses wrapper shape '{${wrapperKey}:{...}}'; use flat '{type:"${wrapperKey}", ...}' instead`);
+			}
+		}
+		const keys = Object.keys(input);
+		const keyList = keys.length === 0 ? "none" : keys.join(", ");
+		throw new Error(
+			`unsupported condition: no 'type' field (got keys: ${keyList}). ` +
+			"Use {type:'file'|'timer'|'exec'|'process'|'port'|'url'|'webhook', ...} " +
+			"or a group shorthand {any:[...]}/{all:[...]}/{not:{...}}/{op,children:[...]}.",
+		);
 	}
 	if (input.type === "timer") {
 		const timer = { ...input } as TimerCondition & { duration?: string | number };
