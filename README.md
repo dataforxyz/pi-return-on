@@ -96,7 +96,7 @@ Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `
 
 ## Timeout policy
 
-New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 10 minutes.
+New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours.
 
 Configure these limits in Pi settings (`~/.pi/agent/settings.json` globally or `.pi/settings.json` per project):
 
@@ -104,10 +104,12 @@ Configure these limits in Pi settings (`~/.pi/agent/settings.json` globally or `
 {
   "returnOn": {
     "defaultTimeout": "10m",
-    "maxTimeout": "10m"
+    "maxTimeout": "2h"
   }
 }
 ```
+
+Lower the cap (for example `"maxTimeout": "10m"`) if you want tighter bounds; raise it (or set per-project) for workflows like long DB dumps or remote renders.
 
 `defaultTimeoutMs` and `maxTimeoutMs` are also accepted as millisecond numbers. The default must be positive and cannot exceed the max. Environment variables `PI_RETURN_ON_DEFAULT_TIMEOUT` and `PI_RETURN_ON_MAX_TIMEOUT` can override the settings for debugging or local experiments.
 
