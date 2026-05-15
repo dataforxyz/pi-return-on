@@ -1098,6 +1098,72 @@ async function testRetentionPrune() {
   await harness.emit("session_shutdown");
 }
 
+async function testHandlerStartupReconciliation() {
+  const session = createHarness("handler-reconcile");
+  const now = Date.now();
+  const jobId = "reconcile_job";
+  const runId = "reconcile_handler";
+  const label = "reconcile handler label";
+  const resume = "reconcile handler resume";
+  const dir = path.join(stateDir, "handlers", runId);
+  const stdoutPath = path.join(dir, "stdout.log");
+  const stderrPath = path.join(dir, "stderr.log");
+  const job = {
+    id: jobId,
+    label,
+    cwd,
+    sessionFile: session.sessionFile,
+    createdAt: now,
+    updatedAt: now,
+    status: "fired",
+    condition: { type: "timer", after: "1ms" },
+    resume,
+    firedAt: now,
+    delivery: { mode: "fork", notify: "summary", triggerParentOnSummary: true },
+    latches: {},
+    leafState: {},
+  };
+  const run = {
+    id: runId,
+    jobId,
+    label,
+    cwd,
+    parentSessionFile: session.sessionFile,
+    status: "running",
+    pid: 999_999_999,
+    startedAt: now - 1_000,
+    dir,
+    eventPath: path.join(dir, "event.json"),
+    promptPath: path.join(dir, "prompt.md"),
+    stdoutPath,
+    stderrPath,
+    sessionDir: path.join(dir, "sessions"),
+    notify: "summary",
+    triggerParentOnSummary: true,
+  };
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(stdoutPath, "recovered handler summary\n", "utf8");
+  await fs.writeFile(stderrPath, "", "utf8");
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [job] }, null, 2), "utf8");
+  await fs.writeFile(path.join(stateDir, "handlers.json"), JSON.stringify({ version: 1, handlers: [run] }, null, 2), "utf8");
+
+  await session.emit("session_start");
+  const summary = session.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.handlerRunId === runId);
+  if (!summary) throw new Error("startup reconciliation did not emit missed handler summary");
+  if (summary.options?.triggerTurn !== true || summary.message?.details?.status !== "complete" || summary.message?.details?.reconciled !== true) {
+    throw new Error(`reconciled summary metadata was wrong: ${JSON.stringify(summary)}`);
+  }
+  if (!String(summary.message?.content ?? "").includes("recovered handler summary")) {
+    throw new Error(`reconciled summary missed stdout: ${summary.message?.content}`);
+  }
+  const saved = JSON.parse(await fs.readFile(path.join(stateDir, "handlers.json"), "utf8"));
+  const savedRun = saved.handlers.find((candidate: any) => candidate.id === runId);
+  if (savedRun?.status !== "complete" || !savedRun.endedAt || savedRun.exitCode !== null) {
+    throw new Error(`handler run was not reconciled in ledger: ${JSON.stringify(savedRun)}`);
+  }
+  await session.emit("session_shutdown");
+}
+
 async function testFailedFiredEventRetries() {
   const jobId = "pending_retry_job";
   const label = "pending retry label";
@@ -1234,6 +1300,7 @@ await testExecConfirmationAndValidation();
 await testListToolAndCommands();
 await testRestartResume();
 await testPendingFiredEventDelivery();
+await testHandlerStartupReconciliation();
 await testFailedFiredEventRetries();
 await testSessionIsolation();
 await testStatusCancelSessionIsolation();

@@ -235,6 +235,8 @@ interface ReturnOnHandlerRun {
 	stdoutPath: string;
 	stderrPath: string;
 	sessionDir: string;
+	notify?: HandlerNotifyMode;
+	triggerParentOnSummary?: boolean;
 	summary?: string;
 	error?: string;
 }
@@ -1948,18 +1950,36 @@ function formatHandlerAck(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
 	].join("\n");
 }
 
-function formatHandlerSummary(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
+function formatHandlerSummary(job: { id: string; label: string }, run: ReturnOnHandlerRun): string {
 	const status = run.status === "complete" ? "completed" : "failed";
 	const output = run.summary?.trim() || run.error || "(no handler output)";
+	const exit = run.exitCode !== undefined && run.exitCode !== null ? String(run.exitCode) : run.signal ? `signal ${run.signal}` : "unknown";
 	return [
 		`return_on handler ${status}: ${job.label} (${job.id})`,
 		`Handler: ${run.id}`,
-		`Exit: ${run.exitCode ?? "signal " + (run.signal ?? "unknown")}`,
+		`Exit: ${exit}`,
 		`Output: ${run.stdoutPath}`,
 		`Errors: ${run.stderrPath}`,
 		"",
 		truncateText(output, HANDLER_SUMMARY_LIMIT_BYTES),
 	].join("\n");
+}
+
+function isProcessAlive(pid: number | undefined): boolean {
+	if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+async function fillHandlerOutput(run: ReturnOnHandlerRun): Promise<{ stdout: string; stderr: string }> {
+	const stdout = await readOptionalText(run.stdoutPath);
+	const stderr = await readOptionalText(run.stderrPath);
+	run.summary = truncateText(stdout.trim() || stderr.trim(), HANDLER_SUMMARY_LIMIT_BYTES);
+	return { stdout, stderr };
 }
 
 async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: string, code: number | null, signal: NodeJS.Signals | null, notify: HandlerNotifyMode, triggerParent: boolean): Promise<void> {
@@ -1969,9 +1989,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	run.endedAt = Date.now();
 	run.exitCode = code;
 	run.signal = signal;
-	const stdout = await readOptionalText(run.stdoutPath);
-	const stderr = await readOptionalText(run.stderrPath);
-	run.summary = truncateText(stdout.trim() || stderr.trim(), HANDLER_SUMMARY_LIMIT_BYTES);
+	const { stderr } = await fillHandlerOutput(run);
 	run.status = code === 0 ? "complete" : "failed";
 	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
 	await saveHandlers();
@@ -1991,6 +2009,53 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 			{ triggerTurn: triggerParent },
 		);
 	}
+}
+
+async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: string | undefined): Promise<void> {
+	let changed = false;
+	for (const run of handlerRuns) {
+		if (run.status !== "starting" && run.status !== "running") continue;
+		if (!handlerVisibleForSession(run, sessionFile)) continue;
+		if (run.status === "running" && isProcessAlive(run.pid)) continue;
+		const storedJob = jobs.find((candidate) => candidate.id === run.jobId);
+		const job = storedJob ?? { id: run.jobId, label: run.label };
+		const { stderr } = await fillHandlerOutput(run);
+		run.endedAt = run.endedAt ?? Date.now();
+		run.exitCode = run.exitCode ?? null;
+		run.signal = run.signal ?? null;
+		if (run.status === "starting") {
+			run.status = "failed";
+			run.error = run.error || stderr.trim() || "handler was still starting when the parent session ended";
+		} else if (stderr.trim()) {
+			run.status = "failed";
+			run.error = run.error || stderr.trim();
+		} else {
+			run.status = "complete";
+		}
+		changed = true;
+		try {
+			pi.appendEntry?.("return-on-handler-reconciled", { id: run.id, jobId: run.jobId, status: run.status, pid: run.pid, endedAt: run.endedAt });
+		} catch {
+			// Best-effort audit trail.
+		}
+		const notify = run.notify ?? storedJob?.delivery?.notify ?? "summary";
+		if (notify === "summary" || notify === "ack-and-summary") {
+			try {
+				pi.sendMessage(
+					{
+						customType: HANDLER_MESSAGE_TYPE,
+						content: formatHandlerSummary(job, run),
+						display: true,
+						details: { id: run.jobId, handlerRunId: run.id, label: run.label, status: run.status, exitCode: run.exitCode, signal: run.signal, reconciled: true },
+					},
+					{ triggerTurn: run.triggerParentOnSummary ?? storedJob?.delivery?.triggerParentOnSummary ?? false },
+				);
+			} catch (error) {
+				console.error(`[${EXTENSION_NAME}] Failed to send reconciled handler summary ${run.id}:`, error);
+			}
+		}
+	}
+	if (changed) await saveHandlers();
 }
 
 async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig): Promise<boolean> {
@@ -2014,6 +2079,8 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		stdoutPath: path.join(dir, "stdout.log"),
 		stderrPath: path.join(dir, "stderr.log"),
 		sessionDir: path.join(dir, "sessions"),
+		notify: delivery.notify,
+		triggerParentOnSummary: delivery.triggerParentOnSummary,
 	};
 	const eventJson = JSON.stringify(buildReturnEventPayload(job, reason, run), null, 2);
 	await fsp.mkdir(run.sessionDir, { recursive: true });
@@ -2449,6 +2516,11 @@ export default function (pi: ExtensionAPI) {
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
 		await loadHandlers();
+		try {
+			await reconcileHandlerRunsOnStartup(pi, currentSessionFile);
+		} catch (error) {
+			console.error(`[${EXTENSION_NAME}] Failed to reconcile handler runs:`, error);
+		}
 		try {
 			await pruneState();
 		} catch (error) {
