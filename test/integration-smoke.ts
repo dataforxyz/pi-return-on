@@ -206,6 +206,20 @@ async function waitForWake(harness: Harness, expectation: WakeExpectation, timeo
   throw new Error(`timed out waiting for ${expectation.label}. Messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
 }
 
+async function waitForWakeCount(harness: Harness, expectation: WakeExpectation, expectedCount: number, timeoutMs: number) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const entries = wakeEntries(harness, expectation.jobId);
+    if (entries.length >= expectedCount) {
+      for (const entry of entries) assertWake(entry, expectation);
+      return entries;
+    }
+    await sleep(100);
+  }
+  const entries = wakeEntries(harness, expectation.jobId);
+  throw new Error(`timed out waiting for ${expectedCount} wakes of ${expectation.label}, saw ${entries.length}`);
+}
+
 async function expectNoWake(harness: Harness, jobId: string, durationMs: number, reason: string) {
   await sleep(durationMs);
   const entries = wakeEntries(harness, jobId);
@@ -662,6 +676,52 @@ async function testFileExistsFalse(harness: Harness) {
   await expectNoWake(harness, jobId, 1_200, "exists:false fired while file existed");
   await fs.unlink(file);
   await waitForWake(harness, { jobId, label, resume }, 2_500);
+}
+
+async function testMaxFiresMulti(harness: Harness) {
+  const label = "smoke maxFires multi";
+  const resume = "multi fire resume";
+  const file = path.join(cwd, "multi-fire.flag");
+  try { await fs.unlink(file); } catch {}
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "multi-fire.flag", exists: true, every: "100ms" },
+    resume,
+    maxFires: 3,
+  });
+  await expectNoWake(harness, jobId, 800, "multi-fire fired before file appeared");
+  for (let i = 0; i < 3; i++) {
+    await fs.writeFile(file, `present-${i}`, "utf8");
+    await waitForWakeCount(harness, { jobId, label, resume }, i + 1, 4_000);
+    await fs.unlink(file);
+    // wait long enough for the tick (1s) to observe false and clear rearmPending
+    await sleep(1_500);
+  }
+  // After maxFires=3 the job should be retired: writing the file again must not produce a 4th wake.
+  await fs.writeFile(file, "extra", "utf8");
+  await sleep(2_500);
+  await fs.unlink(file).catch(() => {});
+  const entries = wakeEntries(harness, jobId);
+  if (entries.length !== 3) throw new Error(`expected exactly 3 wakes after maxFires=3, saw ${entries.length}`);
+}
+
+async function testMaxFiresEdgeTriggered(harness: Harness) {
+  const label = "smoke maxFires edge";
+  const resume = "edge resume";
+  const file = path.join(cwd, "edge-fire.flag");
+  await fs.writeFile(file, "present", "utf8");
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "edge-fire.flag", exists: true, every: "100ms" },
+    resume,
+    maxFires: 5,
+  });
+  // First wake should arrive; without an edge transition no further wakes should follow.
+  await waitForWakeCount(harness, { jobId, label, resume }, 1, 4_000);
+  await sleep(2_500);
+  await fs.unlink(file).catch(() => {});
+  const entries = wakeEntries(harness, jobId);
+  if (entries.length !== 1) throw new Error(`edge-triggered watcher produced ${entries.length} wakes, expected 1`);
 }
 
 async function testNotConditionAfterDelete(harness: Harness) {
@@ -1306,6 +1366,8 @@ await testProcessPidFile(harness);
 await testPortOpen(harness);
 await testUrlReady(harness);
 await testFileExistsFalse(harness);
+await testMaxFiresMulti(harness);
+await testMaxFiresEdgeTriggered(harness);
 await testNotConditionAfterDelete(harness);
 await testNotExecAfterDelete(harness);
 await testEmptyGroupRejected(harness);

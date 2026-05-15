@@ -212,6 +212,10 @@ interface ReturnOnJob {
 	fireReason?: string;
 	firedAt?: number;
 	cancelledAt?: number;
+	maxFires?: number;
+	fireCount?: number;
+	lastFiredAt?: number;
+	rearmPending?: boolean;
 }
 
 interface ReturnOnHandlerRun {
@@ -676,13 +680,14 @@ async function saveHandlers(): Promise<void> {
 	await fsp.rename(tmp, HANDLERS_FILE);
 }
 
-function firedEventPath(jobId: string): string {
+function firedEventPath(jobId: string, fireCount?: number): string {
+	if (fireCount && fireCount > 1) return path.join(FIRED_DIR, `${jobId}.${fireCount}.json`);
 	return path.join(FIRED_DIR, `${jobId}.json`);
 }
 
 async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "lastAttemptAt" | "handlerRunId" | "error">> = {}): Promise<string> {
 	await fsp.mkdir(FIRED_DIR, { recursive: true });
-	const eventPath = firedEventPath(job.id);
+	const eventPath = firedEventPath(job.id, job.fireCount);
 	const event: FiredEventState = {
 		version: 1,
 		event: "return_on.fired",
@@ -691,7 +696,7 @@ async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partia
 		label: job.label,
 		reason,
 		createdAt: job.createdAt,
-		firedAt: job.firedAt ?? Date.now(),
+		firedAt: job.lastFiredAt ?? job.firedAt ?? Date.now(),
 		cwd: job.cwd,
 		...(job.sessionFile ? { sessionFile: job.sessionFile } : {}),
 		resume: job.resume,
@@ -1789,10 +1794,20 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 			try {
 				const result = await evaluateCondition(job, job.condition);
 				if (result.value) {
-					await fireJob(pi, job, result.summary);
-					changed = true;
-				} else if (Object.keys(job.latches).length > 0) {
-					changed = true;
+					if (job.rearmPending) {
+						// After a fire, require the condition to evaluate false at least
+						// once before we'll fire again. Skip this tick.
+						changed = true;
+					} else {
+						await fireJob(pi, job, result.summary);
+						changed = true;
+					}
+				} else {
+					if (job.rearmPending) {
+						job.rearmPending = false;
+						changed = true;
+					}
+					if (Object.keys(job.latches).length > 0) changed = true;
 				}
 			} catch (error) {
 				job.leafState.root = { ...job.leafState.root, lastSummary: `evaluation error: ${error instanceof Error ? error.message : String(error)}` };
@@ -2182,10 +2197,23 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 
 async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Promise<void> {
 	if (job.status !== "active") return;
-	job.status = "fired";
-	job.firedAt = Date.now();
-	job.updatedAt = job.firedAt;
+	const now = Date.now();
+	const maxFires = Math.max(1, job.maxFires ?? 1);
+	const nextCount = (job.fireCount ?? 0) + 1;
+	const exhausted = reason === "timeout" || nextCount >= maxFires;
+	job.fireCount = nextCount;
+	job.lastFiredAt = now;
+	job.firedAt = job.firedAt ?? now;
+	job.updatedAt = now;
 	job.fireReason = reason;
+	job.status = exhausted ? "fired" : "active";
+	if (!exhausted) {
+		// Re-arm: clear latches and leaf cache so the condition must go false
+		// (or at least be re-evaluated) before it can fire again.
+		job.latches = {};
+		job.leafState = {};
+		job.rearmPending = true;
+	}
 	await saveJobs();
 	let eventPath: string | undefined;
 	try {
@@ -2260,11 +2288,14 @@ function formatFireMessage(job: ReturnOnJob, reason: string): string {
 	const latched = Object.entries(job.latches)
 		.map(([key, latch]) => `- ${key}: ${latch.summary} at ${nowIso(latch.trueAt)}`)
 		.join("\n") || "- none";
+	const maxFires = Math.max(1, job.maxFires ?? 1);
+	const countLine = maxFires > 1 ? [`Fire: ${job.fireCount ?? 1}/${maxFires}${job.status === "active" ? " (will re-arm)" : ""}`] : [];
 	return [
 		`return_on fired: ${job.label} (${job.id})`,
 		`Reason: ${reason}`,
+		...countLine,
 		`Created: ${nowIso(job.createdAt)}`,
-		`Fired: ${nowIso(job.firedAt ?? Date.now())}`,
+		`Fired: ${nowIso(job.lastFiredAt ?? job.firedAt ?? Date.now())}`,
 		`CWD: ${job.cwd}`,
 		"",
 		"Latched leaves:",
@@ -2670,6 +2701,7 @@ export default function (pi: ExtensionAPI) {
 			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
 			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
+			maxFires: Type.Optional(Type.Number({ description: "How many times this watcher should fire before it is retired. Defaults to 1. After each fire the condition must evaluate false at least once before it can fire again (edge-triggered). The watcher is also retired by its timeout, whichever comes first." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
@@ -2691,6 +2723,13 @@ export default function (pi: ExtensionAPI) {
 			const timeoutMs = parseRequestedJobTimeout(params.timeout, returnOnConfig);
 			const webhook = normalizeWebhook(params.webhook);
 			const delivery = normalizeDelivery(params.delivery, returnOnConfig);
+			let maxFires = 1;
+			if (params.maxFires !== undefined) {
+				if (typeof params.maxFires !== "number" || !Number.isFinite(params.maxFires) || !Number.isInteger(params.maxFires) || params.maxFires < 1) {
+					throw new Error("maxFires must be a positive integer");
+				}
+				maxFires = params.maxFires;
+			}
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
@@ -2707,6 +2746,8 @@ export default function (pi: ExtensionAPI) {
 				...(webhook ? { webhook } : {}),
 				...(params.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
 				...(params.endTurn === false ? { endTurn: false } : {}),
+				...(maxFires > 1 ? { maxFires } : {}),
+				fireCount: 0,
 				latches: {},
 				leafState: {},
 			};
@@ -2722,9 +2763,10 @@ export default function (pi: ExtensionAPI) {
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
 			const timeoutText = `\nTimeout: ${formatDuration(timeoutMs)} (max ${formatDuration(returnOnConfig.maxTimeoutMs)})`;
+			const firesText = maxFires > 1 ? `\nMax fires: ${maxFires} (edge-triggered; condition must go false between fires)` : "";
 			const endTurn = params.endTurn !== false;
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}${timeoutText}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
+				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}${timeoutText}${firesText}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
 				details: { job, incomingWebhooks },
 				terminate: endTurn,
 			};
