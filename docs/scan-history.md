@@ -56,7 +56,7 @@ Hotspot session directories: `async-video-messaging`, `cargoviu-ai-agent`,
 - [ ] Improve `normalizeCondition` error messages so leaves like `{file:{...}}`
       or untyped leaves inside `{op,children}` point at the correct
       `{type:"...", ...}` shape.
-- [ ] Add `pidFile` support to process conditions (read pid from file, then
+- [x] Add `pidFile` support to process conditions (read pid from file, then
       apply existing pid/status logic).
 - [ ] Reconsider the default `maxTimeout` cap or auto-fallback to the cap with
       a warning instead of erroring out.

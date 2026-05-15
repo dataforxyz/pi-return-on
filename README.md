@@ -470,7 +470,13 @@ Supported fields:
 { "type": "process", "name": "node", "running": true }
 ```
 
-Supported fields: `pid`, `name`, `commandContains`, `matches`, `running`, `exited`, `state`, and `every`.
+```json
+{ "type": "process", "pidFile": ".return-on/worker.pid", "exited": true }
+```
+
+Supported fields: `pid`, `pidFile`, `name`, `commandContains`, `matches`, `running`, `exited`, `state`, and `every`.
+
+`pidFile` reads the first integer from the file (resolved relative to the session cwd) and applies the existing pid-based check. A missing or empty `pidFile` is treated as the target process not running, so `{exited: true, pidFile: "..."}` fires as soon as the pidfile is removed.
 
 ### Port
 

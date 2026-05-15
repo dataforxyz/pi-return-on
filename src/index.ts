@@ -99,6 +99,7 @@ interface ExecCondition extends Record<string, unknown> {
 interface ProcessCondition extends Record<string, unknown> {
 	type: "process";
 	pid?: number;
+	pidFile?: string;
 	name?: string;
 	commandContains?: string;
 	matches?: string;
@@ -1077,8 +1078,17 @@ function normalizeCondition(input: unknown): Condition {
 		if (input.pid !== undefined && (typeof input.pid !== "number" || !Number.isInteger(input.pid) || input.pid <= 0)) {
 			throw new Error("process condition pid must be a positive integer");
 		}
-		if (input.pid === undefined && typeof input.name !== "string" && typeof input.commandContains !== "string" && typeof input.matches !== "string") {
-			throw new Error("process condition requires pid, name, commandContains, or matches");
+		if (input.pidFile !== undefined && (typeof input.pidFile !== "string" || !input.pidFile.trim())) {
+			throw new Error("process condition pidFile must be a non-empty string");
+		}
+		if (
+			input.pid === undefined
+			&& input.pidFile === undefined
+			&& typeof input.name !== "string"
+			&& typeof input.commandContains !== "string"
+			&& typeof input.matches !== "string"
+		) {
+			throw new Error("process condition requires pid, pidFile, name, commandContains, or matches");
 		}
 		return input as ProcessCondition;
 	}
@@ -1396,6 +1406,20 @@ async function evaluateExec(job: ReturnOnJob, condition: ExecCondition, key: str
 	};
 }
 
+async function readPidFromFile(job: ReturnOnJob, pidFile: string): Promise<number | undefined> {
+	const resolved = path.resolve(job.cwd, pidFile);
+	try {
+		const contents = await fsp.readFile(resolved, "utf8");
+		const match = contents.match(/-?\d+/);
+		if (!match) return undefined;
+		const pid = Number.parseInt(match[0], 10);
+		if (!Number.isInteger(pid) || pid <= 0) return undefined;
+		return pid;
+	} catch {
+		return undefined;
+	}
+}
+
 async function evaluateProcess(job: ReturnOnJob, condition: ProcessCondition, key: string): Promise<EvalResult> {
 	const state = job.leafState[key] ??= {};
 	const everyMs = getPollingInterval(job, condition.every, DEFAULT_PROCESS_EVERY_MS);
@@ -1405,12 +1429,28 @@ async function evaluateProcess(job: ReturnOnJob, condition: ProcessCondition, ke
 	}
 	state.lastCheckAt = now;
 
-	const running = await isProcessRunning(condition);
 	const wantsRunning = condition.exited === true || condition.state === "exited" ? false : condition.running ?? true;
-	const ok = wantsRunning ? running : !running;
 	const target = wantsRunning ? "running" : "exited";
-	const subject = condition.pid !== undefined
-		? `pid ${condition.pid}`
+
+	let effective: ProcessCondition = condition;
+	let resolvedPid: number | undefined;
+	if (condition.pid === undefined && condition.pidFile !== undefined) {
+		resolvedPid = await readPidFromFile(job, condition.pidFile);
+		if (resolvedPid === undefined) {
+			const running = false;
+			const ok = wantsRunning ? running : true;
+			const summary = `pidFile '${condition.pidFile}' missing or empty; target ${target}`;
+			state.lastSummary = summary;
+			state.lastValue = ok;
+			return { value: ok, summary, details: { running, target, pidFile: condition.pidFile } };
+		}
+		effective = { ...condition, pid: resolvedPid };
+	}
+
+	const running = await isProcessRunning(effective);
+	const ok = wantsRunning ? running : !running;
+	const subject = effective.pid !== undefined
+		? condition.pidFile !== undefined ? `pidFile '${condition.pidFile}' (pid ${effective.pid})` : `pid ${effective.pid}`
 		: condition.name
 			? `process name '${condition.name}'`
 			: condition.commandContains
@@ -1419,7 +1459,7 @@ async function evaluateProcess(job: ReturnOnJob, condition: ProcessCondition, ke
 	const summary = `${subject} is ${running ? "running" : "not running"}; target ${target}`;
 	state.lastSummary = summary;
 	state.lastValue = ok;
-	return { value: ok, summary, details: { running, target } };
+	return { value: ok, summary, details: { running, target, ...(resolvedPid !== undefined ? { pidFile: condition.pidFile, resolvedPid } : {}) } };
 }
 
 async function isProcessRunning(condition: ProcessCondition): Promise<boolean> {
@@ -2132,7 +2172,11 @@ function describeCondition(condition: Condition): string {
 	}
 	if (condition.type === "exec") return `exec ${condition.command ?? condition.code ?? "?"}`;
 	if (condition.type === "process") {
-		const target = condition.pid !== undefined ? `pid ${condition.pid}` : condition.name ?? condition.commandContains ?? condition.matches ?? "?";
+		const target = condition.pid !== undefined
+			? `pid ${condition.pid}`
+			: condition.pidFile !== undefined
+				? `pidFile ${condition.pidFile}`
+				: condition.name ?? condition.commandContains ?? condition.matches ?? "?";
 		const state = condition.exited || condition.state === "exited" ? "exited" : "running";
 		return `process ${target} ${state}`;
 	}
