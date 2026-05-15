@@ -91,7 +91,7 @@ Diagnostics:
 | `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `returnOn.defaultDeliveryMode` or `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
 | `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
-| `maxFires` | no | How many times the watcher should fire before being retired. Defaults to `1` (one-shot). With `maxFires > 1` the watcher is edge-triggered: after each fire the condition must evaluate false at least once before it can fire again. The watcher is also retired by its `timeout`, whichever comes first. Timer-only conditions are rejected with `maxFires > 1` because a passed deadline stays passed and cannot re-arm. |
+| `maxFires` | no | How many times the watcher should fire before being retired. Defaults to `1` (one-shot). With `maxFires > 1` the watcher is edge-triggered: after each fire the condition must evaluate false at least once before it can fire again, so the minimum gap between fires is roughly the leaf's `every` interval (plus the global tick). The watcher is also retired by its `timeout`, whichever comes first. Timer-only conditions are rejected with `maxFires > 1` because a passed deadline stays passed and cannot re-arm. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
 

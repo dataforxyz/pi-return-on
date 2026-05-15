@@ -133,3 +133,28 @@ Follow-up: the README "Canonical condition shapes" section should help, but
 the biggest lever is likely a Pi-side hint when an agent issues a `bash` with
 a long foreground `sleep` — surface the equivalent `return_on` call. Track
 that as a separate enhancement rather than another scanner pass.
+
+## 2026-05-16 capability additions
+
+While working through the scan, two capability gaps were closed so that the
+next scan should see strictly fewer reasons for agents to fall back to direct
+waits or work around the tool:
+
+- **`maxFires`** for repeating watchers. Default is still `1`. With
+  `maxFires > 1`, a watcher fires up to N times, edge-triggered (the
+  condition must evaluate false between fires) and is also retired by its
+  `timeout`, whichever comes first. Timer-only conditions are rejected at
+  registration because a passed deadline cannot re-arm.
+- **JSON-string `condition`** — accepted and `JSON.parse`d before validation,
+  matching how some callers flatten tool arguments.
+
+Follow-ups to watch in the next scan:
+
+- [ ] Surface a Pi-side hint when a foreground `sleep ≥10s` is issued,
+      suggesting the equivalent `return_on` call. (Biggest remaining lever
+      against the 479 long-sleep blocks.)
+- [ ] After a couple weeks live, re-run `npm run scan-errors` and
+      `npm run audit:direct-waits` and append a new dated section. Expect
+      schema-confusion, pidFile-not-supported, and timeout-cap-exceeded
+      counts to approach zero; long-sleep blocks should drop only modestly
+      until the Pi-side hint lands.

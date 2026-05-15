@@ -2428,9 +2428,12 @@ function summarizeJob(job: ReturnOnJob): string {
 	const timeout = job.timeoutAt ? ` timeout=${nowIso(job.timeoutAt)}` : "";
 	const delivery = job.delivery?.mode ? ` delivery=${job.delivery.mode}` : "";
 	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
-	const fired = job.firedAt ? ` fired=${nowIso(job.firedAt)}` : "";
+	const lastFired = job.lastFiredAt ?? job.firedAt;
+	const fired = lastFired ? ` fired=${nowIso(lastFired)}` : "";
+	const maxFires = Math.max(1, job.maxFires ?? 1);
+	const fires = maxFires > 1 ? ` fires=${job.fireCount ?? 0}/${maxFires}` : "";
 	const cancelled = job.cancelledAt ? ` cancelled=${nowIso(job.cancelledAt)}` : "";
-	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
+	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${fires}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
 }
 
 function formatFiredEventLine(event: FiredEventState): string {
@@ -2454,7 +2457,7 @@ function formatJobDetails(job: ReturnOnJob): string {
 		`Created: ${nowIso(job.createdAt)}`,
 		`Updated: ${nowIso(job.updatedAt)}`,
 		...(job.timeoutAt ? [`Timeout: ${nowIso(job.timeoutAt)}`] : []),
-		...(job.firedAt ? [`Fired: ${nowIso(job.firedAt)}`] : []),
+		...(job.firedAt ? [`Fired: ${nowIso(job.lastFiredAt ?? job.firedAt)}${job.maxFires && job.maxFires > 1 ? ` (${job.fireCount ?? 0}/${job.maxFires})` : ""}`] : []),
 		...(job.fireReason ? [`Fire reason: ${job.fireReason}`] : []),
 		...(job.cancelledAt ? [`Cancelled: ${nowIso(job.cancelledAt)}`] : []),
 		...(job.delivery ? [`Delivery: ${job.delivery.mode} notify=${job.delivery.notify}`] : []),
@@ -2697,6 +2700,7 @@ export default function (pi: ExtensionAPI) {
 			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
+			"By default each watcher fires once and is retired. Set maxFires to a positive integer to fire up to N times (edge-triggered: the condition must evaluate false between fires); timer-only conditions cannot be combined with maxFires>1.",
 			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only after user approval.",
 		],
 		parameters: Type.Object({
