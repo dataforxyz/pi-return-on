@@ -52,6 +52,7 @@ Design notes:
 - [Background worker clarifying questions](./docs/background-worker-clarifying-questions.md)
 - [Background event router and handler ledger](./docs/background-event-router.md)
 - [Inbound intercom fork channel](./docs/intercom-fork-channel.md)
+- [Scan history (recurring tool errors)](./docs/scan-history.md)
 
 Diagnostics:
 
@@ -71,7 +72,7 @@ Diagnostics:
   "condition": { "type": "file", "path": "out/video.mp4", "stableFor": "10s" },
   "resume": "Continue now that the render output is ready.",
   "every": "2s",
-  "timeout": "30m",
+  "timeout": "10m",
   "webhook": "https://example.com/pi-return-on-hook",
   "delivery": { "mode": "fork", "notify": "ack-and-summary" },
   "endTurn": true,
@@ -87,7 +88,7 @@ Diagnostics:
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. If omitted, `returnOn.defaultTimeout` applies. Values above `returnOn.maxTimeout` are rejected. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
-| `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
+| `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `returnOn.defaultDeliveryMode` or `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
 | `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 
@@ -109,6 +110,22 @@ Configure these limits in Pi settings (`~/.pi/agent/settings.json` globally or `
 ```
 
 `defaultTimeoutMs` and `maxTimeoutMs` are also accepted as millisecond numbers. The default must be positive and cannot exceed the max. Environment variables `PI_RETURN_ON_DEFAULT_TIMEOUT` and `PI_RETURN_ON_MAX_TIMEOUT` can override the settings for debugging or local experiments.
+
+## Default delivery policy
+
+Use settings to make fork handling the default for real workflows instead of requiring every tool call to repeat `delivery: {"mode":"fork"}`:
+
+```json
+{
+  "returnOn": {
+    "defaultDeliveryMode": "fork",
+    "defaultDeliveryNotify": "ack-and-summary",
+    "triggerParentOnSummary": false
+  }
+}
+```
+
+`defaultDeliveryMode` accepts `"wake"` or `"fork"`. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"`. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
 
 ## Background fork handlers
 
@@ -134,7 +151,7 @@ Useful delivery options:
 - `triggerParentOnSummary: true` — make the final summary trigger a parent turn; default is display-only.
 - `piCommand` — override the `pi` executable path for testing or custom installs. `PI_RETURN_ON_PI_BIN` also works.
 
-Set `PI_RETURN_ON_DELIVERY_MODE=fork` before starting Pi to make fork handling the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
+Set `returnOn.defaultDeliveryMode` to `"fork"` or set `PI_RETURN_ON_DELIVERY_MODE=fork` before starting Pi to make fork handling the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
 
 ## Orchestration recipes
 
