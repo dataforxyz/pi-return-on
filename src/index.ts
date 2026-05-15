@@ -1276,6 +1276,14 @@ function conditionHasIncomingWebhook(condition: Condition): boolean {
 	return false;
 }
 
+function conditionIsTimerOnly(condition: Condition): boolean {
+	if (isGroupCondition(condition)) {
+		if (condition.children.length === 0) return false;
+		return condition.children.every(conditionIsTimerOnly);
+	}
+	return "type" in condition && condition.type === "timer";
+}
+
 function truncateText(value: string, limit = OUTPUT_LIMIT_BYTES): string {
 	const buf = Buffer.from(value);
 	if (buf.length <= limit) return value;
@@ -2729,6 +2737,9 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("maxFires must be a positive integer");
 				}
 				maxFires = params.maxFires;
+			}
+			if (maxFires > 1 && conditionIsTimerOnly(condition)) {
+				throw new Error("maxFires > 1 requires a re-armable condition. A timer-only condition cannot fire more than once because a passed deadline stays passed. Combine the timer with a file/process/port/url/exec/webhook leaf, or use multiple separate watchers.");
 			}
 			const job: ReturnOnJob = {
 				id: makeId(),

@@ -678,6 +678,24 @@ async function testFileExistsFalse(harness: Harness) {
   await waitForWake(harness, { jobId, label, resume }, 2_500);
 }
 
+async function testMaxFiresTimerOnlyRejected(harness: Harness) {
+  const cases: Array<{ label: string; condition: any }> = [
+    { label: "timer leaf", condition: { type: "timer", after: "500ms" } },
+    { label: "all of timers", condition: { all: [ { type: "timer", after: "500ms" }, { type: "timer", after: "1s" } ] } },
+  ];
+  for (const { label, condition } of cases) {
+    let message = "";
+    try {
+      await harness.register({ label: `smoke maxFires timer-only ${label}`, condition, resume: "should reject", maxFires: 3 } as any);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    if (!/maxFires > 1 requires a re-armable condition/.test(message)) {
+      throw new Error(`${label}: timer-only maxFires was not rejected: ${message}`);
+    }
+  }
+}
+
 async function testMaxFiresMulti(harness: Harness) {
   const label = "smoke maxFires multi";
   const resume = "multi fire resume";
@@ -1368,6 +1386,7 @@ await testUrlReady(harness);
 await testFileExistsFalse(harness);
 await testMaxFiresMulti(harness);
 await testMaxFiresEdgeTriggered(harness);
+await testMaxFiresTimerOnlyRejected(harness);
 await testNotConditionAfterDelete(harness);
 await testNotExecAfterDelete(harness);
 await testEmptyGroupRejected(harness);
