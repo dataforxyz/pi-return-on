@@ -58,7 +58,9 @@ Hotspot session directories: `async-video-messaging`, `cargoviu-ai-agent`,
       `{type:"...", ...}` shape.
 - [ ] Add `pidFile` support to process conditions (read pid from file, then
       apply existing pid/status logic).
-- [ ] Reconsider the default `maxTimeout` cap or auto-fallback to the cap with
-      a warning instead of erroring out.
+- [x] Reconsider the default `maxTimeout` cap or auto-fallback to the cap with
+      a warning instead of erroring out. *(Default cap raised from 10 m to 2 h
+      so DB dumps, build matrices, and remote renders work out of the box;
+      operators can still lower it via `returnOn.maxTimeout`.)*
 - [ ] Expand README/tool description with the canonical flat-leaf examples
       so new agents see the right shape first.

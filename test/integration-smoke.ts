@@ -692,6 +692,32 @@ async function testTimeoutWake(harness: Harness) {
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
 }
 
+async function testDefaultMaxTimeoutIsTwoHours(harness: Harness) {
+  let rejected: string | undefined;
+  try {
+    await harness.callTool("return_on", {
+      label: "smoke 3h over default cap",
+      condition: { type: "timer", after: "3h" },
+      timeout: "3h",
+      resume: "should reject",
+    });
+  } catch (error) {
+    rejected = String(error);
+  }
+  if (!rejected || !/exceeds max 2h/i.test(rejected)) {
+    throw new Error(`default max timeout no longer 2h: ${rejected ?? "accepted"}`);
+  }
+  const ok = await harness.callTool("return_on", {
+    label: "smoke 90m within default cap",
+    condition: { type: "file", path: "never-90m-default-cap.txt", exists: true, every: "500ms" },
+    timeout: "90m",
+    resume: "90m default cap resume",
+  });
+  const jobId = ok.details.job.id as string;
+  allJobIds.push(jobId);
+  await harness.cancel(jobId);
+}
+
 async function testDefaultTimeoutAndMax(harness: Harness) {
   await withProjectSettings({ returnOn: { defaultTimeout: "700ms", maxTimeout: "1s" } }, async () => {
     const label = "smoke default timeout";
@@ -1087,6 +1113,7 @@ await testEmptyGroupRejected(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
+await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
 await harness.emit("session_shutdown");
 await testExecConfirmationAndValidation();
