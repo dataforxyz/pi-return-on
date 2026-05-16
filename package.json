@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "smoke": "tsx test/integration-smoke.ts",
     "scan-errors": "node scripts/scan-return-on-errors.mjs",
+    "scan-errors:recent": "node scripts/scan-return-on-errors.mjs --days 7",
     "collect:direct-waits": "node scripts/collect-direct-wait-examples.mjs",
     "review:direct-waits": "node scripts/review-direct-wait-examples.mjs",
     "test:direct-wait-tools": "node --test scripts/collect-direct-wait-examples.test.mjs scripts/review-direct-wait-examples.test.mjs",

@@ -26,10 +26,17 @@ for (let i = 0; i < args.length; i++) {
 			process.exit(2);
 		}
 		untilMs = parsed;
+	} else if (arg === "--days") {
+		const days = Number(args[++i]);
+		if (!Number.isFinite(days) || days <= 0) {
+			console.error(`Invalid --days value: ${args[i]}`);
+			process.exit(2);
+		}
+		sinceMs = Date.now() - days * 86_400_000;
 	} else if (arg === "--json") {
 		jsonOut = true;
 	} else if (arg === "--help" || arg === "-h") {
-		console.log("Usage: scan-return-on-errors [--since <iso>] [--until <iso>] [--json] [root...]");
+		console.log("Usage: scan-return-on-errors [--since <iso>] [--until <iso>] [--days N] [--json] [root...]");
 		process.exit(0);
 	} else {
 		roots.push(resolve(arg));
