@@ -35,6 +35,8 @@ const DEFAULT_RETURN_ON_MAX_TIMEOUT_MS = 2 * 60 * 60_000;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
+const DIRECT_TIMEOUT_AUDIT_THRESHOLD_MS = 30_000;
+const DIRECT_TIMEOUT_BLOCK_THRESHOLD_MS = 300_000;
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
@@ -321,7 +323,7 @@ interface ConditionLeafTarget {
 	condition: LeafCondition;
 }
 
-type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_backgrounded";
+type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_short_timeout" | "allowed_backgrounded";
 
 interface DirectWaitMatch {
 	kind: string;
@@ -535,6 +537,20 @@ function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefine
 		}
 	}
 
+	// `timeout [opts] N[smhd] <cmd>` (GNU coreutils): agent is bounding a slow
+	// foreground command with a hard ceiling instead of backgrounding it +
+	// using return_on. Detect any timeout >= 30s; treat >= 5m as blocked.
+	for (const match of normalized.matchAll(/(?:^|[;&|]\s*)timeout(?:\s+(?:--?[a-zA-Z][\w-]*(?:=\S+)?|-[a-zA-Z]\s+\S+))*\s+(\d+(?:\.\d+)?)(ms|s|m|h|d)?\s+\S/g)) {
+		const durationMs = parseShellSleepDurationMs(match[1], match[2] ?? "s");
+		if (durationMs !== undefined && durationMs >= DIRECT_TIMEOUT_AUDIT_THRESHOLD_MS) {
+			return {
+				kind: "timeout-bounded command",
+				detail: `timeout ${match[1]}${match[2] ?? "s"}`,
+				durationMs,
+			};
+		}
+	}
+
 	const checks: Array<{ regex: RegExp; kind: string; detail: string }> = [
 		{ regex: /(?:^|[;&|]\s*)tail\b[^;&|]*(?:\s-f\b|\s--follow(?:=\S+)?\b)/, kind: "streaming log wait", detail: "tail -f/--follow" },
 		{ regex: /(?:^|[;&|]\s*)journalctl\b[^;&|]*(?:\s-f\b|\s--follow\b)/, kind: "streaming log wait", detail: "journalctl -f/--follow" },
@@ -558,7 +574,8 @@ function analyzeDirectWait(command: string): DirectWaitAnalysis | undefined {
 	const match = detectDirectWaitPattern(normalized);
 	if (!match) return undefined;
 	if (isExplicitlyBackgrounded(normalized)) return { ...match, action: "allowed_backgrounded" };
-	if (match.durationMs !== undefined && match.durationMs < DIRECT_SLEEP_BLOCK_THRESHOLD_MS) return { ...match, action: "allowed_short_sleep" };
+	if (match.kind === "short sleep" && match.durationMs !== undefined && match.durationMs < DIRECT_SLEEP_BLOCK_THRESHOLD_MS) return { ...match, action: "allowed_short_sleep" };
+	if (match.kind === "timeout-bounded command" && match.durationMs !== undefined && match.durationMs < DIRECT_TIMEOUT_BLOCK_THRESHOLD_MS) return { ...match, action: "allowed_short_timeout" };
 	return { ...match, action: "blocked" };
 }
 
@@ -583,6 +600,9 @@ function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
 	}
 	if (match.kind === "infinite loop") {
 		return `Replace the infinite loop with a return_on watcher (file/process/port/url/exec) so the turn can end and resume when the real condition flips.`;
+	}
+	if (match.kind === "timeout-bounded command") {
+		return `Background the command (nohup ... > log 2>&1 & echo $! > pid) and watch the pid: return_on({condition:{type:"process", pidFile:".return-on/work.pid", state:"exited", every:"2s"}, resume:"work finished"}). The 'timeout N' cap blocks the turn for up to N; return_on lets the session end and resume on real completion.`;
 	}
 	return `Background the work (& with pid+log capture) and call return_on on a file/process/port/url leaf for the readiness/completion signal.`;
 }

@@ -174,6 +174,30 @@ The baseline shifts dramatically once we exclude pre-fix sessions, which is
 the right way to track progress going forward. Re-run with `--since` set to
 the latest pre-fix-cluster boundary in each scan.
 
+## 2026-05-16 timeout-bounded command detection
+
+User asked: are we catching `timeout 900 <cmd>` patterns? A quick session scan
+found **80** bash tool calls with `timeout N` where N >= 30s:
+
+| Bucket | Count |
+|---|---|
+| 30-60s | 20 |
+| 1-5m  | 46 |
+| 5-15m | 10 |
+| 15-30m | 3 |
+| 30-60m | 1 |
+
+The 5-15m / 15-30m / 30-60m cases (14 total) are the bad ones: the agent is
+pinning the turn for up to 30+ minutes instead of backgrounding the command
+and using `return_on` on its pid. Workloads observed: piker backtests,
+juston-app pytest matrix, fetch_hist data jobs.
+
+Fix: `analyzeDirectWait` now detects `timeout [opts] N[smhd] <cmd>` and
+classifies it as a `"timeout-bounded command"`. >= 5m is blocked with a
+suggested `return_on({type:"process", pidFile:...})` shape; 30s-5m is
+audited as `allowed_short_timeout` so we keep visibility on the smaller
+cases without disrupting routine usage. Smoke coverage added.
+
 ## 2026-05-16 capability additions
 
 While working through the scan, two capability gaps were closed so that the

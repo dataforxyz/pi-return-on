@@ -267,6 +267,19 @@ async function testDirectWaitPolicy(harness: Harness) {
   const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
   if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);
 
+  const longTimeout = await harness.toolCall("bash", { command: "timeout 900 uv run pytest tests/" });
+  if (!longTimeout?.block || !String(longTimeout.reason).includes("timeout-bounded command")) {
+    throw new Error(`long timeout-bounded command was not blocked: ${JSON.stringify(longTimeout)}`);
+  }
+  if (!String(longTimeout.reason).includes("type:\"process\"") || !String(longTimeout.reason).includes("pidFile")) {
+    throw new Error(`timeout-bounded block did not suggest a process/pidFile watcher: ${JSON.stringify(longTimeout)}`);
+  }
+
+  const shortTimeout = await harness.toolCall("bash", { command: "timeout 60 make check" });
+  if (shortTimeout?.block) {
+    throw new Error(`60s timeout-bounded command should not be blocked: ${JSON.stringify(shortTimeout)}`);
+  }
+
   const auditFile = path.join(stateDir, "direct-wait-audit.jsonl");
   const auditLines = (await fs.readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   if (!auditLines.some((entry) => entry.action === "blocked" && entry.detail === "sleep 10s")) {
@@ -277,6 +290,12 @@ async function testDirectWaitPolicy(harness: Harness) {
   }
   if (!auditLines.some((entry) => entry.action === "allowed_backgrounded" && entry.detail === "package manager dev server")) {
     throw new Error(`backgrounded direct-wait opportunity was not audited: ${JSON.stringify(auditLines)}`);
+  }
+  if (!auditLines.some((entry) => entry.action === "blocked" && entry.kind === "timeout-bounded command" && entry.detail === "timeout 900s")) {
+    throw new Error(`long timeout-bounded command was not audited: ${JSON.stringify(auditLines)}`);
+  }
+  if (!auditLines.some((entry) => entry.action === "allowed_short_timeout" && entry.detail === "timeout 60s")) {
+    throw new Error(`short timeout-bounded command was not audited: ${JSON.stringify(auditLines)}`);
   }
 
   await harness.runCommand("return-on-direct-waits", "10");
