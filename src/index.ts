@@ -562,6 +562,8 @@ function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefine
 		{ regex: /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+start\b/, kind: "foreground server", detail: "package manager start server" },
 		{ regex: /(?:^|[;&|]\s*)(?:next|vite|astro|webpack-dev-server)\s+(?:dev|serve)?\b/, kind: "foreground dev server", detail: "dev server command" },
 		{ regex: /(?:^|[;&|]\s*)python(?:3)?\s+-m\s+http\.server\b/, kind: "foreground server", detail: "python -m http.server" },
+		{ regex: /(?:^|[;&|]\s*)gh\s+run\s+watch\b/, kind: "ci watch", detail: "gh run watch" },
+		{ regex: /(?:^|[;&|]\s*)gh\s+pr\s+checks\b[^;&|]*\s--watch(?!=false)(?:\s|$|=true\b)/, kind: "ci watch", detail: "gh pr checks --watch" },
 	];
 
 	const found = checks.find((check) => check.regex.test(normalized));
@@ -603,6 +605,9 @@ function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
 	}
 	if (match.kind === "timeout-bounded command") {
 		return `Background the command (nohup ... > log 2>&1 & echo $! > pid) and watch the pid: return_on({condition:{type:"process", pidFile:".return-on/work.pid", state:"exited", every:"2s"}, resume:"work finished"}). The 'timeout N' cap blocks the turn for up to N; return_on lets the session end and resume on real completion.`;
+	}
+	if (match.kind === "ci watch") {
+		return `Use an exec watcher that polls the run status: return_on({condition:{type:"exec", command:"gh run view <id> --json status --jq .status", contains:"completed", every:"30s"}, allowExec:true, resume:"ci run finished"}). 'gh run watch' / 'gh pr checks --watch' pins the turn until CI completes.`;
 	}
 	return `Background the work (& with pid+log capture) and call return_on on a file/process/port/url leaf for the readiness/completion signal.`;
 }

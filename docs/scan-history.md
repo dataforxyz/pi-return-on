@@ -174,6 +174,32 @@ The baseline shifts dramatically once we exclude pre-fix sessions, which is
 the right way to track progress going forward. Re-run with `--since` set to
 the latest pre-fix-cluster boundary in each scan.
 
+## 2026-05-16 wider blocking-pattern sweep + gh CI watchers
+
+With the `timeout N` detector live, re-ran a wider scan looking for other
+foreground-blocking patterns not yet caught. Candidates inspected:
+`gh run watch`, `gh pr checks --watch`, `kubectl wait`, `docker wait`, the
+`wait` shell builtin on a pid, `inotifywait`, `entr`, `nc -l`, ssh tail-f,
+long `curl --max-time`, `nodemon`, `vitest --watch`, `jest --watch`,
+`cargo watch`, `tsc --watch`, `tmux attach`, `screen -r`.
+
+After tightening the regexes to skip false positives (grep word lists,
+`--watch=false`, the substring inside heredocs), the only real hits across
+all local sessions were:
+
+- **3x `gh run watch <id>`** in cargoviu-ai-agent CI workflows. Synchronous
+  poll for the full duration of the GitHub Actions run.
+- 0 of the other candidates were genuine.
+
+Fix: added a `"ci watch"` kind to `analyzeDirectWait` covering
+`gh run watch <id>` and `gh pr checks --watch` (but not `--watch=false`).
+Block suggestion is an `exec` watcher polling `gh run view <id> --json
+status --jq .status` for `"completed"`. Smoke coverage added.
+
+Takeaway: the existing detector covers the bulk of real blocking patterns.
+Further additions should be data-driven — re-run the wider sweep every few
+weeks and only add a detector once the pattern appears in real sessions.
+
 ## 2026-05-16 timeout-bounded command detection
 
 User asked: are we catching `timeout 900 <cmd>` patterns? A quick session scan

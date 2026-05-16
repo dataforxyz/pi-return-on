@@ -280,6 +280,15 @@ async function testDirectWaitPolicy(harness: Harness) {
     throw new Error(`60s timeout-bounded command should not be blocked: ${JSON.stringify(shortTimeout)}`);
   }
 
+  const ghRunWatch = await harness.toolCall("bash", { command: "gh run watch 12345 --exit-status" });
+  if (!ghRunWatch?.block || !String(ghRunWatch.reason).includes("gh run watch") || !String(ghRunWatch.reason).includes("type:\"exec\"")) {
+    throw new Error(`gh run watch was not blocked with exec-watcher guidance: ${JSON.stringify(ghRunWatch)}`);
+  }
+  const ghChecksWatchFalse = await harness.toolCall("bash", { command: "gh pr checks 99 --watch=false" });
+  if (ghChecksWatchFalse?.block) {
+    throw new Error(`gh pr checks --watch=false should not be blocked: ${JSON.stringify(ghChecksWatchFalse)}`);
+  }
+
   const auditFile = path.join(stateDir, "direct-wait-audit.jsonl");
   const auditLines = (await fs.readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   if (!auditLines.some((entry) => entry.action === "blocked" && entry.detail === "sleep 10s")) {

@@ -34,6 +34,7 @@ Block obvious direct waits in bash tool calls and return an actionable reason. T
 - infinite shell loops such as `while true; do ...` or `for ((;;)); do ...`
 - common foreground dev/server commands such as `npm run dev`, `pnpm dev`, `yarn start`, `next dev`, `vite`, and `python -m http.server`
 - `timeout N <cmd>` (GNU coreutils) where `N` is 5 minutes or longer. Bounding a slow command with a hard ceiling still blocks the turn for up to `N`; the same workload should run in the background with a `return_on` watcher on its pid/log. `timeout` values between 30s and 5m are audited as `allowed_short_timeout` for visibility but not blocked.
+- `gh run watch <run-id>` and `gh pr checks --watch` (not `--watch=false`). Both poll a CI run synchronously and can pin the turn for the full duration of the workflow. Use an `exec` watcher that polls `gh run view <id> --json status` instead.
 
 Commands that are explicitly backgrounded with `&`, `nohup`, `setsid`, or `disown` are not blocked by this policy.
 
