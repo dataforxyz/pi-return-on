@@ -11,6 +11,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
+import { compactReturnOnHandlerMessages } from "./context-compaction.ts";
 
 const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
@@ -2848,6 +2849,12 @@ function commandReply(content: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	(pi.on as unknown as (event: "context", handler: (event: { messages: unknown[] }) => { messages: unknown[] } | undefined) => void)("context", (event) => {
+		const messages = compactReturnOnHandlerMessages(event.messages);
+		if (messages === event.messages) return undefined;
+		return { messages };
+	});
+
 	pi.registerMessageRenderer?.(EXTENSION_NAME, (message, _options, theme) => {
 		return new Text(theme.fg("accent", "⏰ return_on\n") + message.content, 0, 0);
 	});
