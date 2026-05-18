@@ -2547,7 +2547,7 @@ function formatJobDetails(job: ReturnOnJob): string {
 function formatTimeoutSummary(job: ReturnOnJob): string {
 	if (!job.timeoutAt) return "none";
 	const remaining = job.timeoutAt - Date.now();
-	return remaining <= 0 ? `${nowIso(job.timeoutAt)} (due)` : `${nowIso(job.timeoutAt)} (${formatDuration(remaining)} left)`;
+	return remaining <= 0 ? `due ${formatDuration(-remaining)} ago` : `in ${formatDuration(remaining)}`;
 }
 
 function latestJobActivityAt(job: ReturnOnJob): number {
@@ -2564,17 +2564,23 @@ function latestJobActivityAt(job: ReturnOnJob): number {
 	);
 }
 
+function formatJobStatusBadge(job: ReturnOnJob): string {
+	if (job.status === "active") return "● WAITING";
+	if (job.status === "fired") return "✓ RETURNED";
+	return "× CANCELLED";
+}
+
 function formatJobAgeSummary(job: ReturnOnJob): string {
 	const now = Date.now();
-	return `started ${formatAge(job.createdAt, now)} · active ${formatAge(latestJobActivityAt(job), now)}`;
+	const started = `started ${formatAge(job.createdAt, now)}`;
+	if (job.status === "active") return `${started} · last check ${formatAge(latestJobActivityAt(job), now)}`;
+	if (job.status === "fired") return `${started} · returned ${formatAge(job.lastFiredAt ?? job.firedAt ?? job.updatedAt, now)}`;
+	return `${started} · cancelled ${formatAge(job.cancelledAt ?? job.updatedAt, now)}`;
 }
 
 function formatJobModalLine(job: ReturnOnJob): string {
-	const maxFires = Math.max(1, job.maxFires ?? 1);
-	const fires = maxFires > 1 ? ` fires=${job.fireCount ?? 0}/${maxFires}` : "";
-	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
-	const timeout = job.status === "active" ? ` timeout=${formatTimeoutSummary(job)}` : "";
-	return `${job.id} [${job.status}] ${job.label} · ${formatJobAgeSummary(job)}${timeout}${fires}${handler}`;
+	const timeout = job.status === "active" && job.timeoutAt ? ` · timeout ${formatTimeoutSummary(job)}` : "";
+	return `${formatJobStatusBadge(job)} — ${truncateInline(job.label, 56)} · ${formatJobAgeSummary(job)}${timeout}`;
 }
 
 const RETURN_ON_WAITERS_SORTS = ["status", "updated", "created", "timeout", "label"] as const;
@@ -2622,6 +2628,8 @@ function sortJobsForDisplay(items: ReturnOnJob[], sort: ReturnOnWaitersSort = "s
 
 class ReturnOnWaitersModal implements Component {
 	private scroll = 0;
+	private selectedIndex = 0;
+	private showDetails = false;
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
 	private scope: ReturnOnWaitersScope = "session";
@@ -2636,29 +2644,48 @@ class ReturnOnWaitersModal implements Component {
 	) {}
 
 	handleInput(data: string): void {
+		const visibleJobs = this.visibleJobs();
+		this.clampSelection(visibleJobs.length);
 		const body = this.getCachedBodyLength();
 		const maxScroll = Math.max(0, body - RETURN_ON_MODAL_BODY_LINES);
-		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q") {
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || RETURN_ON_SHORTCUT_ALIASES.some((shortcut) => matchesKey(data, shortcut)) || data === "q") {
 			this.done();
 			return;
 		}
 		if (data === "a") {
 			this.scope = this.scope === "all" ? "session" : "all";
-			this.scroll = 0;
+			this.resetView();
 		} else if (data === "s") {
 			const current = RETURN_ON_WAITERS_SORTS.indexOf(this.sort);
 			this.sort = RETURN_ON_WAITERS_SORTS[(current + 1) % RETURN_ON_WAITERS_SORTS.length];
 			this.sortDescending = defaultSortDescending(this.sort);
-			this.scroll = 0;
+			this.resetView();
 		} else if (data === "r") {
 			this.sortDescending = !this.sortDescending;
-			this.scroll = 0;
-		} else if (matchesKey(data, Key.down) || data === "j") this.scroll = Math.min(maxScroll, this.scroll + 1);
-		else if (matchesKey(data, Key.up) || data === "k") this.scroll = Math.max(0, this.scroll - 1);
-		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("f"))) this.scroll = Math.min(maxScroll, this.scroll + RETURN_ON_MODAL_BODY_LINES - 4);
-		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("b"))) this.scroll = Math.max(0, this.scroll - (RETURN_ON_MODAL_BODY_LINES - 4));
-		else if (matchesKey(data, Key.home)) this.scroll = 0;
-		else if (matchesKey(data, Key.end)) this.scroll = maxScroll;
+			this.resetView();
+		} else if (matchesKey(data, Key.enter) || data === " " || data === "d") {
+			if (visibleJobs.length > 0) this.showDetails = !this.showDetails;
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.down) || data === "j") {
+			this.selectedIndex = Math.min(visibleJobs.length - 1, this.selectedIndex + 1);
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.up) || data === "k") {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("f"))) {
+			this.selectedIndex = Math.min(visibleJobs.length - 1, this.selectedIndex + RETURN_ON_MODAL_BODY_LINES - 6);
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("b"))) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - (RETURN_ON_MODAL_BODY_LINES - 6));
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.home)) {
+			this.selectedIndex = 0;
+			this.ensureSelectedVisible();
+		} else if (matchesKey(data, Key.end)) {
+			this.selectedIndex = Math.max(0, visibleJobs.length - 1);
+			this.ensureSelectedVisible();
+		} else if (data === "J") this.scroll = Math.min(maxScroll, this.scroll + 1);
+		else if (data === "K") this.scroll = Math.max(0, this.scroll - 1);
 		else return;
 		this.invalidate();
 	}
@@ -2667,6 +2694,7 @@ class ReturnOnWaitersModal implements Component {
 		const frameWidth = Math.max(40, width);
 		const innerWidth = Math.max(20, frameWidth - 4);
 		const visibleJobs = this.visibleJobs();
+		this.clampSelection(visibleJobs.length);
 		const activeCount = visibleJobs.filter((job) => job.status === "active").length;
 		const body = this.getBodyLines(innerWidth);
 		const maxScroll = Math.max(0, body.length - RETURN_ON_MODAL_BODY_LINES);
@@ -2674,11 +2702,12 @@ class ReturnOnWaitersModal implements Component {
 		const visibleBody = body.slice(this.scroll, this.scroll + RETURN_ON_MODAL_BODY_LINES);
 		const scopeLabel = this.scope === "all" ? "all sessions" : "this chat";
 		const sortLabel = `${this.sort} ${this.sortDescending ? "desc" : "asc"}`;
-		const title = `${this.theme.fg("accent", "⏰ return_on waiters")} ${this.theme.fg("dim", `${activeCount} active · ${visibleJobs.length} total · ${scopeLabel} · ${sortLabel}`)}`;
+		const selected = visibleJobs.length > 0 ? ` · ${this.selectedIndex + 1}/${visibleJobs.length}` : "";
+		const title = `${this.theme.fg("accent", "⏰ return_on waiters")} ${this.theme.fg("dim", `${activeCount} waiting · ${visibleJobs.length} total · ${scopeLabel} · ${sortLabel}${selected}`)}`;
 		const range = body.length > RETURN_ON_MODAL_BODY_LINES
 			? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + RETURN_ON_MODAL_BODY_LINES)}/${body.length}`
 			: "";
-		const help = this.theme.fg("dim", `a all/this-chat · s sort · r reverse · ↑/↓ scroll · q/Esc close${range}`);
+		const help = this.theme.fg("dim", `↑/↓ select · Enter details · a all/this-chat · s sort · r reverse · q close${range}`);
 		return [
 			this.border("┌", "┐", frameWidth),
 			this.frameLine(title, frameWidth),
@@ -2694,6 +2723,32 @@ class ReturnOnWaitersModal implements Component {
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+	}
+
+	private resetView(): void {
+		this.scroll = 0;
+		this.selectedIndex = 0;
+		this.showDetails = false;
+	}
+
+	private clampSelection(count = this.visibleJobs().length): void {
+		if (count <= 0) {
+			this.selectedIndex = 0;
+			this.showDetails = false;
+			return;
+		}
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, count - 1));
+	}
+
+	private selectedRowLine(): number {
+		return 4 + this.selectedIndex;
+	}
+
+	private ensureSelectedVisible(): void {
+		const row = this.selectedRowLine();
+		if (row < this.scroll) this.scroll = row;
+		else if (row >= this.scroll + RETURN_ON_MODAL_BODY_LINES) this.scroll = row - RETURN_ON_MODAL_BODY_LINES + 1;
+		this.scroll = Math.max(0, this.scroll);
 	}
 
 	private getCachedBodyLength(): number {
@@ -2713,8 +2768,8 @@ class ReturnOnWaitersModal implements Component {
 	private getBodyLines(innerWidth: number): string[] {
 		if (this.cachedLines && this.cachedWidth === innerWidth) return this.cachedLines;
 		const visibleJobs = this.visibleJobs();
-		const activeJobs = visibleJobs.filter((job) => job.status === "active");
-		const inactiveJobs = visibleJobs.filter((job) => job.status !== "active");
+		this.clampSelection(visibleJobs.length);
+		const activeCount = visibleJobs.filter((job) => job.status === "active").length;
 		const lines: string[] = [];
 		const push = (line = "") => lines.push(line);
 		const pushWrapped = (line = "") => {
@@ -2725,41 +2780,43 @@ class ReturnOnWaitersModal implements Component {
 			for (const wrapped of wrapTextWithAnsi(line, innerWidth)) push(wrapped);
 		};
 		pushWrapped(this.theme.fg("dim", `Scope: ${this.scopeDescription()} · sort: ${this.sort} ${this.sortDescending ? "desc" : "asc"}`));
-		pushWrapped(this.theme.fg("dim", "Keys: a toggle all/this-chat · s cycle sort · r reverse sort"));
+		pushWrapped(this.theme.fg("dim", "Keys: ↑/↓ or j/k select · Enter/d details · a scope · s sort · r reverse · Shift+J/K line-scroll"));
 		push("");
-		pushWrapped(this.theme.fg("accent", `Active waiters (${activeJobs.length})`));
-		if (activeJobs.length === 0) {
-			pushWrapped(this.theme.fg("warning", `No active return_on waiters for ${this.scope === "all" ? "any session" : "this chat"}.`));
+		pushWrapped(this.theme.fg("accent", `Waiters (${visibleJobs.length}, ${activeCount} waiting)`));
+		if (visibleJobs.length === 0) {
+			pushWrapped(this.theme.fg("warning", `No return_on waiters for ${this.scope === "all" ? "any session" : "this chat"}.`));
 		} else {
-			activeJobs.forEach((job, index) => {
-				if (index > 0) push("");
-				pushWrapped(this.theme.fg("accent", `${index + 1}. ${job.label}`));
-				pushWrapped(`id/status: ${job.id} / ${job.status}`);
-				pushWrapped(`waiting: ${formatJobWaitSummary(job)}`);
-				pushWrapped(`timeout: ${formatTimeoutSummary(job)}`);
-				pushWrapped(`created: ${nowIso(job.createdAt)} · updated: ${nowIso(job.updatedAt)}`);
-				pushWrapped(`session: ${job.sessionFile ?? "unknown"}`);
-				pushWrapped(`cwd: ${job.cwd}`);
-				if (job.delivery) pushWrapped(`delivery: ${job.delivery.mode} notify=${job.delivery.notify}`);
-				if (job.handlerRunId) pushWrapped(`handler: ${job.handlerRunId}`);
-				const maxFires = Math.max(1, job.maxFires ?? 1);
-				if (maxFires > 1) pushWrapped(`fires: ${job.fireCount ?? 0}/${maxFires}${job.rearmPending ? " (re-arm pending)" : ""}`);
-				pushWrapped("condition tree:");
-				for (const line of formatConditionTree(job.condition).split("\n")) pushWrapped(`  ${line}`);
-				pushWrapped("leaf checks:");
-				for (const line of formatLeafStateLines(job)) pushWrapped(`  - ${line}`);
-				const hooks = formatJobWebhooks(job);
-				if (hooks.length > 0) {
-					pushWrapped("incoming webhooks:");
-					for (const hook of hooks) pushWrapped(`  - ${hook}`);
-				}
-				pushWrapped(`resume: ${job.resume}`);
+			visibleJobs.forEach((job, index) => {
+				const selected = index === this.selectedIndex;
+				const marker = selected ? "›" : " ";
+				const line = `${marker} ${index + 1}. ${formatJobModalLine(job)}`;
+				pushWrapped(selected ? this.theme.fg("accent", line) : line);
 			});
 		}
-		if (inactiveJobs.length > 0) {
+		const selectedJob = visibleJobs[this.selectedIndex];
+		if (selectedJob && this.showDetails) {
 			push("");
-			pushWrapped(this.theme.fg("accent", `Fired/cancelled jobs (${inactiveJobs.length})`));
-			for (const job of inactiveJobs) pushWrapped(`- ${formatJobModalLine(job)} session=${job.sessionFile ?? "unknown"}`);
+			pushWrapped(this.theme.fg("accent", `Details: ${selectedJob.label}`));
+			pushWrapped(`id/state: ${selectedJob.id} / ${formatJobStatusBadge(selectedJob)}`);
+			pushWrapped(`waiting: ${formatJobWaitSummary(selectedJob)}`);
+			pushWrapped(`timeout: ${formatTimeoutSummary(selectedJob)}`);
+			pushWrapped(`${formatJobAgeSummary(selectedJob)} · timeout ${formatTimeoutSummary(selectedJob)}`);
+			pushWrapped(`session: ${selectedJob.sessionFile ?? "unknown"}`);
+			pushWrapped(`cwd: ${selectedJob.cwd}`);
+			if (selectedJob.delivery) pushWrapped(`delivery: ${selectedJob.delivery.mode} notify=${selectedJob.delivery.notify}`);
+			if (selectedJob.handlerRunId) pushWrapped(`handler: ${selectedJob.handlerRunId}`);
+			const maxFires = Math.max(1, selectedJob.maxFires ?? 1);
+			if (maxFires > 1) pushWrapped(`fires: ${selectedJob.fireCount ?? 0}/${maxFires}${selectedJob.rearmPending ? " (re-arm pending)" : ""}`);
+			pushWrapped("condition tree:");
+			for (const line of formatConditionTree(selectedJob.condition).split("\n")) pushWrapped(`  ${line}`);
+			pushWrapped("leaf checks:");
+			for (const line of formatLeafStateLines(selectedJob)) pushWrapped(`  - ${line}`);
+			const hooks = formatJobWebhooks(selectedJob);
+			if (hooks.length > 0) {
+				pushWrapped("incoming webhooks:");
+				for (const hook of hooks) pushWrapped(`  - ${hook}`);
+			}
+			pushWrapped(`resume: ${selectedJob.resume}`);
 		}
 		this.cachedWidth = innerWidth;
 		this.cachedLines = lines;
