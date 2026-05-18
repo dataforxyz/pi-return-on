@@ -2019,6 +2019,22 @@ function closeFdBestEffort(fd: number | undefined): void {
 	}
 }
 
+function fileSizeBytes(filePath: string): number | null {
+	try {
+		return fs.statSync(filePath).size;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function formatHandlerLogPath(label: "Output" | "Errors", filePath: string): string {
+	const size = fileSizeBytes(filePath);
+	if (size === null) return `${label}: unavailable (${filePath}, missing)`;
+	if (label === "Errors" && size === 0) return `${label}: none (${filePath}, 0 B)`;
+	return `${label}: ${filePath} (${size} B)`;
+}
+
 function formatHandlerAck(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
 	return [
 		`return_on fired: ${job.label} (${job.id})`,
@@ -2036,8 +2052,8 @@ function formatHandlerSummary(job: { id: string; label: string }, run: ReturnOnH
 		`return_on handler ${status}: ${job.label} (${job.id})`,
 		`Handler: ${run.id}`,
 		`Exit: ${exit}`,
-		`Output: ${run.stdoutPath}`,
-		`Errors: ${run.stderrPath}`,
+		formatHandlerLogPath("Output", run.stdoutPath),
+		formatHandlerLogPath("Errors", run.stderrPath),
 		"",
 		truncateText(output, HANDLER_SUMMARY_LIMIT_BYTES),
 	].join("\n");
