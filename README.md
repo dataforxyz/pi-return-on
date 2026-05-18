@@ -151,7 +151,7 @@ Common mistakes that will be rejected:
 
 New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours.
 
-Configure these limits in Pi settings (`~/.pi/agent/settings.json` globally or `.pi/settings.json` per project):
+Configure these limits in Pi settings (`$PI_CODING_AGENT_DIR/settings.json` when Pi is running with an isolated agent directory, otherwise `~/.pi/agent/settings.json` globally, or `.pi/settings.json` per project):
 
 ```json
 {
@@ -180,7 +180,7 @@ Use settings to make fork handling the default for real workflows instead of req
 }
 ```
 
-`defaultDeliveryMode` accepts `"wake"` or `"fork"`. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"`. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
+`defaultDeliveryMode` accepts `"wake"` or `"fork"`. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"` and defaults to `"summary"` for fork delivery when unset. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
 
 ## Background fork handlers
 

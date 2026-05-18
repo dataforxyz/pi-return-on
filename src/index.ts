@@ -456,9 +456,15 @@ function parseBooleanSetting(value: unknown, fallback: boolean, name: string): b
 	throw new Error(`${name} must be a boolean`);
 }
 
+function getPiAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR
+		? path.resolve(process.env.PI_CODING_AGENT_DIR)
+		: path.join(os.homedir(), ".pi", "agent");
+}
+
 async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	let settings: ReturnOnSettings = {};
-	for (const file of [path.join(os.homedir(), ".pi", "agent", "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
+	for (const file of [path.join(getPiAgentDir(), "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
 		const parsed = await readJsonObject(expandHome(file));
 		if (isObject(parsed?.returnOn)) settings = { ...settings, ...parsed.returnOn };
 	}
@@ -468,7 +474,7 @@ async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	const defaultTimeoutMs = parsePositiveDurationSetting(defaultSource, DEFAULT_RETURN_ON_TIMEOUT_MS, "returnOn.defaultTimeout");
 	if (defaultTimeoutMs > maxTimeoutMs) throw new Error(`returnOn.defaultTimeout (${formatDuration(defaultTimeoutMs)}) must not exceed returnOn.maxTimeout (${formatDuration(maxTimeoutMs)})`);
 	const defaultDeliveryMode = parseDeliveryModeSetting(process.env.PI_RETURN_ON_DELIVERY_MODE ?? settings.defaultDeliveryMode ?? settings.deliveryMode, "wake", "returnOn.defaultDeliveryMode");
-	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "ack-and-summary", "returnOn.defaultDeliveryNotify");
+	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "summary", "returnOn.defaultDeliveryNotify");
 	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, false, "returnOn.triggerParentOnSummary");
 	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary };
 }
