@@ -1949,6 +1949,22 @@ function buildReturnEventPayload(job: ReturnOnJob, reason: string, run: ReturnOn
 	};
 }
 
+function handlerParentNotificationLines(run: Pick<ReturnOnHandlerRun, "notify" | "triggerParentOnSummary">): string[] {
+	const notify = run.notify ?? "summary";
+	if (notify === "none") {
+		return [
+			"Parent notification mode: none",
+			"Your final response is stored in handler logs only and will not be automatically posted to the parent transcript/context.",
+		];
+	}
+	return [
+		`Parent notification mode: ${notify}`,
+		`Your final response WILL be copied into the parent transcript/context${run.triggerParentOnSummary ? " and will trigger a parent turn" : ""}.`,
+		...(notify === "ack-and-summary" ? ["The parent already received a launch ack; do not repeat startup details unless relevant."] : []),
+		"Keep the final response concise. If you already sent an intercom message to the parent, do not repeat its full content; just note that you escalated it.",
+	];
+}
+
 function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun, eventJson: string): string {
 	const parentContact = run.parentIntercomTarget
 		? `Parent intercom target, if pi-intercom is available: ${run.parentIntercomTarget}`
@@ -1967,7 +1983,8 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		"- If pi-intercom is available and a parent target is provided, use intercom.send for non-blocking progress, blocker, or escalation notices.",
 		"- Use intercom.ask only when you cannot safely continue without a parent decision; it blocks this handler until reply or timeout.",
 		"- If you do contact the parent, keep it brief and include the handler id.",
-		"- Prefer producing a concise final summary. The return_on extension will relay that final output to the parent session.",
+		"- Prefer producing a concise final summary.",
+		...handlerParentNotificationLines(run).map((line) => `- ${line}`),
 		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting for an external event.",
 		"- Never wait for this handler's own pid or status. If return_on_handlers shows this handler as running, that is expected while you are executing; summarize that observation instead of waiting.",
 		"",
@@ -1994,6 +2011,7 @@ function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
 		"If pi-intercom is available, use intercom.send for non-blocking parent notices and intercom.ask only for true blocking parent decisions.",
 		...(run.parentIntercomTarget ? [`Parent intercom target: ${run.parentIntercomTarget}`] : []),
+		...handlerParentNotificationLines(run),
 		`Handler id: ${run.id}`,
 	].join("\n");
 }
