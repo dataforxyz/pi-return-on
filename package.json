@@ -23,6 +23,14 @@
     "test": "npm run typecheck && npm run test:direct-wait-tools && npm run test:scan-direct-waits && npm run smoke",
     "audit:direct-waits": "node scripts/scan-direct-waits.mjs"
   },
+  "peerDependencies": {
+    "pi-forks": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "pi-forks": {
+      "optional": true
+    }
+  },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
     "@earendil-works/pi-coding-agent": "^0.74.0",

@@ -6,13 +6,17 @@ import { spawn } from "node:child_process";
 import * as net from "node:net";
 import * as http from "node:http";
 import { randomBytes } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
 
 const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
+const RETURN_ON_SHORTCUT = Key.ctrlAlt("w");
+const RETURN_ON_SHORTCUT_LABEL = "Ctrl+Alt+W";
+const RETURN_ON_MODAL_BODY_LINES = 28;
 const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
 const FIRED_DIR = path.join(STATE_DIR, "fired");
@@ -2010,15 +2014,6 @@ async function readOptionalText(filePath: string): Promise<string> {
 	}
 }
 
-function closeFdBestEffort(fd: number | undefined): void {
-	if (fd === undefined) return;
-	try {
-		fs.closeSync(fd);
-	} catch {
-		// Best effort cleanup; the child owns duplicated stdio fds after spawn succeeds.
-	}
-}
-
 function formatHandlerAck(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
 	return [
 		`return_on fired: ${job.label} (${job.id})`,
@@ -2139,9 +2134,8 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig): Promise<boolean> {
 	await loadHandlers();
 	const id = makeHandlerId(job);
-	const dir = path.join(HANDLERS_DIR, id);
 	const run: ReturnOnHandlerRun = {
-		id,
+		...buildForkRunPaths("return_on", id),
 		jobId: job.id,
 		label: job.label,
 		cwd: job.cwd,
@@ -2151,12 +2145,6 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		...(resolveParentIntercomTarget(pi) ? { parentIntercomTarget: resolveParentIntercomTarget(pi) } : {}),
 		status: "starting",
 		startedAt: Date.now(),
-		dir,
-		eventPath: path.join(dir, "event.json"),
-		promptPath: path.join(dir, "prompt.md"),
-		stdoutPath: path.join(dir, "stdout.log"),
-		stderrPath: path.join(dir, "stderr.log"),
-		sessionDir: path.join(dir, "sessions"),
 		notify: delivery.notify,
 		triggerParentOnSummary: delivery.triggerParentOnSummary,
 	};
@@ -2171,59 +2159,35 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 
 	const command = getHandlerCommand(delivery);
 	const args = buildHandlerArgs(job, run);
-	let stdoutFd: number | undefined;
-	let stderrFd: number | undefined;
 	try {
-		stdoutFd = fs.openSync(run.stdoutPath, "a");
-		stderrFd = fs.openSync(run.stderrPath, "a");
-		const child = spawn(command, args, {
+		const launch = await launchDetachedFork({
+			command,
+			args,
 			cwd: job.cwd,
-			detached: true,
-			env: {
+			stdoutPath: run.stdoutPath,
+			stderrPath: run.stderrPath,
+			env: buildForkHandlerEnv("return_on", run.id, {
 				...process.env,
-				PI_RETURN_ON_HANDLER: "1",
-				PI_RETURN_ON_HANDLER_RUN_ID: run.id,
 				...(job.sessionFile ? { PI_RETURN_ON_PARENT_SESSION_FILE: job.sessionFile } : {}),
+			}),
+			onClose: (code, signal) => {
+				void markHandlerFinished(pi, job, run.id, code, signal, delivery.notify, delivery.triggerParentOnSummary).catch((error) => {
+					console.error(`[${EXTENSION_NAME}] Failed to finish handler ${run.id}:`, error);
+				});
 			},
-			stdio: ["ignore", stdoutFd, stderrFd],
 		});
-		closeFdBestEffort(stdoutFd);
-		closeFdBestEffort(stderrFd);
-		stdoutFd = undefined;
-		stderrFd = undefined;
-		child.unref();
-
-		let launchError: unknown;
-		const spawned = await new Promise<boolean>((resolve) => {
-			const onSpawn = () => {
-				child.off("error", onError);
-				resolve(true);
-			};
-			const onError = (error: Error) => {
-				launchError = error;
-				child.off("spawn", onSpawn);
-				resolve(false);
-			};
-			child.once("spawn", onSpawn);
-			child.once("error", onError);
-		});
-		if (!spawned) {
+		if (!launch.ok) {
 			run.status = "failed";
 			run.endedAt = Date.now();
-			run.error = launchError instanceof Error ? launchError.message : String(launchError);
+			run.error = launch.error instanceof Error ? launch.error.message : String(launch.error);
 			await saveHandlers();
-			console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, launchError);
+			console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, launch.error);
 			return false;
 		}
 
-		run.pid = child.pid;
+		run.pid = launch.pid;
 		run.status = "running";
 		await saveHandlers();
-		child.once("close", (code, signal) => {
-			void markHandlerFinished(pi, job, run.id, code, signal, delivery.notify, delivery.triggerParentOnSummary).catch((error) => {
-				console.error(`[${EXTENSION_NAME}] Failed to finish handler ${run.id}:`, error);
-			});
-		});
 		if (delivery.notify === "ack-and-summary") {
 			pi.sendMessage(
 				{
@@ -2237,8 +2201,6 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		}
 		return true;
 	} catch (error) {
-		closeFdBestEffort(stdoutFd);
-		closeFdBestEffort(stderrFd);
 		run.status = "failed";
 		run.endedAt = Date.now();
 		run.error = error instanceof Error ? error.message : String(error);
@@ -2412,13 +2374,14 @@ function formatJobWaitSummary(job: ReturnOnJob): string {
 }
 
 function formatStatusTag(active: ReturnOnJob[]): string {
+	const hint = ` · ${RETURN_ON_SHORTCUT_LABEL}`;
 	if (active.length === 1) {
 		const job = active[0];
-		return `⏰ ${truncateInline(job.label, 22)} · ${truncateInline(formatJobWaitSummary(job), 48)}`;
+		return `⏰ ${truncateInline(job.label, 22)} · ${truncateInline(formatJobWaitSummary(job), 48)}${hint}`;
 	}
 	const labels = active.slice(0, 3).map((job) => truncateInline(job.label, 16)).join(" · ");
 	const more = active.length > 3 ? ` +${active.length - 3}` : "";
-	return `⏰ ${active.length} waiting: ${labels}${more}`;
+	return `⏰ ${active.length} waiting: ${labels}${more}${hint}`;
 }
 
 function pollingIntervalForLeaf(job: ReturnOnJob, condition: LeafCondition): number | undefined {
@@ -2523,6 +2486,247 @@ function formatJobDetails(job: ReturnOnJob): string {
 	return lines.join("\n");
 }
 
+function formatTimeoutSummary(job: ReturnOnJob): string {
+	if (!job.timeoutAt) return "none";
+	const remaining = job.timeoutAt - Date.now();
+	return remaining <= 0 ? `${nowIso(job.timeoutAt)} (due)` : `${nowIso(job.timeoutAt)} (${formatDuration(remaining)} left)`;
+}
+
+function formatJobModalLine(job: ReturnOnJob): string {
+	const maxFires = Math.max(1, job.maxFires ?? 1);
+	const fires = maxFires > 1 ? ` fires=${job.fireCount ?? 0}/${maxFires}` : "";
+	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
+	const timeout = job.status === "active" ? ` timeout=${formatTimeoutSummary(job)}` : "";
+	return `${job.id} [${job.status}] ${job.label}${timeout}${fires}${handler}`;
+}
+
+const RETURN_ON_WAITERS_SORTS = ["status", "updated", "created", "timeout", "label"] as const;
+type ReturnOnWaitersSort = typeof RETURN_ON_WAITERS_SORTS[number];
+type ReturnOnWaitersScope = "all" | "session";
+
+function statusRank(job: ReturnOnJob): number {
+	return job.status === "active" ? 0 : job.status === "fired" ? 1 : 2;
+}
+
+function defaultSortDescending(sort: ReturnOnWaitersSort): boolean {
+	return sort === "updated" || sort === "created";
+}
+
+function compareOptionalNumber(a: number | undefined, b: number | undefined): number {
+	if (a === undefined && b === undefined) return 0;
+	if (a === undefined) return 1;
+	if (b === undefined) return -1;
+	return a - b;
+}
+
+function compareJobsForSort(a: ReturnOnJob, b: ReturnOnJob, sort: ReturnOnWaitersSort): number {
+	switch (sort) {
+		case "status": {
+			const byStatus = statusRank(a) - statusRank(b);
+			return byStatus !== 0 ? byStatus : (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt);
+		}
+		case "updated":
+			return (a.updatedAt ?? a.createdAt) - (b.updatedAt ?? b.createdAt);
+		case "created":
+			return a.createdAt - b.createdAt;
+		case "timeout":
+			return compareOptionalNumber(a.timeoutAt, b.timeoutAt);
+		case "label":
+			return a.label.localeCompare(b.label);
+	}
+}
+
+function sortJobsForDisplay(items: ReturnOnJob[], sort: ReturnOnWaitersSort = "status", descending = defaultSortDescending(sort)): ReturnOnJob[] {
+	return [...items].sort((a, b) => {
+		const result = compareJobsForSort(a, b, sort) || a.id.localeCompare(b.id);
+		return descending ? -result : result;
+	});
+}
+
+class ReturnOnWaitersModal implements Component {
+	private scroll = 0;
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
+	private scope: ReturnOnWaitersScope = "session";
+	private sort: ReturnOnWaitersSort = "status";
+	private sortDescending = defaultSortDescending(this.sort);
+
+	constructor(
+		private readonly allJobs: ReturnOnJob[],
+		private readonly session: string | undefined,
+		private readonly theme: Theme,
+		private readonly done: () => void,
+	) {}
+
+	handleInput(data: string): void {
+		const body = this.getCachedBodyLength();
+		const maxScroll = Math.max(0, body - RETURN_ON_MODAL_BODY_LINES);
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q") {
+			this.done();
+			return;
+		}
+		if (data === "a") {
+			this.scope = this.scope === "all" ? "session" : "all";
+			this.scroll = 0;
+		} else if (data === "s") {
+			const current = RETURN_ON_WAITERS_SORTS.indexOf(this.sort);
+			this.sort = RETURN_ON_WAITERS_SORTS[(current + 1) % RETURN_ON_WAITERS_SORTS.length];
+			this.sortDescending = defaultSortDescending(this.sort);
+			this.scroll = 0;
+		} else if (data === "r") {
+			this.sortDescending = !this.sortDescending;
+			this.scroll = 0;
+		} else if (matchesKey(data, Key.down) || data === "j") this.scroll = Math.min(maxScroll, this.scroll + 1);
+		else if (matchesKey(data, Key.up) || data === "k") this.scroll = Math.max(0, this.scroll - 1);
+		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("f"))) this.scroll = Math.min(maxScroll, this.scroll + RETURN_ON_MODAL_BODY_LINES - 4);
+		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("b"))) this.scroll = Math.max(0, this.scroll - (RETURN_ON_MODAL_BODY_LINES - 4));
+		else if (matchesKey(data, Key.home)) this.scroll = 0;
+		else if (matchesKey(data, Key.end)) this.scroll = maxScroll;
+		else return;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		const frameWidth = Math.max(40, width);
+		const innerWidth = Math.max(20, frameWidth - 4);
+		const visibleJobs = this.visibleJobs();
+		const activeCount = visibleJobs.filter((job) => job.status === "active").length;
+		const body = this.getBodyLines(innerWidth);
+		const maxScroll = Math.max(0, body.length - RETURN_ON_MODAL_BODY_LINES);
+		this.scroll = Math.min(this.scroll, maxScroll);
+		const visibleBody = body.slice(this.scroll, this.scroll + RETURN_ON_MODAL_BODY_LINES);
+		const scopeLabel = this.scope === "all" ? "all sessions" : "this chat";
+		const sortLabel = `${this.sort} ${this.sortDescending ? "desc" : "asc"}`;
+		const title = `${this.theme.fg("accent", "⏰ return_on waiters")} ${this.theme.fg("dim", `${activeCount} active · ${visibleJobs.length} total · ${scopeLabel} · ${sortLabel}`)}`;
+		const range = body.length > RETURN_ON_MODAL_BODY_LINES
+			? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + RETURN_ON_MODAL_BODY_LINES)}/${body.length}`
+			: "";
+		const help = this.theme.fg("dim", `a all/this-chat · s sort · r reverse · ↑/↓ scroll · q/Esc close${range}`);
+		return [
+			this.border("┌", "┐", frameWidth),
+			this.frameLine(title, frameWidth),
+			this.border("├", "┤", frameWidth),
+			...visibleBody.map((line) => this.frameLine(line, frameWidth)),
+			...(visibleBody.length === 0 ? [this.frameLine("", frameWidth)] : []),
+			this.border("├", "┤", frameWidth),
+			this.frameLine(help, frameWidth),
+			this.border("└", "┘", frameWidth),
+		];
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+
+	private getCachedBodyLength(): number {
+		return this.cachedLines?.length ?? 0;
+	}
+
+	private visibleJobs(): ReturnOnJob[] {
+		const scoped = this.scope === "all" ? this.allJobs : this.allJobs.filter((job) => jobVisibleForSession(job, this.session));
+		return sortJobsForDisplay(scoped, this.sort, this.sortDescending);
+	}
+
+	private scopeDescription(): string {
+		if (this.scope === "all") return "all sessions";
+		return this.session ? `this chat (${this.session})` : "this chat (unsaved session)";
+	}
+
+	private getBodyLines(innerWidth: number): string[] {
+		if (this.cachedLines && this.cachedWidth === innerWidth) return this.cachedLines;
+		const visibleJobs = this.visibleJobs();
+		const activeJobs = visibleJobs.filter((job) => job.status === "active");
+		const inactiveJobs = visibleJobs.filter((job) => job.status !== "active");
+		const lines: string[] = [];
+		const push = (line = "") => lines.push(line);
+		const pushWrapped = (line = "") => {
+			if (!line) {
+				push("");
+				return;
+			}
+			for (const wrapped of wrapTextWithAnsi(line, innerWidth)) push(wrapped);
+		};
+		pushWrapped(this.theme.fg("dim", `Scope: ${this.scopeDescription()} · sort: ${this.sort} ${this.sortDescending ? "desc" : "asc"}`));
+		pushWrapped(this.theme.fg("dim", "Keys: a toggle all/this-chat · s cycle sort · r reverse sort"));
+		push("");
+		pushWrapped(this.theme.fg("accent", `Active waiters (${activeJobs.length})`));
+		if (activeJobs.length === 0) {
+			pushWrapped(this.theme.fg("warning", `No active return_on waiters for ${this.scope === "all" ? "any session" : "this chat"}.`));
+		} else {
+			activeJobs.forEach((job, index) => {
+				if (index > 0) push("");
+				pushWrapped(this.theme.fg("accent", `${index + 1}. ${job.label}`));
+				pushWrapped(`id/status: ${job.id} / ${job.status}`);
+				pushWrapped(`waiting: ${formatJobWaitSummary(job)}`);
+				pushWrapped(`timeout: ${formatTimeoutSummary(job)}`);
+				pushWrapped(`created: ${nowIso(job.createdAt)} · updated: ${nowIso(job.updatedAt)}`);
+				pushWrapped(`session: ${job.sessionFile ?? "unknown"}`);
+				pushWrapped(`cwd: ${job.cwd}`);
+				if (job.delivery) pushWrapped(`delivery: ${job.delivery.mode} notify=${job.delivery.notify}`);
+				if (job.handlerRunId) pushWrapped(`handler: ${job.handlerRunId}`);
+				const maxFires = Math.max(1, job.maxFires ?? 1);
+				if (maxFires > 1) pushWrapped(`fires: ${job.fireCount ?? 0}/${maxFires}${job.rearmPending ? " (re-arm pending)" : ""}`);
+				pushWrapped("condition tree:");
+				for (const line of formatConditionTree(job.condition).split("\n")) pushWrapped(`  ${line}`);
+				pushWrapped("leaf checks:");
+				for (const line of formatLeafStateLines(job)) pushWrapped(`  - ${line}`);
+				const hooks = formatJobWebhooks(job);
+				if (hooks.length > 0) {
+					pushWrapped("incoming webhooks:");
+					for (const hook of hooks) pushWrapped(`  - ${hook}`);
+				}
+				pushWrapped(`resume: ${job.resume}`);
+			});
+		}
+		if (inactiveJobs.length > 0) {
+			push("");
+			pushWrapped(this.theme.fg("accent", `Fired/cancelled jobs (${inactiveJobs.length})`));
+			for (const job of inactiveJobs) pushWrapped(`- ${formatJobModalLine(job)} session=${job.sessionFile ?? "unknown"}`);
+		}
+		this.cachedWidth = innerWidth;
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	private border(left: string, right: string, width: number): string {
+		return `${left}${"─".repeat(Math.max(0, width - 2))}${right}`;
+	}
+
+	private frameLine(content: string, width: number): string {
+		const innerWidth = Math.max(1, width - 4);
+		const text = truncateToWidth(content, innerWidth, "…");
+		const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(text)));
+		return `│ ${text}${padding} │`;
+	}
+}
+
+async function showWaitersModal(ctx: ExtensionContext): Promise<void> {
+	latestCtx = ctx;
+	currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+	await loadJobs();
+	const session = ctx.sessionManager.getSessionFile() ?? undefined;
+	const allJobs = sortJobsForDisplay(jobs, "status");
+	if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
+		ctx.ui.notify(allJobs.length ? allJobs.map(summarizeJob).join("\n") : "No return_on jobs.", "info");
+		return;
+	}
+	await ctx.ui.custom<void>(
+		(_tui, theme, _keybindings, done) => new ReturnOnWaitersModal(allJobs, session, theme, done),
+		{
+			overlay: true,
+			overlayOptions: {
+				width: "90%",
+				minWidth: 60,
+				maxHeight: "85%",
+				anchor: "center",
+				margin: 1,
+			},
+		},
+	);
+	updateStatus(ctx);
+}
+
 function jobVisibleForSession(job: ReturnOnJob, session: string | undefined): boolean {
 	return !session || !job.sessionFile || job.sessionFile === session;
 }
@@ -2573,6 +2777,10 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerMessageRenderer?.(HANDLER_MESSAGE_TYPE, (message, _options, theme) => {
 		return new Text(theme.fg("accent", "⏰ return_on handler\n") + message.content, 0, 0);
+	});
+	pi.registerShortcut?.(RETURN_ON_SHORTCUT, {
+		description: "Show return_on waiters and condition details",
+		handler: showWaitersModal,
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -2648,6 +2856,13 @@ export default function (pi: ExtensionAPI) {
 			const relevant = jobs.filter((job) => jobVisibleForSession(job, session));
 			const text = relevant.length ? relevant.map(summarizeJob).join("\n") : "No return_on jobs for this session.";
 			ctx.ui.notify(text, "info");
+		},
+	});
+
+	pi.registerCommand("return-on-waiters", {
+		description: `Open the return_on waiters modal (${RETURN_ON_SHORTCUT_LABEL})`,
+		handler: async (_args, ctx) => {
+			await showWaitersModal(ctx);
 		},
 	});
 

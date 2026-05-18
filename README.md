@@ -29,6 +29,7 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 Slash commands:
 
 - `/return-on-list`
+- `/return-on-waiters` (same detail view as `Ctrl+Alt+W`)
 - `/return-on-status <id>`
 - `/return-on-cancel <id>`
 - `/return-on-handlers`
@@ -39,7 +40,8 @@ Slash commands:
 
 Visibility:
 
-- Active waits update the Pi status footer with compact tags such as `⏰ build · port 127.0.0.1:3000 open` or `⏰ 2 waiting: build · render`.
+- Active waits update the Pi status footer with compact tags such as `⏰ build · port 127.0.0.1:3000 open · Ctrl+Alt+W` or `⏰ 2 waiting: build · render · Ctrl+Alt+W`.
+- Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a scrollable modal for this chat with active waiters, condition trees, leaf-check state, timeouts, delivery/handler metadata, webhooks, resume instructions, and fired/cancelled jobs. In the modal, press `a` to toggle this chat vs all sessions, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), and `r` to reverse sort order.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
 - The `return_on` registration result includes a `Waiting for:` line so the agent and user can immediately verify the watcher target.
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
