@@ -31,6 +31,16 @@ test("compacts routine return_on handler receipts while preserving lookup pointe
 	assert.ok(compacted.content.length < receipt.content.length);
 });
 
+test("does not recompact already compacted return_on handler receipts", () => {
+	const compacted = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler receipt (compacted for model context; routine success).\nHandler: roh_123\nOutput: /tmp/out.log (10 B)",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([compacted]), [compacted]);
+});
+
 test("does not compact failed return_on handler receipts", () => {
 	const failed = {
 		role: "custom",
