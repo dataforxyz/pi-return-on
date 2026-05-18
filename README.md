@@ -77,7 +77,7 @@ Diagnostics:
   "every": "2s",
   "timeout": "10m",
   "webhook": "https://example.com/pi-return-on-hook",
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" },
+  "delivery": { "mode": "fork", "notify": "summary" },
   "endTurn": true,
   "allowExec": false
 }
@@ -172,7 +172,7 @@ Use settings to make fork handling the default for real workflows instead of req
 {
   "returnOn": {
     "defaultDeliveryMode": "fork",
-    "defaultDeliveryNotify": "ack-and-summary",
+    "defaultDeliveryNotify": "summary",
     "triggerParentOnSummary": false
   }
 }
@@ -188,18 +188,18 @@ Legacy delivery wakes the same parent session with `triggerTurn: true`. For even
 
 ```json
 {
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+  "delivery": { "mode": "fork", "notify": "summary" }
 }
 ```
 
-When the watcher fires, the extension writes an event capsule under `~/.local/state/pi-return-on/handlers/<id>/`, starts a sibling/background Pi process, and posts a brief ack plus final handler summary back into the parent transcript. If the sibling process cannot launch, delivery falls back to waking the parent session so the event is not lost. On later session starts, stale `starting`/`running` handler entries are reconciled from pid liveness plus stdout/stderr logs and any missed summary is emitted according to the stored notify policy. By default it can fork the parent session for context; when `endTurn:false` keeps the parent turn active, the handler uses the capsule-only prompt to avoid inheriting live parent work. The handler inherits normal Pi extension discovery, so tools such as `subagent(...)` and `intercom(...)` are available when they are installed for top-level Pi sessions.
+When the watcher fires, the extension writes an event capsule under `~/.local/state/pi-return-on/handlers/<id>/`, starts a sibling/background Pi process, and posts the final handler summary back into the parent transcript. If the sibling process cannot launch, delivery falls back to waking the parent session so the event is not lost. On later session starts, stale `starting`/`running` handler entries are reconciled from pid liveness plus stdout/stderr logs and any missed summary is emitted according to the stored notify policy. By default it can fork the parent session for context; when `endTurn:false` keeps the parent turn active, the handler uses the capsule-only prompt to avoid inheriting live parent work. The handler inherits normal Pi extension discovery, so tools such as `subagent(...)` and `intercom(...)` are available when they are installed for top-level Pi sessions.
 
 If pi-intercom is available, the handler prompt includes the parent intercom target and an explicit delegated-authority policy. The handler may answer or act directly when the needed response is derivable from the event, inherited context, repo state, or prior user instructions. It should escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence. Use `intercom.send` for non-blocking progress, blocker, or escalation notices; use `intercom.ask` only when a parent decision is required and the handler cannot safely continue without it. Routine completion should still be returned as the final handler summary.
 
 Useful delivery options:
 
+- `notify: "summary"` — only post the final summary; this is the default for fork delivery.
 - `notify: "ack-and-summary"` — post launch ack and final summary.
-- `notify: "summary"` — only post the final summary.
 - `notify: "none"` — keep handler output in its handler directory only.
 - `triggerParentOnSummary: true` — make the final summary trigger a parent turn; default is display-only.
 - `piCommand` — override the `pi` executable path for testing or custom installs. `PI_RETURN_ON_PI_BIN` also works.
@@ -224,7 +224,7 @@ npm test > .return-on/test.log 2>&1 & echo $! > .return-on/test.pid
   "label": "test process finished",
   "condition": { "type": "process", "pid": 12345, "exited": true },
   "resume": "The test process exited. Inspect .return-on/test.log and summarize failures or success.",
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" },
+  "delivery": { "mode": "fork", "notify": "summary" },
   "endTurn": false
 }
 ```
@@ -256,7 +256,7 @@ For failure-first routing, use `any` with separate marker conditions and let the
     ]
   },
   "resume": "Triage the worker log marker. If it is routine, summarize; if blocked or risky, escalate with the smallest needed question.",
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+  "delivery": { "mode": "fork", "notify": "summary" }
 }
 ```
 
@@ -269,7 +269,7 @@ For failure-first routing, use `any` with separate marker conditions and let the
   "label": "review subagent result ready",
   "condition": { "type": "file", "path": "/tmp/pi-subagents-user/results/review-run.json", "exists": true },
   "resume": "A review subagent result file is ready. Read it, extract the decision and blockers, and report only the relevant summary.",
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+  "delivery": { "mode": "fork", "notify": "summary" }
 }
 ```
 
@@ -314,7 +314,7 @@ Use incoming webhooks for CI, deploy providers, remote machines, or humans click
   "label": "CI callback",
   "condition": { "type": "webhook", "bodyMatches": "success|failure|cancelled" },
   "resume": "CI called back. Inspect the payload and linked logs if present; summarize status and next action.",
-  "delivery": { "mode": "fork", "notify": "ack-and-summary" }
+  "delivery": { "mode": "fork", "notify": "summary" }
 }
 ```
 
