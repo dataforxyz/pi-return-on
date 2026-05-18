@@ -1086,7 +1086,7 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary">): DeliveryConfig {
 	const base: DeliveryConfig = {
 		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake"),
-		notify: config?.defaultDeliveryNotify ?? "ack-and-summary",
+		notify: config?.defaultDeliveryNotify ?? "summary",
 		triggerParentOnSummary: config?.triggerParentOnSummary ?? process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
 	};
 	if (input === undefined || input === null || input === false) return base;
