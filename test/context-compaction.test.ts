@@ -51,6 +51,26 @@ test("does not compact return_on handler receipts with non-empty stderr", () => 
 	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
 });
 
+test("does not compact return_on handler receipts with later actionable blocker lines", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: [
+			"return_on handler completed: build watcher",
+			"Handler: roh_123",
+			"Exit: 0",
+			"Output: /tmp/out.log (10 B)",
+			"Errors: none (/tmp/err.log, 0 B)",
+			"Routine line one.",
+			"Routine line two.",
+			"Routine line three.",
+			"BLOCKED: needs parent decision before continuing.",
+		].join("\n"),
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
+});
+
 test("does not recompact already compacted return_on handler receipts", () => {
 	const compacted = {
 		role: "custom",
