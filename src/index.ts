@@ -15,6 +15,7 @@ import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fo
 const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
 const RETURN_ON_SHORTCUT = Key.ctrlAlt("w");
+const RETURN_ON_SHORTCUT_ALIASES = [RETURN_ON_SHORTCUT, Key.altCtrl("w")];
 const RETURN_ON_SHORTCUT_LABEL = "Ctrl+Alt+W";
 const RETURN_ON_MODAL_BODY_LINES = 28;
 const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
@@ -502,6 +503,13 @@ function formatDuration(ms: number): string {
 	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
 	if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
 	return `${Math.round(ms / 86_400_000)}d`;
+}
+
+function formatAge(timestamp: number | undefined, now = Date.now()): string {
+	if (!timestamp) return "unknown";
+	const delta = now - timestamp;
+	if (Math.abs(delta) < 1000) return "just now";
+	return delta >= 0 ? `${formatDuration(delta)} ago` : `in ${formatDuration(-delta)}`;
 }
 
 function parseShellSleepDurationMs(value: string, unit = "s"): number | undefined {
@@ -2492,12 +2500,31 @@ function formatTimeoutSummary(job: ReturnOnJob): string {
 	return remaining <= 0 ? `${nowIso(job.timeoutAt)} (due)` : `${nowIso(job.timeoutAt)} (${formatDuration(remaining)} left)`;
 }
 
+function latestJobActivityAt(job: ReturnOnJob): number {
+	const leafChecks = Object.values(job.leafState).map((state) => state.lastCheckAt ?? 0);
+	const latchTimes = Object.values(job.latches).map((latch) => latch.trueAt);
+	return Math.max(
+		job.updatedAt ?? 0,
+		job.lastFiredAt ?? 0,
+		job.firedAt ?? 0,
+		job.cancelledAt ?? 0,
+		...leafChecks,
+		...latchTimes,
+		job.createdAt,
+	);
+}
+
+function formatJobAgeSummary(job: ReturnOnJob): string {
+	const now = Date.now();
+	return `started ${formatAge(job.createdAt, now)} · active ${formatAge(latestJobActivityAt(job), now)}`;
+}
+
 function formatJobModalLine(job: ReturnOnJob): string {
 	const maxFires = Math.max(1, job.maxFires ?? 1);
 	const fires = maxFires > 1 ? ` fires=${job.fireCount ?? 0}/${maxFires}` : "";
 	const handler = job.handlerRunId ? ` handler=${job.handlerRunId}` : "";
 	const timeout = job.status === "active" ? ` timeout=${formatTimeoutSummary(job)}` : "";
-	return `${job.id} [${job.status}] ${job.label}${timeout}${fires}${handler}`;
+	return `${job.id} [${job.status}] ${job.label} · ${formatJobAgeSummary(job)}${timeout}${fires}${handler}`;
 }
 
 const RETURN_ON_WAITERS_SORTS = ["status", "updated", "created", "timeout", "label"] as const;
@@ -2778,10 +2805,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer?.(HANDLER_MESSAGE_TYPE, (message, _options, theme) => {
 		return new Text(theme.fg("accent", "⏰ return_on handler\n") + message.content, 0, 0);
 	});
-	pi.registerShortcut?.(RETURN_ON_SHORTCUT, {
-		description: "Show return_on waiters and condition details",
-		handler: showWaitersModal,
-	});
+	for (const shortcut of RETURN_ON_SHORTCUT_ALIASES) {
+		pi.registerShortcut?.(shortcut, {
+			description: shortcut === RETURN_ON_SHORTCUT
+				? "Show return_on waiters and condition details"
+				: `Show return_on waiters and condition details (${RETURN_ON_SHORTCUT_LABEL} alias)`,
+			handler: showWaitersModal,
+		});
+	}
 
 	pi.on("before_agent_start", async (event) => {
 		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
