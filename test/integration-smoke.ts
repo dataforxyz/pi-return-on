@@ -44,6 +44,13 @@ const projectSettingsPath = path.join(projectSettingsDir, "settings.json");
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const allJobIds: string[] = [];
 
+async function withUserAgentSettings(settings: unknown, fn: () => Promise<void>): Promise<void> {
+  const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-agent-dir-"));
+  await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify(settings, null, 2), "utf8");
+  await withEnv({ PI_CODING_AGENT_DIR: agentDir }, fn);
+  await fs.rm(agentDir, { recursive: true, force: true });
+}
+
 async function withProjectSettings(settings: unknown, fn: () => Promise<void>): Promise<void> {
   let previous: string | undefined;
   try {
@@ -355,10 +362,12 @@ async function testForkDelivery(harness: Harness) {
     const handlerMessages = harness.messages.filter((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId);
     const ack = handlerMessages.find((entry) => entry.message?.details?.status === "running");
     const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
-    if (ack && summary) {
-      if (ack.options?.triggerTurn !== false) throw new Error("fork delivery ack should not trigger parent turn");
+    if (summary) {
+      if (ack) throw new Error("fork delivery should default to summary-only without a launch ack");
       if (summary.options?.triggerTurn !== false) throw new Error("fork delivery summary should not trigger parent turn by default");
-      if (!String(summary.message?.content ?? "").includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
+      const summaryContent = String(summary.message?.content ?? "");
+      if (!summaryContent.includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
+      if (!summaryContent.includes("Output:") || !summaryContent.includes("Errors: none")) throw new Error("fork delivery summary missed log pointers");
       const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
       const systemPromptIndex = args.indexOf("--append-system-prompt");
       if (systemPromptIndex === -1) throw new Error("fork delivery did not pass a handler system prompt");
@@ -984,6 +993,35 @@ async function testDefaultTimeoutAndMax(harness: Harness) {
 
 async function testDefaultDeliverySettings(harness: Harness) {
   await withEnv({ PI_RETURN_ON_DELIVERY_MODE: undefined, PI_RETURN_ON_DELIVERY_NOTIFY: undefined, PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY: undefined }, async () => {
+    const explicitForkResult = await harness.callTool("return_on", {
+      label: "smoke explicit fork default notify",
+      condition: { type: "timer", after: "1h" },
+      timeout: "5s",
+      delivery: { mode: "fork" },
+      resume: "explicit fork default notify resume",
+    });
+    const explicitForkJob = explicitForkResult.details.job;
+    allJobIds.push(explicitForkJob.id as string);
+    if (explicitForkJob.delivery?.mode !== "fork" || explicitForkJob.delivery?.notify !== "summary") {
+      throw new Error(`explicit fork delivery did not default notify to summary: ${JSON.stringify(explicitForkJob.delivery)}`);
+    }
+    await harness.cancel(explicitForkJob.id as string);
+
+    await withUserAgentSettings({ returnOn: { defaultDeliveryMode: "fork", defaultDeliveryNotify: "none", triggerParentOnSummary: true } }, async () => {
+      const result = await harness.callTool("return_on", {
+        label: "smoke isolated agent dir fork delivery",
+        condition: { type: "timer", after: "1h" },
+        timeout: "5s",
+        resume: "isolated agent dir fork delivery resume",
+      });
+      const job = result.details.job;
+      allJobIds.push(job.id as string);
+      if (job.delivery?.mode !== "fork" || job.delivery?.notify !== "none" || job.delivery?.triggerParentOnSummary !== true) {
+        throw new Error(`PI_CODING_AGENT_DIR settings default delivery was not applied: ${JSON.stringify(job.delivery)}`);
+      }
+      await harness.cancel(job.id as string);
+    });
+
     await withProjectSettings({ returnOn: { defaultDeliveryMode: "fork", defaultDeliveryNotify: "summary", triggerParentOnSummary: true } }, async () => {
       const result = await harness.callTool("return_on", {
         label: "smoke default fork delivery",

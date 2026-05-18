@@ -11,6 +11,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
+import { compactReturnOnHandlerMessages } from "./context-compaction.ts";
 
 const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
@@ -456,9 +457,15 @@ function parseBooleanSetting(value: unknown, fallback: boolean, name: string): b
 	throw new Error(`${name} must be a boolean`);
 }
 
+function getPiAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR
+		? path.resolve(process.env.PI_CODING_AGENT_DIR)
+		: path.join(os.homedir(), ".pi", "agent");
+}
+
 async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	let settings: ReturnOnSettings = {};
-	for (const file of [path.join(os.homedir(), ".pi", "agent", "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
+	for (const file of [path.join(getPiAgentDir(), "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
 		const parsed = await readJsonObject(expandHome(file));
 		if (isObject(parsed?.returnOn)) settings = { ...settings, ...parsed.returnOn };
 	}
@@ -468,7 +475,7 @@ async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	const defaultTimeoutMs = parsePositiveDurationSetting(defaultSource, DEFAULT_RETURN_ON_TIMEOUT_MS, "returnOn.defaultTimeout");
 	if (defaultTimeoutMs > maxTimeoutMs) throw new Error(`returnOn.defaultTimeout (${formatDuration(defaultTimeoutMs)}) must not exceed returnOn.maxTimeout (${formatDuration(maxTimeoutMs)})`);
 	const defaultDeliveryMode = parseDeliveryModeSetting(process.env.PI_RETURN_ON_DELIVERY_MODE ?? settings.defaultDeliveryMode ?? settings.deliveryMode, "wake", "returnOn.defaultDeliveryMode");
-	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "ack-and-summary", "returnOn.defaultDeliveryNotify");
+	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "summary", "returnOn.defaultDeliveryNotify");
 	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, false, "returnOn.triggerParentOnSummary");
 	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary };
 }
@@ -1094,7 +1101,7 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary">): DeliveryConfig {
 	const base: DeliveryConfig = {
 		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake"),
-		notify: config?.defaultDeliveryNotify ?? "ack-and-summary",
+		notify: config?.defaultDeliveryNotify ?? "summary",
 		triggerParentOnSummary: config?.triggerParentOnSummary ?? process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
 	};
 	if (input === undefined || input === null || input === false) return base;
@@ -1949,6 +1956,22 @@ function buildReturnEventPayload(job: ReturnOnJob, reason: string, run: ReturnOn
 	};
 }
 
+function handlerParentNotificationLines(run: Pick<ReturnOnHandlerRun, "notify" | "triggerParentOnSummary">): string[] {
+	const notify = run.notify ?? "summary";
+	if (notify === "none") {
+		return [
+			"Parent notification mode: none",
+			"Your final response is stored in handler logs only and will not be automatically posted to the parent transcript/context.",
+		];
+	}
+	return [
+		`Parent notification mode: ${notify}`,
+		`Your final response WILL be copied into the parent transcript/context${run.triggerParentOnSummary ? " and will trigger a parent turn" : ""}.`,
+		...(notify === "ack-and-summary" ? ["The parent already received a launch ack; do not repeat startup details unless relevant."] : []),
+		"Keep the final response concise. If you already sent an intercom message to the parent, do not repeat its full content; just note that you escalated it.",
+	];
+}
+
 function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun, eventJson: string): string {
 	const parentContact = run.parentIntercomTarget
 		? `Parent intercom target, if pi-intercom is available: ${run.parentIntercomTarget}`
@@ -1967,7 +1990,8 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		"- If pi-intercom is available and a parent target is provided, use intercom.send for non-blocking progress, blocker, or escalation notices.",
 		"- Use intercom.ask only when you cannot safely continue without a parent decision; it blocks this handler until reply or timeout.",
 		"- If you do contact the parent, keep it brief and include the handler id.",
-		"- Prefer producing a concise final summary. The return_on extension will relay that final output to the parent session.",
+		"- Prefer producing a concise final summary.",
+		...handlerParentNotificationLines(run).map((line) => `- ${line}`),
 		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting for an external event.",
 		"- Never wait for this handler's own pid or status. If return_on_handlers shows this handler as running, that is expected while you are executing; summarize that observation instead of waiting.",
 		"",
@@ -1994,6 +2018,7 @@ function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
 		"If pi-intercom is available, use intercom.send for non-blocking parent notices and intercom.ask only for true blocking parent decisions.",
 		...(run.parentIntercomTarget ? [`Parent intercom target: ${run.parentIntercomTarget}`] : []),
+		...handlerParentNotificationLines(run),
 		`Handler id: ${run.id}`,
 	].join("\n");
 }
@@ -2022,6 +2047,31 @@ async function readOptionalText(filePath: string): Promise<string> {
 	}
 }
 
+function closeFdBestEffort(fd: number | undefined): void {
+	if (fd === undefined) return;
+	try {
+		fs.closeSync(fd);
+	} catch {
+		// Best effort cleanup; the child owns duplicated stdio fds after spawn succeeds.
+	}
+}
+
+function fileSizeBytes(filePath: string): number | null {
+	try {
+		return fs.statSync(filePath).size;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function formatHandlerLogPath(label: "Output" | "Errors", filePath: string): string {
+	const size = fileSizeBytes(filePath);
+	if (size === null) return `${label}: unavailable (${filePath}, missing)`;
+	if (label === "Errors" && size === 0) return `${label}: none (${filePath}, 0 B)`;
+	return `${label}: ${filePath} (${size} B)`;
+}
+
 function formatHandlerAck(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
 	return [
 		`return_on fired: ${job.label} (${job.id})`,
@@ -2039,8 +2089,8 @@ function formatHandlerSummary(job: { id: string; label: string }, run: ReturnOnH
 		`return_on handler ${status}: ${job.label} (${job.id})`,
 		`Handler: ${run.id}`,
 		`Exit: ${exit}`,
-		`Output: ${run.stdoutPath}`,
-		`Errors: ${run.stderrPath}`,
+		formatHandlerLogPath("Output", run.stdoutPath),
+		formatHandlerLogPath("Errors", run.stderrPath),
 		"",
 		truncateText(output, HANDLER_SUMMARY_LIMIT_BYTES),
 	].join("\n");
@@ -2799,6 +2849,12 @@ function commandReply(content: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	(pi.on as unknown as (event: "context", handler: (event: { messages: unknown[] }) => { messages: unknown[] } | undefined) => void)("context", (event) => {
+		const messages = compactReturnOnHandlerMessages(event.messages);
+		if (messages === event.messages) return undefined;
+		return { messages };
+	});
+
 	pi.registerMessageRenderer?.(EXTENSION_NAME, (message, _options, theme) => {
 		return new Text(theme.fg("accent", "⏰ return_on\n") + message.content, 0, 0);
 	});

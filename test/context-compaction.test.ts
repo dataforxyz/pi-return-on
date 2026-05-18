@@ -1,0 +1,116 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { compactReturnOnHandlerMessages } from "../src/context-compaction.ts";
+
+test("compacts routine return_on handler receipts while preserving lookup pointers", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: [
+			"return_on handler completed: build watcher (ro_123)",
+			"Handler: roh_123",
+			"Exit: 0",
+			"Output: /tmp/pi-return-on/stdout.log (10000 B)",
+			"Errors: none (/tmp/pi-return-on/stderr.log, 0 B)",
+			"",
+			"Routine success with marker RETURN_ON_OK.",
+			`NOISY ${"x".repeat(500)}`,
+			`NOISY2 ${"x".repeat(500)}`,
+			`NOISY3 ${"x".repeat(500)}`,
+		].join("\n"),
+	};
+
+	const result = compactReturnOnHandlerMessages([receipt]);
+	const compacted = result[0] as { content: string };
+	assert.match(compacted.content, /compacted for model context/);
+	assert.match(compacted.content, /Handler: roh_123/);
+	assert.match(compacted.content, /Output: \/tmp\/pi-return-on\/stdout\.log \(10000 B\)/);
+	assert.match(compacted.content, /Errors: none/);
+	assert.match(compacted.content, /RETURN_ON_OK/);
+	assert.doesNotMatch(compacted.content, /NOISY3/);
+	assert.ok(compacted.content.length < receipt.content.length);
+});
+
+test("does not compact return_on handler receipts without a usable output log pointer", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler completed: build watcher\nHandler: roh_123\nExit: 0\nOutput: unavailable (/tmp/out.log, missing)\nErrors: none (/tmp/err.log, 0 B)\n\nSummary should stay inline because output is missing.",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
+});
+
+test("does not compact return_on handler receipts with non-empty stderr", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler completed: build watcher\nHandler: roh_123\nExit: 0\nOutput: /tmp/out.log (10 B)\nErrors: /tmp/err.log (42 B)\n\nWarning details stay inline.",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
+});
+
+test("does not compact return_on handler receipts with later actionable blocker lines", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: [
+			"return_on handler completed: build watcher",
+			"Handler: roh_123",
+			"Exit: 0",
+			"Output: /tmp/out.log (10 B)",
+			"Errors: none (/tmp/err.log, 0 B)",
+			"Routine line one.",
+			"Routine line two.",
+			"Routine line three.",
+			"PARENT-DECISION: choose deploy target.",
+		].join("\n"),
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
+});
+
+test("preserves long return_on log lookup pointers without truncation", () => {
+	const longOutput = `/tmp/${"a".repeat(350)}/stdout.log`;
+	const longErrors = `/tmp/${"b".repeat(350)}/stderr.log`;
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: [
+			"return_on handler completed: build watcher",
+			"Handler: roh_123",
+			"Exit: 0",
+			`Output: ${longOutput} (10 B)`,
+			`Errors: none (${longErrors}, 0 B)`,
+			"Routine summary.",
+		].join("\n"),
+	};
+
+	const result = compactReturnOnHandlerMessages([receipt]);
+	const compacted = result[0] as { content: string };
+	assert.match(compacted.content, /compacted for model context/);
+	assert.ok(compacted.content.includes(`Output: ${longOutput} (10 B)`));
+	assert.ok(compacted.content.includes(`Errors: none (${longErrors}, 0 B)`));
+	assert.doesNotMatch(compacted.content, /…/);
+});
+
+test("does not recompact already compacted return_on handler receipts", () => {
+	const compacted = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler receipt (compacted for model context; routine success).\nHandler: roh_123\nOutput: /tmp/out.log (10 B)",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([compacted]), [compacted]);
+});
+
+test("does not compact failed return_on handler receipts", () => {
+	const failed = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler failed: build watcher\nHandler: roh_123\nExit: 1\nOutput: /tmp/out.log (10 B)\n\nFailure details stay inline.",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([failed]), [failed]);
+});
