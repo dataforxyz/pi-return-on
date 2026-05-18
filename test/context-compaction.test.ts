@@ -31,6 +31,16 @@ test("compacts routine return_on handler receipts while preserving lookup pointe
 	assert.ok(compacted.content.length < receipt.content.length);
 });
 
+test("does not compact return_on handler receipts without a usable output log pointer", () => {
+	const receipt = {
+		role: "custom",
+		customType: "return-on-handler",
+		content: "return_on handler completed: build watcher\nHandler: roh_123\nExit: 0\nOutput: unavailable (/tmp/out.log, missing)\nErrors: none (/tmp/err.log, 0 B)\n\nSummary should stay inline because output is missing.",
+	};
+
+	assert.deepEqual(compactReturnOnHandlerMessages([receipt]), [receipt]);
+});
+
 test("does not compact return_on handler receipts with non-empty stderr", () => {
 	const receipt = {
 		role: "custom",
