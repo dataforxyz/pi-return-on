@@ -198,6 +198,8 @@ When the watcher fires, the extension writes an event capsule under `~/.local/st
 
 If pi-intercom is available, the handler prompt includes the parent intercom target and an explicit delegated-authority policy. The handler may answer or act directly when the needed response is derivable from the event, inherited context, repo state, or prior user instructions. It should escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence. Use `intercom.send` for non-blocking progress, blocker, or escalation notices; use `intercom.ask` only when a parent decision is required and the handler cannot safely continue without it. Routine completion should still be returned as the final handler summary.
 
+Routine-success handler receipts are compacted before model context is built so repeated fired-event summaries do not bloat later turns. Compaction is conservative: the receipt must show success/exit 0, a usable `Output:` log path with byte size, and an absent or empty `Errors:` line. Handler id, exit, Output/Errors pointers, byte sizes, and a few summary lines stay inline. Failed receipts, non-empty stderr, missing/unavailable output logs, and already-compacted receipts are left unchanged.
+
 Useful delivery options:
 
 - `notify: "summary"` — only post the final summary; this is the default for fork delivery.
