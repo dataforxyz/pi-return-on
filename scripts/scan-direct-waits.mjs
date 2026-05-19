@@ -11,6 +11,7 @@ const defaultRoots = [
 ];
 const maxFileBytes = 5 * 1024 * 1024;
 const sleepThresholdMs = 10_000;
+const longRuntimeThresholdMs = 60_000;
 
 const args = process.argv.slice(2);
 const json = args.includes("--json");
@@ -55,6 +56,47 @@ function isBackgrounded(text) {
   return /(^|\s)(nohup|setsid)\s+/.test(text)
     || /(^|[;\s])disown(\s|;|$)/.test(text)
     || /(^|[^&])&(\s*(echo\s+\$!|disown|$|[;]))/.test(text);
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "unknown";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
+}
+
+function textContent(content) {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((item) => {
+      if (typeof item?.text === "string") return item.text;
+      if (typeof item?.content === "string") return item.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function collectToolCalls(entry) {
+  const message = entry.message ?? {};
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return [];
+  const calls = [];
+  for (const item of message.content) {
+    if (item?.type !== "toolCall") continue;
+    calls.push({
+      entryId: entry.id,
+      parentId: entry.parentId,
+      timestamp: Date.parse(entry.timestamp ?? "") || message.timestamp || undefined,
+      toolCallId: item.id,
+      toolName: item.name,
+      arguments: item.arguments ?? {},
+    });
+  }
+  return calls;
+}
+
+function previewArguments(toolName, args) {
+  const raw = toolName === "bash" && typeof args?.command === "string" ? args.command : JSON.stringify(args ?? {});
+  return String(raw ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
 }
 
 function classifyLine(line) {
@@ -123,6 +165,48 @@ async function* walk(target) {
   }
 }
 
+async function scanSessionLongRuntimes(file, raw) {
+  const toolCalls = new Map();
+  const hits = [];
+  const lines = raw.split("\n");
+  lines.forEach((line, index) => {
+    if (!line.trim()) return;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return;
+    }
+    for (const call of collectToolCalls(entry)) {
+      if (call.toolCallId) toolCalls.set(call.toolCallId, call);
+    }
+    const message = entry.message ?? {};
+    if (message.role !== "toolResult" || !message.toolCallId) return;
+    const call = toolCalls.get(message.toolCallId);
+    if (!call?.timestamp) return;
+    const resultTimestamp = Date.parse(entry.timestamp ?? "") || message.timestamp || undefined;
+    if (!resultTimestamp) return;
+    const durationMs = resultTimestamp - call.timestamp;
+    if (!Number.isFinite(durationMs) || durationMs < longRuntimeThresholdMs) return;
+    const toolName = String(message.toolName ?? call.toolName ?? "unknown");
+    const text = previewArguments(toolName, call.arguments) || textContent(message.content).replace(/\s+/g, " ").trim().slice(0, 240);
+    hits.push({
+      file,
+      line: index + 1,
+      text,
+      action: "long_runtime_candidate",
+      kind: "long tool runtime",
+      detail: `${toolName} took ${formatDuration(durationMs)}`,
+      durationMs,
+      toolName,
+      entryId: entry.id,
+      toolCallId: message.toolCallId,
+      callEntryId: call.entryId,
+    });
+  });
+  return hits;
+}
+
 async function readAudit(file) {
   const entries = [];
   if (!(await exists(file))) return entries;
@@ -172,6 +256,7 @@ if (!auditOnly) {
       } catch {
         continue;
       }
+      if (file.endsWith(".jsonl")) scanHits.push(...await scanSessionLongRuntimes(file, raw));
       const lines = raw.split("\n");
       lines.forEach((line, index) => {
         const hit = classifyLine(line);

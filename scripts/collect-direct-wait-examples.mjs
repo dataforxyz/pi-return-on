@@ -13,6 +13,7 @@ const maxFileBytes = 20 * 1024 * 1024;
 const sleepThresholdMs = 10_000;
 const returnOnLookaheadEntries = 80;
 const returnOnLookaheadMs = 30 * 60 * 1000;
+const longRuntimeThresholdMs = 60_000;
 
 const args = process.argv.slice(2);
 const paths = [];
@@ -111,6 +112,12 @@ function addMatch(matches, match) {
     backgrounded: match.backgrounded ?? false,
     severity: match.severity ?? "candidate",
   });
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "unknown";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
 }
 
 function detectWaitMatches(command) {
@@ -267,6 +274,19 @@ function findNearbyReturnOn(call, returnOnCalls, registrations) {
   return { toolCalls: nearbyToolCalls, registrations: nearbyRegistrations };
 }
 
+function runtimeMatch(call, result) {
+  if (!call?.timestamp || !result?.timestamp) return undefined;
+  const durationMs = result.timestamp - call.timestamp;
+  if (!Number.isFinite(durationMs) || durationMs < longRuntimeThresholdMs) return undefined;
+  return {
+    kind: "long tool runtime",
+    detail: `bash took ${formatDuration(durationMs)}`,
+    durationMs,
+    backgrounded: false,
+    severity: "direct_wait",
+  };
+}
+
 function classifyExample(matches, audit, nearbyReturnOn, artifacts) {
   if (audit?.action === "blocked") return "direct_wait_blocked";
   if (audit?.action === "allowed_short_sleep") return "short_sleep";
@@ -328,10 +348,12 @@ async function scanSession(file) {
   for (const call of bashCalls) {
     const command = typeof call.arguments.command === "string" ? call.arguments.command : "";
     if (!command) continue;
+    const result = toolResults.get(call.toolCallId);
     const matches = detectWaitMatches(command);
+    const longRuntime = runtimeMatch(call, result);
+    if (longRuntime) matches.push(longRuntime);
     if (!includeAllBash && matches.length === 0) continue;
     const hash = commandHash(command);
-    const result = toolResults.get(call.toolCallId);
     const nearbyReturnOn = findNearbyReturnOn(call, returnOnCalls, registrations);
     const artifacts = extractArtifacts(command);
     const audit = directWaitAudits.find((candidate) => {

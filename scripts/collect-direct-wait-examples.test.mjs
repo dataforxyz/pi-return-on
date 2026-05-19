@@ -89,3 +89,21 @@ test("collector records multiple wait matches from one bash command", async () =
   assert.equal(example.detection.matches.length, 2);
   assert.deepEqual(example.detection.matches.map((match) => match.kind), ["long sleep", "repeated polling"]);
 });
+
+test("collector records long bash runtimes from session timestamps", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-collector-"));
+  const sessionFile = path.join(dir, "session.jsonl");
+  const output = path.join(dir, "examples.jsonl");
+  await writeJsonl(sessionFile, [
+    sessionEntry(),
+    assistantTool("bash-3", "bash", { command: "npm test", timeout: 1800 }, "2026-05-12T00:00:01.000Z"),
+    toolResult("bash-3", "bash", "2026-05-12T00:22:52.600Z"),
+  ]);
+
+  await execFileAsync(process.execPath, [script, "--output", output, sessionFile], { cwd: path.resolve(".") });
+  const [example] = (await fs.readFile(output, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(example.classification, "missed_candidate");
+  assert.equal(example.detection.primaryKind, "long tool runtime");
+  assert.equal(example.detection.matches[0].durationMs, 1_371_600);
+  assert.match(example.detection.matches[0].detail, /bash took 1371\.6s/);
+});
