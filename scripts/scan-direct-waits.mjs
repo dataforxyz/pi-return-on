@@ -284,6 +284,45 @@ function countsObject(map) {
   return Object.fromEntries([...map.entries()].sort((a, b) => b[1] - a[1]));
 }
 
+function longRuntimeSignature(hit) {
+  const text = String(hit.text ?? "").replace(/\s+/g, " ").trim();
+  const npm = text.match(/(?:^|[;&|]\s*)(npm|pnpm|yarn|bun)\s+(?:(run)\s+)?([\w:.-]+)/);
+  if (npm) return `${npm[1]} ${npm[2] ? `run ${npm[3]}` : npm[3]}`;
+  const ghWatch = text.match(/(?:^|[;&|]\s*)gh\s+run\s+watch\b/);
+  if (ghWatch) return "gh run watch";
+  const make = text.match(/(?:^|[;&|]\s*)make\s+([\w:.-]+)/);
+  if (make) return `make ${make[1]}`;
+  const nodeScript = text.match(/(?:^|[;&|]\s*)node\s+([^\s;&|]+)/);
+  if (nodeScript) return `node ${path.basename(nodeScript[1])}`;
+  const bashScript = text.match(/(?:^|[;&|]\s*)(?:bash|sh)\s+([^\s;&|]+)/);
+  if (bashScript) return `shell ${path.basename(bashScript[1])}`;
+  const firstWords = text.split(" ").slice(0, 4).join(" ");
+  return firstWords || "unknown long runtime";
+}
+
+function longRuntimeRecommendation(signature) {
+  if (signature === "gh run watch") return "Use an exec watcher that polls gh run status instead of blocking on gh run watch.";
+  if (/^(npm|pnpm|yarn|bun) /.test(signature) || signature.startsWith("make ")) return "Run the command in the background with stdout/stderr and a pid file, then register a process-exited return_on watcher and inspect the log on wake.";
+  return "If this can run longer than a minute, start it in the background with log/pid artifacts and register return_on on process/file completion.";
+}
+
+function buildLongRuntimeGroups(hits) {
+  const groups = new Map();
+  for (const hit of hits) {
+    if (hit.kind !== "long tool runtime") continue;
+    const signature = longRuntimeSignature(hit);
+    const group = groups.get(signature) ?? { signature, count: 0, totalDurationMs: 0, maxDurationMs: 0, recommendation: longRuntimeRecommendation(signature), samples: [] };
+    group.count += 1;
+    group.totalDurationMs += hit.durationMs ?? 0;
+    group.maxDurationMs = Math.max(group.maxDurationMs, hit.durationMs ?? 0);
+    if (group.samples.length < 3) group.samples.push({ file: hit.file, line: hit.line, durationMs: hit.durationMs, text: hit.text });
+    groups.set(signature, group);
+  }
+  return [...groups.values()].sort((a, b) => b.count - a.count || b.maxDurationMs - a.maxDurationMs).slice(0, 20);
+}
+
+const longRuntimeGroups = buildLongRuntimeGroups(scanHits);
+
 const result = {
   auditFile: defaultAuditFile,
   auditFiles: [...auditFiles],
@@ -294,6 +333,7 @@ const result = {
   scanHits: scanHits.length,
   scanByAction: countsObject(scanByAction),
   scanByKind: countsObject(scanByKind),
+  longRuntimeGroups,
   recentAudit: auditEntries.slice(-20),
   sampleHits: scanHits.slice(0, 50),
 };
@@ -308,6 +348,12 @@ if (json) {
     console.log(`Scanned ${roots.length} root(s), found ${result.scanHits} possible direct-wait lines`);
     console.log(`  by action: ${JSON.stringify(result.scanByAction)}`);
     console.log(`  by kind:   ${JSON.stringify(result.scanByKind)}`);
+    if (result.longRuntimeGroups.length > 0) {
+      console.log("  long runtime groups:");
+      for (const group of result.longRuntimeGroups.slice(0, 8)) {
+        console.log(`  - ${group.count}x ${group.signature}; max ${formatDuration(group.maxDurationMs)}; ${group.recommendation}`);
+      }
+    }
     for (const hit of result.sampleHits.slice(0, 15)) {
       console.log(`- ${hit.action} ${hit.kind} ${hit.file}:${hit.line} ${hit.text}`);
     }

@@ -52,6 +52,7 @@ const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
 	"- Do not block the conversation with direct waits such as sleep commands of 10 seconds or longer, tail -f, watch, infinite polling loops, or foreground dev servers.",
 	"- For long-running work, start the command in the background, capture logs/pid files, then register a return_on watcher for the file, process, port, URL, webhook, or timer that means it is ready/done.",
+	"- Choose a timeout that covers the longest reasonable wait; the packaged default max is 2h, so do not assume older 10m caps unless project settings say otherwise.",
 	"- After registering return_on, end the turn and let return_on wake the session instead of polling manually.",
 ].join("\n");
 
@@ -3123,7 +3124,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Register timers/watchers that resume Pi later without spending model tokens waiting",
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
-			"Every return_on watcher has an effective timeout. If no timeout is provided, the configured default applies; explicit timeouts cannot exceed the configured maximum.",
+			"Every return_on watcher has an effective timeout. If no timeout is provided, the configured default applies; explicit timeouts cannot exceed the configured maximum. The packaged default max is 2h; choose a realistic explicit timeout for long jobs instead of assuming an older 10m cap.",
 			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",

@@ -60,10 +60,10 @@ Diagnostics:
 
 - `npm run scan-errors` runs `scripts/scan-return-on-errors.mjs` and scans local Pi session JSONL logs for failed `return_on` tool calls, grouping common error messages/argument shapes.
 - By default it scans Pi session logs under `~/.pi/agent/sessions/--<cwd>--/*.jsonl`; use `npm run scan-errors -- <path>` to scan non-default session roots.
-- Use `--since <iso>` and/or `--until <iso>` to filter errors by their session-log timestamp, e.g. `npm run scan-errors -- --since 2026-05-15T22:30:00Z` to ignore errors logged before a fix shipped. `--days N` is shorthand for `--since (now - N days)`. `--json` emits a machine-readable summary (counts, top errors, top condition shapes, example file paths) suitable for appending to a history file.
+- Use `--since <iso>` and/or `--until <iso>` to filter errors by their session-log timestamp, e.g. `npm run scan-errors -- --since 2026-05-15T22:30:00Z` to ignore errors logged before a fix shipped. `--days N` is shorthand for `--since (now - N days)`. Historical errors covered by current compatibility formats or the current 2h packaged `maxTimeout` are suppressed by default; use `--include-resolved` to audit them. `--json` emits a machine-readable summary (counts, top errors, top condition shapes, example file paths) suitable for appending to a history file.
 - `npm run scan-errors:recent` is `scan-errors --days 7` — the quick rolling check after fixes ship.
 - `npm run prune-sessions` dry-runs deletion of `~/.pi/agent/sessions/**/*.jsonl` files older than 30 days (configurable with `--days`); pass `--apply` to actually delete. Files modified within the last 24h are always kept so the active session can't be removed. Use this to keep the scan inputs from accumulating indefinitely.
-- `npm run audit:direct-waits` summarizes the structured direct-wait audit plus raw textual candidates in local Pi session logs, including long tool runtimes inferred from session timestamps (the same kind of wait shown in the feed as `Took 1371.6s`).
+- `npm run audit:direct-waits` summarizes the structured direct-wait audit plus raw textual candidates in local Pi session logs, including long tool runtimes inferred from session timestamps (the same kind of wait shown in the feed as `Took 1371.6s`). Long runtimes are grouped by command pattern with a short return_on-oriented follow-up recommendation.
 - `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns or long runtime thresholds and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
 - `npm run review:direct-waits` summarizes/dedupes that corpus, samples unreviewed examples, and can append human verdicts to the sidecar `~/.local/state/pi-return-on/direct-wait-example-reviews.jsonl` without mutating session logs.
 - Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
@@ -156,7 +156,7 @@ Common mistakes that will still be rejected:
 
 ## Timeout policy
 
-New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours.
+New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours. For long-running jobs, choose an explicit timeout that covers the expected completion window instead of assuming the older 10 minute maximum still applies.
 
 Configure these limits in Pi settings (`$PI_CODING_AGENT_DIR/settings.json` when Pi is running with an isolated agent directory, otherwise `~/.pi/agent/settings.json` globally, or `.pi/settings.json` per project). A leading `~` in `PI_CODING_AGENT_DIR` is expanded before settings are loaded:
 
