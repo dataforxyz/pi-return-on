@@ -41,6 +41,29 @@ try {
   const scan = JSON.parse(await runScanner(["--json", auditPath], { HOME: home }));
   assert.equal(scan.auditEntries, 2);
   assert.equal(scan.scanHits, 0, "explicit audit JSONL should not be double-counted as text scan hits");
+
+  const sessionPath = path.join(tmp, "session.jsonl");
+  await fs.writeFile(sessionPath, [
+    JSON.stringify({ type: "session", id: "session-test", timestamp: "2026-05-12T00:00:00.000Z", cwd: "/tmp/project" }),
+    JSON.stringify({
+      type: "message",
+      id: "assistant-call",
+      timestamp: "2026-05-12T00:00:01.000Z",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "bash-long", name: "bash", arguments: { command: "npm test", timeout: 1800 } }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "bash-long-result",
+      parentId: "assistant-call",
+      timestamp: "2026-05-12T00:22:52.600Z",
+      message: { role: "toolResult", toolCallId: "bash-long", toolName: "bash", isError: false, content: [{ type: "text", text: "ok" }] },
+    }),
+  ].join("\n") + "\n", "utf8");
+  const runtimeScan = JSON.parse(await runScanner(["--json", sessionPath], { HOME: home }));
+  assert.equal(runtimeScan.scanByAction.long_runtime_candidate, 1);
+  assert.equal(runtimeScan.scanByKind["long tool runtime"], 1);
+  assert.match(runtimeScan.sampleHits[0].detail, /bash took 1371\.6s/);
+  assert.equal(runtimeScan.sampleHits[0].toolCallId, "bash-long");
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
 }
