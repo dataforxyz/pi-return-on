@@ -476,7 +476,7 @@ async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	if (defaultTimeoutMs > maxTimeoutMs) throw new Error(`returnOn.defaultTimeout (${formatDuration(defaultTimeoutMs)}) must not exceed returnOn.maxTimeout (${formatDuration(maxTimeoutMs)})`);
 	const defaultDeliveryMode = parseDeliveryModeSetting(process.env.PI_RETURN_ON_DELIVERY_MODE ?? settings.defaultDeliveryMode ?? settings.deliveryMode, "wake", "returnOn.defaultDeliveryMode");
 	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "summary", "returnOn.defaultDeliveryNotify");
-	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, false, "returnOn.triggerParentOnSummary");
+	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, true, "returnOn.triggerParentOnSummary");
 	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary };
 }
 
@@ -1102,7 +1102,7 @@ function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaul
 	const base: DeliveryConfig = {
 		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake"),
 		notify: config?.defaultDeliveryNotify ?? "summary",
-		triggerParentOnSummary: config?.triggerParentOnSummary ?? process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1",
+		triggerParentOnSummary: config?.triggerParentOnSummary ?? (process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === undefined ? true : process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1"),
 	};
 	if (input === undefined || input === null || input === false) return base;
 	if (input === true) return { ...base, mode: "fork" };

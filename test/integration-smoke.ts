@@ -364,7 +364,7 @@ async function testForkDelivery(harness: Harness) {
     const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
     if (summary) {
       if (ack) throw new Error("fork delivery should default to summary-only without a launch ack");
-      if (summary.options?.triggerTurn !== false) throw new Error("fork delivery summary should not trigger parent turn by default");
+      if (summary.options?.triggerTurn !== true) throw new Error("fork delivery summary should trigger parent turn by default");
       const summaryContent = String(summary.message?.content ?? "");
       if (!summaryContent.includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
       if (!summaryContent.includes("Output:") || !summaryContent.includes("Errors: none")) throw new Error("fork delivery summary missed log pointers");
@@ -1002,8 +1002,8 @@ async function testDefaultDeliverySettings(harness: Harness) {
     });
     const explicitForkJob = explicitForkResult.details.job;
     allJobIds.push(explicitForkJob.id as string);
-    if (explicitForkJob.delivery?.mode !== "fork" || explicitForkJob.delivery?.notify !== "summary") {
-      throw new Error(`explicit fork delivery did not default notify to summary: ${JSON.stringify(explicitForkJob.delivery)}`);
+    if (explicitForkJob.delivery?.mode !== "fork" || explicitForkJob.delivery?.notify !== "summary" || explicitForkJob.delivery?.triggerParentOnSummary !== true) {
+      throw new Error(`explicit fork delivery did not default to summary with parent wake: ${JSON.stringify(explicitForkJob.delivery)}`);
     }
     await harness.cancel(explicitForkJob.id as string);
 
