@@ -64,6 +64,9 @@ try {
   assert.equal(runtimeScan.scanByKind["long tool runtime"], 1);
   assert.match(runtimeScan.sampleHits[0].detail, /bash took 1371\.6s/);
   assert.equal(runtimeScan.sampleHits[0].toolCallId, "bash-long");
+  assert.equal(runtimeScan.longRuntimeGroups[0].signature, "npm test");
+  assert.equal(runtimeScan.longRuntimeGroups[0].count, 1);
+  assert.match(runtimeScan.longRuntimeGroups[0].recommendation, /background/);
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
 }
