@@ -474,6 +474,26 @@ async function testCommonShorthandAccepted(harness: Harness) {
   allJobIds.push(execJob.id);
   if (execJob.condition.type !== "exec" || execJob.condition.command !== "exit 1") throw new Error(`exec shorthand was not normalized: ${JSON.stringify(execJob.condition)}`);
   await harness.cancel(execJob.id);
+
+  const wrapped = await tool.execute("wrapped-leaves", {
+    label: "wrapped leaves",
+    condition: {
+      op: "or",
+      children: [
+        { file: { path: "wrapped-ready.json", exists: true }, every: "5s" },
+        { process: { pidFile: "wrapped.pid", status: "exited" } },
+        { port: 9, host: "127.0.0.1" },
+      ],
+    },
+    resume: "wrapped leaves resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const wrappedJob = wrapped.details.job;
+  allJobIds.push(wrappedJob.id);
+  const [fileLeaf, processLeaf, portLeaf] = wrappedJob.condition.children;
+  if (fileLeaf.type !== "file" || fileLeaf.path !== "wrapped-ready.json" || fileLeaf.every !== "5s") throw new Error(`file wrapper was not normalized: ${JSON.stringify(fileLeaf)}`);
+  if (processLeaf.type !== "process" || processLeaf.pidFile !== "wrapped.pid" || processLeaf.state !== "exited") throw new Error(`process wrapper/status was not normalized: ${JSON.stringify(processLeaf)}`);
+  if (portLeaf.type !== "port" || portLeaf.port !== 9 || portLeaf.host !== "127.0.0.1") throw new Error(`port shorthand was not normalized: ${JSON.stringify(portLeaf)}`);
+  await harness.cancel(wrappedJob.id);
 }
 
 async function testLogContains(harness: Harness) {
@@ -837,14 +857,9 @@ async function testEmptyGroupRejected(harness: Harness) {
 async function testConditionShapeErrors(harness: Harness) {
   const cases: Array<{ label: string; condition: unknown; match: RegExp }> = [
     {
-      label: "wrapper file leaf",
-      condition: { file: { path: "/x", exists: true } },
-      match: /wrapper shape '\{file:\{\.\.\.\}\}'.*\{type:"file"/,
-    },
-    {
-      label: "wrapper file leaf inside op group",
-      condition: { op: "or", children: [{ file: { path: "/x", exists: true } }] },
-      match: /wrapper shape '\{file:\{\.\.\.\}\}'.*\{type:"file"/,
+      label: "ambiguous multiple wrapper leaves",
+      condition: { file: { path: "/x", exists: true }, process: { pidFile: "job.pid" } },
+      match: /multiple leaf wrappers: file, process/,
     },
     {
       label: "missing type with present keys",
