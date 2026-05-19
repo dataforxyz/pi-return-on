@@ -102,7 +102,7 @@ Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `
 
 ## Canonical condition shapes
 
-The biggest source of `return_on` errors in real sessions is using the wrong condition shape. Use these forms; everything else is rejected.
+The biggest source of `return_on` errors in real sessions is using the wrong condition shape. Prefer these canonical forms; common older wrapper shorthands are accepted for compatibility and normalized when the watcher is registered.
 
 Flat leaves always include `type`:
 
@@ -115,7 +115,7 @@ Flat leaves always include `type`:
 { "type": "exec",    "command": "test -f out/done" }
 ```
 
-Groups wrap flat leaves; **never** wrap leaves inside `{file:{...}}` / `{process:{...}}`:
+Groups should wrap flat leaves:
 
 ```json
 { "any": [ { "type": "file", "path": "done", "exists": true },
@@ -129,20 +129,25 @@ Groups wrap flat leaves; **never** wrap leaves inside `{file:{...}}` / `{process
 { "op": "or", "children": [ /* flat leaves or nested groups */ ] }
 ```
 
-Common mistakes that will be rejected:
+These shorthands are accepted and normalized:
+
+```json
+{ "timer": "30s" }
+{ "type": "timer", "duration": "30s" }
+{ "exec": "test -f out/done" }
+{ "file": { "path": "done", "exists": true } }
+{ "process": { "pidFile": "job.pid", "status": "exited" } }
+{ "port": 3000, "host": "127.0.0.1" }
+```
+
+Common mistakes that will still be rejected:
 
 ```jsonc
-// wrong: wrapper-style leaf
-{ "file": { "path": "out", "exists": true } }
-
-// wrong: wrapper-style leaves inside a group
-{ "op": "or", "children": [
-  { "file":    { "path": "done",   "exists": true } },
-  { "process": { "pidFile": "job.pid", "status": "exited" } }
-] }
-
-// wrong: no type at all
+// wrong: no type or known shorthand
 { "path": "out", "exists": true }
+
+// wrong: ambiguous multiple wrappers
+{ "file": { "path": "done" }, "process": { "pidFile": "job.pid" } }
 ```
 
 `condition` may also be passed as a JSON-encoded string (useful for tool callers that flatten arguments); the extension will `JSON.parse` it before validating.

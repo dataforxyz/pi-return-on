@@ -1137,41 +1137,46 @@ function normalizeCondition(input: unknown): Condition {
 		}
 	}
 	if (!isObject(input)) throw new Error("condition must be an object (or a JSON-encoded object string)");
-	if (Array.isArray(input.any)) {
-		if (input.any.length === 0) throw new Error("any group requires children");
-		return { op: "or", children: input.any.map(normalizeCondition) };
+	let conditionInput = input as Record<string, any>;
+	if (Array.isArray(conditionInput.any)) {
+		if (conditionInput.any.length === 0) throw new Error("any group requires children");
+		return { op: "or", children: conditionInput.any.map(normalizeCondition) };
 	}
-	if (Array.isArray(input.all)) {
-		if (input.all.length === 0) throw new Error("all group requires children");
-		return { op: "and", children: input.all.map(normalizeCondition) };
+	if (Array.isArray(conditionInput.all)) {
+		if (conditionInput.all.length === 0) throw new Error("all group requires children");
+		return { op: "and", children: conditionInput.all.map(normalizeCondition) };
 	}
-	if (input.not !== undefined) return { op: "not", children: [normalizeCondition(input.not)] };
-	if (typeof input.op === "string") {
-		const op = input.op.toLowerCase();
-		if (op !== "and" && op !== "or" && op !== "not") throw new Error(`unsupported group op '${input.op}'`);
-		const childrenInput = Array.isArray(input.children) ? input.children : [];
+	if (conditionInput.not !== undefined) return { op: "not", children: [normalizeCondition(conditionInput.not)] };
+	if (typeof conditionInput.op === "string") {
+		const op = conditionInput.op.toLowerCase();
+		if (op !== "and" && op !== "or" && op !== "not") throw new Error(`unsupported group op '${conditionInput.op}'`);
+		const childrenInput = Array.isArray(conditionInput.children) ? conditionInput.children : [];
 		if (op !== "not" && childrenInput.length === 0) throw new Error(`${op} group requires children`);
 		if (op === "not" && childrenInput.length !== 1) throw new Error("not group requires exactly one child");
-		return { ...input, op, children: childrenInput.map(normalizeCondition) } as Condition;
+		return { ...conditionInput, op, children: childrenInput.map(normalizeCondition) } as Condition;
 	}
-	if (input.type === undefined) {
-		if (typeof input.timer === "string" || typeof input.timer === "number") {
-			const { timer, ...rest } = input;
+	if (conditionInput.type === undefined) {
+		if (typeof conditionInput.timer === "string" || typeof conditionInput.timer === "number") {
+			const { timer, ...rest } = conditionInput;
 			return normalizeCondition({ ...rest, type: "timer", after: timer });
 		}
-		if (typeof input.exec === "string") {
-			const { exec, ...rest } = input;
+		if (typeof conditionInput.exec === "string") {
+			const { exec, ...rest } = conditionInput;
 			return normalizeCondition({ ...rest, type: "exec", command: exec });
 		}
-		if (input.timer !== undefined && !isObject(input.timer)) throw new Error("timer shorthand requires a duration string or number");
-		if (input.exec !== undefined && !isObject(input.exec)) throw new Error("exec shorthand requires a command string");
+		if (typeof conditionInput.port === "number") return normalizeCondition({ ...conditionInput, type: "port" });
+		if (typeof conditionInput.url === "string") return normalizeCondition({ ...conditionInput, type: "url" });
+		if (conditionInput.timer !== undefined && !isObject(conditionInput.timer)) throw new Error("timer shorthand requires a duration string or number");
+		if (conditionInput.exec !== undefined && !isObject(conditionInput.exec)) throw new Error("exec shorthand requires a command string");
 		const WRAPPER_LEAF_KEYS = ["file", "process", "port", "url", "webhook", "exec", "timer"] as const;
-		for (const wrapperKey of WRAPPER_LEAF_KEYS) {
-			if (isObject(input[wrapperKey])) {
-				throw new Error(`condition leaf uses wrapper shape '{${wrapperKey}:{...}}'; use flat '{type:"${wrapperKey}", ...}' instead`);
-			}
+		const wrapperKeys = WRAPPER_LEAF_KEYS.filter((wrapperKey) => isObject(conditionInput[wrapperKey]));
+		if (wrapperKeys.length > 1) throw new Error(`condition uses multiple leaf wrappers: ${wrapperKeys.join(", ")}`);
+		const wrapperKey = wrapperKeys[0];
+		if (wrapperKey) {
+			const { [wrapperKey]: wrapped, ...rest } = conditionInput;
+			return normalizeCondition({ ...(wrapped as Record<string, unknown>), ...rest, type: wrapperKey });
 		}
-		const keys = Object.keys(input);
+		const keys = Object.keys(conditionInput);
 		const keyList = keys.length === 0 ? "none" : keys.join(", ");
 		throw new Error(
 			`unsupported condition: no 'type' field (got keys: ${keyList}). ` +
@@ -1179,68 +1184,72 @@ function normalizeCondition(input: unknown): Condition {
 			"or a group shorthand {any:[...]}/{all:[...]}/{not:{...}}/{op,children:[...]}.",
 		);
 	}
-	if (input.type === "timer") {
-		const timer = { ...input } as TimerCondition & { duration?: string | number };
+	if (conditionInput.type === "timer") {
+		const timer = { ...conditionInput } as TimerCondition & { duration?: string | number };
 		if (timer.after === undefined && timer.at === undefined && timer.duration !== undefined) timer.after = timer.duration;
 		if (timer.after === undefined && timer.at === undefined) throw new Error("timer condition requires after, at, or duration");
 		return timer;
 	}
-	if (input.type === "file") {
-		if (typeof input.path !== "string" || !input.path.trim()) throw new Error("file condition requires path");
-		return input as FileCondition;
+	if (conditionInput.type === "file") {
+		if (typeof conditionInput.path !== "string" || !conditionInput.path.trim()) throw new Error("file condition requires path");
+		return conditionInput as FileCondition;
 	}
-	if (input.type === "exec") {
-		if (typeof input.command !== "string" && typeof input.code !== "string") {
+	if (conditionInput.type === "exec") {
+		if (typeof conditionInput.command !== "string" && typeof conditionInput.code !== "string") {
 			throw new Error("exec condition requires command or code");
 		}
 		for (const field of ["runner", "shell"] as const) {
-			const runner = input[field];
+			const runner = conditionInput[field];
 			if (runner !== undefined && (!SUPPORTED_RUNNERS.has(runner as Runner) || typeof runner !== "string")) {
 				throw new Error(`unsupported exec ${field} '${String(runner)}'`);
 			}
 		}
-		return input as ExecCondition;
+		return conditionInput as ExecCondition;
 	}
-	if (input.type === "process") {
-		if (input.pid !== undefined && (typeof input.pid !== "number" || !Number.isInteger(input.pid) || input.pid <= 0)) {
+	if (conditionInput.type === "process") {
+		if (conditionInput.state === undefined && conditionInput.status !== undefined) {
+			if (conditionInput.status !== "running" && conditionInput.status !== "exited") throw new Error("process condition status must be 'running' or 'exited'");
+			conditionInput = { ...conditionInput, state: conditionInput.status };
+		}
+		if (conditionInput.pid !== undefined && (typeof conditionInput.pid !== "number" || !Number.isInteger(conditionInput.pid) || conditionInput.pid <= 0)) {
 			throw new Error("process condition pid must be a positive integer");
 		}
-		if (input.pidFile !== undefined && (typeof input.pidFile !== "string" || !input.pidFile.trim())) {
+		if (conditionInput.pidFile !== undefined && (typeof conditionInput.pidFile !== "string" || !conditionInput.pidFile.trim())) {
 			throw new Error("process condition pidFile must be a non-empty string");
 		}
 		if (
-			input.pid === undefined
-			&& input.pidFile === undefined
-			&& typeof input.name !== "string"
-			&& typeof input.commandContains !== "string"
-			&& typeof input.matches !== "string"
+			conditionInput.pid === undefined
+			&& conditionInput.pidFile === undefined
+			&& typeof conditionInput.name !== "string"
+			&& typeof conditionInput.commandContains !== "string"
+			&& typeof conditionInput.matches !== "string"
 		) {
 			throw new Error("process condition requires pid, pidFile, name, commandContains, or matches");
 		}
-		return input as ProcessCondition;
+		return conditionInput as ProcessCondition;
 	}
-	if (input.type === "port") {
-		if (typeof input.port !== "number" || !Number.isInteger(input.port) || input.port <= 0 || input.port > 65535) {
+	if (conditionInput.type === "port") {
+		if (typeof conditionInput.port !== "number" || !Number.isInteger(conditionInput.port) || conditionInput.port <= 0 || conditionInput.port > 65535) {
 			throw new Error("port condition requires port between 1 and 65535");
 		}
-		return input as PortCondition;
+		return conditionInput as PortCondition;
 	}
-	if (input.type === "url") {
-		if (typeof input.url !== "string" || !input.url.trim()) throw new Error("url condition requires url");
+	if (conditionInput.type === "url") {
+		if (typeof conditionInput.url !== "string" || !conditionInput.url.trim()) throw new Error("url condition requires url");
 		try {
-			new URL(input.url);
+			new URL(conditionInput.url);
 		} catch {
-			throw new Error(`url condition has invalid url '${String(input.url)}'`);
+			throw new Error(`url condition has invalid url '${String(conditionInput.url)}'`);
 		}
-		return input as UrlCondition;
+		return conditionInput as UrlCondition;
 	}
-	if (input.type === "webhook") {
-		if (input.path !== undefined && (typeof input.path !== "string" || !input.path.startsWith("/"))) throw new Error("webhook condition path must start with '/'");
-		if (input.token !== undefined && typeof input.token !== "string") throw new Error("webhook condition token must be a string");
-		if (input.method !== undefined && typeof input.method !== "string") throw new Error("webhook condition method must be a string");
-		return input as IncomingWebhookCondition;
+	if (conditionInput.type === "webhook") {
+		if (conditionInput.path !== undefined && (typeof conditionInput.path !== "string" || !conditionInput.path.startsWith("/"))) throw new Error("webhook condition path must start with '/'");
+		if (conditionInput.token !== undefined && typeof conditionInput.token !== "string") throw new Error("webhook condition token must be a string");
+		if (conditionInput.method !== undefined && typeof conditionInput.method !== "string") throw new Error("webhook condition method must be a string");
+		return conditionInput as IncomingWebhookCondition;
 	}
-	throw new Error(`unsupported condition type '${String(input.type)}'`);
+	throw new Error(`unsupported condition type '${String(conditionInput.type)}'`);
 }
 
 function isGroupCondition(condition: Condition): condition is GroupCondition {
