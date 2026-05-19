@@ -132,9 +132,11 @@ Groups should wrap flat leaves:
 These shorthands are accepted and normalized:
 
 ```json
+"30s"
 { "timer": "30s" }
 { "type": "timer", "duration": "30s" }
 { "exec": "test -f out/done" }
+{ "file": "done", "contains": "READY" }
 { "file": { "path": "done", "exists": true } }
 { "process": { "pidFile": "job.pid", "status": "exited" } }
 { "port": 3000, "host": "127.0.0.1" }
@@ -156,7 +158,7 @@ Common mistakes that will still be rejected:
 
 New watchers are never unbounded. By default, `return_on` applies a 10 minute timeout when the tool call omits `timeout`, and rejects explicit timeouts longer than 2 hours.
 
-Configure these limits in Pi settings (`$PI_CODING_AGENT_DIR/settings.json` when Pi is running with an isolated agent directory, otherwise `~/.pi/agent/settings.json` globally, or `.pi/settings.json` per project):
+Configure these limits in Pi settings (`$PI_CODING_AGENT_DIR/settings.json` when Pi is running with an isolated agent directory, otherwise `~/.pi/agent/settings.json` globally, or `.pi/settings.json` per project). A leading `~` in `PI_CODING_AGENT_DIR` is expanded before settings are loaded:
 
 ```json
 {

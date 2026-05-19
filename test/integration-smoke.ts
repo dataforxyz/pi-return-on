@@ -51,6 +51,18 @@ async function withUserAgentSettings(settings: unknown, fn: () => Promise<void>)
   await fs.rm(agentDir, { recursive: true, force: true });
 }
 
+async function withTildeUserAgentSettings(settings: unknown, fn: () => Promise<void>): Promise<void> {
+  const agentName = `pi-return-on-agent-dir-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const agentDir = path.join(os.homedir(), agentName);
+  await fs.mkdir(agentDir, { recursive: true });
+  await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify(settings, null, 2), "utf8");
+  try {
+    await withEnv({ PI_CODING_AGENT_DIR: `~/${agentName}` }, fn);
+  } finally {
+    await fs.rm(agentDir, { recursive: true, force: true });
+  }
+}
+
 async function withProjectSettings(settings: unknown, fn: () => Promise<void>): Promise<void> {
   let previous: string | undefined;
   try {
@@ -454,6 +466,19 @@ async function testCommonShorthandAccepted(harness: Harness) {
   if (timerJob.condition.type !== "timer" || timerJob.condition.after !== "10s") throw new Error(`timer shorthand was not normalized: ${JSON.stringify(timerJob.condition)}`);
   await harness.cancel(timerJob.id);
 
+  const timerString = await tool.execute("timer-string-condition", {
+    label: "timer string condition",
+    condition: "10s",
+    timeout: JSON.stringify("30s"),
+    resume: "timer string condition resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const timerStringJob = timerString.details.job;
+  allJobIds.push(timerStringJob.id);
+  if (timerStringJob.condition.type !== "timer" || timerStringJob.condition.after !== "10s") throw new Error(`timer string condition was not normalized: ${JSON.stringify(timerStringJob.condition)}`);
+  const timeoutMs = timerStringJob.timeoutAt - timerStringJob.createdAt;
+  if (Math.abs(timeoutMs - 30_000) > 1_000) throw new Error(`JSON-encoded timeout string was not parsed as 30s: ${timeoutMs}`);
+  await harness.cancel(timerStringJob.id);
+
   const duration = await tool.execute("timer-duration", {
     label: "timer duration alias",
     condition: { type: "timer", duration: "10s" },
@@ -481,6 +506,7 @@ async function testCommonShorthandAccepted(harness: Harness) {
       op: "or",
       children: [
         { file: { path: "wrapped-ready.json", exists: true }, every: "5s" },
+        { file: "string-file.log", contains: "READY" },
         { process: { pidFile: "wrapped.pid", status: "exited" } },
         { port: 9, host: "127.0.0.1" },
       ],
@@ -489,8 +515,9 @@ async function testCommonShorthandAccepted(harness: Harness) {
   }, new AbortController().signal, () => {}, harness.ctx);
   const wrappedJob = wrapped.details.job;
   allJobIds.push(wrappedJob.id);
-  const [fileLeaf, processLeaf, portLeaf] = wrappedJob.condition.children;
+  const [fileLeaf, fileStringLeaf, processLeaf, portLeaf] = wrappedJob.condition.children;
   if (fileLeaf.type !== "file" || fileLeaf.path !== "wrapped-ready.json" || fileLeaf.every !== "5s") throw new Error(`file wrapper was not normalized: ${JSON.stringify(fileLeaf)}`);
+  if (fileStringLeaf.type !== "file" || fileStringLeaf.path !== "string-file.log" || fileStringLeaf.contains !== "READY") throw new Error(`file string shorthand was not normalized: ${JSON.stringify(fileStringLeaf)}`);
   if (processLeaf.type !== "process" || processLeaf.pidFile !== "wrapped.pid" || processLeaf.state !== "exited") throw new Error(`process wrapper/status was not normalized: ${JSON.stringify(processLeaf)}`);
   if (portLeaf.type !== "port" || portLeaf.port !== 9 || portLeaf.host !== "127.0.0.1") throw new Error(`port shorthand was not normalized: ${JSON.stringify(portLeaf)}`);
   await harness.cancel(wrappedJob.id);
@@ -1033,6 +1060,21 @@ async function testDefaultDeliverySettings(harness: Harness) {
       allJobIds.push(job.id as string);
       if (job.delivery?.mode !== "fork" || job.delivery?.notify !== "none" || job.delivery?.triggerParentOnSummary !== true) {
         throw new Error(`PI_CODING_AGENT_DIR settings default delivery was not applied: ${JSON.stringify(job.delivery)}`);
+      }
+      await harness.cancel(job.id as string);
+    });
+
+    await withTildeUserAgentSettings({ returnOn: { defaultDeliveryMode: "fork", defaultDeliveryNotify: "none", triggerParentOnSummary: true } }, async () => {
+      const result = await harness.callTool("return_on", {
+        label: "smoke tilde agent dir fork delivery",
+        condition: { type: "timer", after: "1h" },
+        timeout: "5s",
+        resume: "tilde agent dir fork delivery resume",
+      });
+      const job = result.details.job;
+      allJobIds.push(job.id as string);
+      if (job.delivery?.mode !== "fork" || job.delivery?.notify !== "none" || job.delivery?.triggerParentOnSummary !== true) {
+        throw new Error(`PI_CODING_AGENT_DIR tilde settings default delivery was not applied: ${JSON.stringify(job.delivery)}`);
       }
       await harness.cancel(job.id as string);
     });

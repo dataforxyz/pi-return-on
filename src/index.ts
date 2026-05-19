@@ -385,8 +385,16 @@ function parseDuration(input: string | number | undefined, fallbackMs?: number):
 	if (input === undefined || input === null || input === "") return fallbackMs;
 	if (typeof input === "number" && Number.isFinite(input)) return input;
 	if (typeof input !== "string") return fallbackMs;
-	const trimmed = input.trim();
+	let trimmed = input.trim();
 	if (!trimmed) return fallbackMs;
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (typeof parsed === "string") trimmed = parsed.trim();
+		} catch {
+			trimmed = trimmed.slice(1, -1).trim();
+		}
+	}
 	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|m|min|mins|h|hr|hrs|d|day|days)?$/i);
 	if (!match) return fallbackMs;
 	const value = Number(match[1]);
@@ -459,7 +467,7 @@ function parseBooleanSetting(value: unknown, fallback: boolean, name: string): b
 
 function getPiAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR
-		? path.resolve(process.env.PI_CODING_AGENT_DIR)
+		? path.resolve(expandHome(process.env.PI_CODING_AGENT_DIR))
 		: path.join(os.homedir(), ".pi", "agent");
 }
 
@@ -1134,6 +1142,8 @@ function normalizeCondition(input: unknown): Condition {
 			} catch (error) {
 				throw new Error(`condition was a string but not valid JSON: ${(error as Error).message}`);
 			}
+		} else if (parseDuration(trimmed) !== undefined) {
+			return normalizeCondition({ type: "timer", after: trimmed });
 		}
 	}
 	if (!isObject(input)) throw new Error("condition must be an object (or a JSON-encoded object string)");
@@ -1163,6 +1173,10 @@ function normalizeCondition(input: unknown): Condition {
 		if (typeof conditionInput.exec === "string") {
 			const { exec, ...rest } = conditionInput;
 			return normalizeCondition({ ...rest, type: "exec", command: exec });
+		}
+		if (typeof conditionInput.file === "string") {
+			const { file, ...rest } = conditionInput;
+			return normalizeCondition({ ...rest, type: "file", path: file });
 		}
 		if (typeof conditionInput.port === "number") return normalizeCondition({ ...conditionInput, type: "port" });
 		if (typeof conditionInput.url === "string") return normalizeCondition({ ...conditionInput, type: "url" });
