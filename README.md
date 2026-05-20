@@ -40,10 +40,10 @@ Slash commands:
 
 Visibility:
 
-- Active waits update the Pi status footer with compact tags such as `⏰ build · port 127.0.0.1:3000 open · Ctrl+Alt+W` or `⏰ 2 waiting: build · render · Ctrl+Alt+W`.
-- Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a compact modal for this chat. It shows one basic row per waiter by default, with clear states (`● WAITING`, `✓ RETURNED`, `× CANCELLED`) plus how long ago it started and last checked/returned; use `↑`/`↓` or `j`/`k` to move between waiters, `Enter`/`d` to expand details for the selected waiter, `a` to toggle this chat vs all sessions, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), and `r` to reverse sort order.
+- Active waits update the Pi status footer with a compact green status such as `⏰ 1 · Ctrl+Alt+W` or `⏰ 2 · Ctrl+Alt+W` instead of noisy partial job titles.
+- Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a compact, color-coded modal for this chat. It shows one basic row per waiter by default, with clear states (`● WAITING`, `✓ RETURNED`, `× CANCELLED`) plus how long ago it started, when it last checked/returned, how often active waiters check, and when the next check is due; use `↑`/`↓` or `j`/`k` to move between waiters, `Enter`/`d` to expand details for the selected waiter, `a` to toggle this chat vs all sessions, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), and `r` to reverse sort order.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
-- The `return_on` registration result includes a `Waiting for:` line so the agent and user can immediately verify the watcher target.
+- The `return_on` registration result is a short WAITING receipt: it shows the job id/label, plain-language trigger bullets, check cadence, timeout, and the `Ctrl+Alt+W`/`/return-on-waiters` status shortcut.
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
 - `/return-on-fired-events` and `return_on_fired_events` show pending/delivered/failed fired capsules for restart-safe delivery debugging.
 - `/return-on-prune --dry-run` previews retention cleanup before deleting old state.

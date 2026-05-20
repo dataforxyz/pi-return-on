@@ -1008,7 +1008,7 @@ async function testDefaultTimeoutAndMax(harness: Harness) {
     const jobId = result.details.job.id as string;
     allJobIds.push(jobId);
     if (typeof result.details.job.timeoutAt !== "number") throw new Error("default timeout did not set timeoutAt");
-    if (!String(result.content?.[0]?.text ?? "").includes("Timeout: 700ms")) throw new Error("registration did not display effective default timeout");
+    if (!String(result.content?.[0]?.text ?? "").includes("Timeout: in 700ms")) throw new Error("registration did not display effective default timeout");
     const entry = await waitForWake(harness, { jobId, label, resume }, 2_500);
     if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("default timeout wake did not include timeout reason");
 
@@ -1134,8 +1134,8 @@ async function testListToolAndCommands() {
   await harness.emit("session_start");
   const activeId = await harness.register({ label: "list active", condition: { type: "timer", after: "10s" }, resume: "list active resume" });
   const statusAfterActive = harness.statuses.at(-1)?.value ?? "";
-  if (!statusAfterActive.includes("list active") || !statusAfterActive.includes("timer")) {
-    throw new Error(`status tag did not show active wait label and condition: ${statusAfterActive}`);
+  if (!statusAfterActive.includes("⏰") || !statusAfterActive.includes("1") || !statusAfterActive.includes("Ctrl+Alt+W") || statusAfterActive.includes("list active")) {
+    throw new Error(`status tag did not show compact active wait count and shortcut: ${statusAfterActive}`);
   }
   const cancelId = await harness.register({ label: "list cancel", condition: { type: "timer", after: "10s" }, resume: "list cancel resume" });
   await harness.cancel(cancelId);

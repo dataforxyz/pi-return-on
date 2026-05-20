@@ -1041,7 +1041,7 @@ function activeJobsForCurrentSession(): ReturnOnJob[] {
 function updateStatus(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
 	const active = activeJobsForCurrentSession();
-	ctx.ui.setStatus(EXTENSION_NAME, active.length > 0 ? formatStatusTag(active) : undefined);
+	ctx.ui.setStatus(EXTENSION_NAME, active.length > 0 ? formatStatusTag(active, ctx.ui.theme) : undefined);
 }
 
 function startTicker(pi: ExtensionAPI): void {
@@ -1888,7 +1888,9 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 				continue;
 			}
 			try {
+				const previousLeafState = JSON.stringify(job.leafState);
 				const result = await evaluateCondition(job, job.condition);
+				if (JSON.stringify(job.leafState) !== previousLeafState) changed = true;
 				if (result.value) {
 					if (job.rearmPending) {
 						// After a fire, require the condition to evaluate false at least
@@ -2442,6 +2444,78 @@ function describeCondition(condition: Condition): string {
 	return "unknown condition";
 }
 
+function compactPathForReceipt(value: string, cwd: string): string {
+	const home = os.homedir();
+	const homeRelative = value === home ? "~" : value.startsWith(`${home}${path.sep}`) ? `~/${path.relative(home, value)}` : value;
+	const cwdRelative = path.isAbsolute(value) ? path.relative(cwd, value) : value;
+	let compact = cwdRelative && !cwdRelative.startsWith("..") && !path.isAbsolute(cwdRelative) && cwdRelative.length < homeRelative.length ? cwdRelative : homeRelative;
+	if (compact.length <= 88) return compact;
+	const parts = compact.split(/[\\/]+/).filter(Boolean);
+	if (parts.length >= 2) compact = `…/${parts.slice(-2).join("/")}`;
+	return truncateInline(compact, 88);
+}
+
+function describeConditionForReceipt(condition: Condition, cwd: string): string {
+	if (isGroupCondition(condition)) return `${condition.op.toUpperCase()}(${condition.children.map((child) => describeConditionForReceipt(child, cwd)).join(", ")})`;
+	if (condition.type === "timer") return condition.after !== undefined ? `timer reaches ${condition.after}` : `clock reaches ${condition.at ?? "the requested time"}`;
+	if (condition.type === "file") {
+		const action = condition.deleted ? "file is deleted" : condition.exists === false ? "file is absent" : condition.changed ? "file changes" : condition.stableFor !== undefined ? `file is stable for ${condition.stableFor}` : "file appears";
+		const content = condition.contains !== undefined ? ` and contains “${truncateInline(condition.contains, 36)}”` : condition.matches !== undefined ? ` and matches /${truncateInline(condition.matches, 36)}/` : "";
+		return `${action}${content}: ${compactPathForReceipt(condition.path, cwd)}`;
+	}
+	if (condition.type === "exec") return `command succeeds: ${truncateInline(condition.command ?? condition.code ?? "exec condition", 72)}`;
+	if (condition.type === "process") {
+		const target = condition.pid !== undefined
+			? `pid ${condition.pid}`
+			: condition.pidFile !== undefined
+				? compactPathForReceipt(condition.pidFile, cwd)
+				: condition.name ?? condition.commandContains ?? condition.matches ?? "process";
+		const state = condition.exited || condition.state === "exited" ? "exits" : "is running";
+		return `process ${state}: ${target}`;
+	}
+	if (condition.type === "port") return `port ${condition.host ?? "127.0.0.1"}:${condition.port} is ${condition.closed ? "closed" : "open"}`;
+	if (condition.type === "url") return `URL is ready: ${truncateInline(condition.url, 88)}`;
+	if (condition.type === "webhook") return `webhook arrives: ${condition.method ?? "POST"} ${condition.path ?? "configured path"}`;
+	return describeCondition(condition);
+}
+
+function formatReceiptConditionLines(job: ReturnOnJob): string[] {
+	const condition = job.condition;
+	if (isGroupCondition(condition) && condition.op !== "not") {
+		const heading = condition.op === "or" ? "It will return when ANY ONE happens:" : "It will return when ALL happen:";
+		return [heading, ...condition.children.map((child, index) => `  ${index + 1}. ${describeConditionForReceipt(child, job.cwd)}`)];
+	}
+	if (isGroupCondition(condition) && condition.op === "not") {
+		return ["It will return when this is no longer true:", `  • ${condition.children[0] ? describeConditionForReceipt(condition.children[0], job.cwd) : "condition"}`];
+	}
+	return ["It will return when:", `  • ${describeConditionForReceipt(condition, job.cwd)}`];
+}
+
+function formatReceiptCheckCadence(job: ReturnOnJob): string | undefined {
+	const pollable = collectConditionLeafTargets(job.condition)
+		.map(({ condition }) => pollingIntervalForLeaf(job, condition))
+		.filter((value): value is number => value !== undefined);
+	if (pollable.length === 0) return undefined;
+	const min = Math.min(...pollable);
+	const max = Math.max(...pollable);
+	return min === max ? `Checks: every ${formatDuration(min)}` : `Checks: every ${formatDuration(min)}–${formatDuration(max)}`;
+}
+
+function formatRegisteredJobMessage(job: ReturnOnJob, timeoutMs: number, maxTimeoutMs: number, maxFires: number, endTurn: boolean, incomingWebhooks: string): string {
+	const lines = [
+		`✅ return_on is WAITING now`,
+		`Job: ${job.label} (${job.id})`,
+		...formatReceiptConditionLines(job),
+		formatReceiptCheckCadence(job),
+		`Timeout: in ${formatDuration(timeoutMs)} (max ${formatDuration(maxTimeoutMs)})`,
+		maxFires > 1 ? `Repeats: up to ${maxFires} times after the condition resets` : undefined,
+		`View status: ${RETURN_ON_SHORTCUT_LABEL} or /return-on-waiters`,
+		endTurn ? "This chat will resume when it returns; no manual polling needed." : "Continuing this turn; the watcher is still active in the background.",
+		incomingWebhooks || undefined,
+	].filter((line): line is string => Boolean(line));
+	return lines.join("\n");
+}
+
 function latestLeafSummary(job: ReturnOnJob): string | undefined {
 	const latched = Object.entries(job.latches);
 	if (latched.length > 0) return `latched ${latched.length}: ${latched.map(([, latch]) => latch.summary).join("; ")}`;
@@ -2455,15 +2529,11 @@ function formatJobWaitSummary(job: ReturnOnJob): string {
 	return latestLeafSummary(job) ?? describeCondition(job.condition);
 }
 
-function formatStatusTag(active: ReturnOnJob[]): string {
-	const hint = ` · ${RETURN_ON_SHORTCUT_LABEL}`;
-	if (active.length === 1) {
-		const job = active[0];
-		return `⏰ ${truncateInline(job.label, 22)} · ${truncateInline(formatJobWaitSummary(job), 48)}${hint}`;
-	}
-	const labels = active.slice(0, 3).map((job) => truncateInline(job.label, 16)).join(" · ");
-	const more = active.length > 3 ? ` +${active.length - 3}` : "";
-	return `⏰ ${active.length} waiting: ${labels}${more}${hint}`;
+function formatStatusTag(active: ReturnOnJob[], theme?: Theme): string {
+	const clock = theme ? theme.fg("success", "⏰") : "⏰";
+	const count = theme ? theme.fg("success", String(active.length)) : String(active.length);
+	const hint = theme ? theme.fg("dim", RETURN_ON_SHORTCUT_LABEL) : RETURN_ON_SHORTCUT_LABEL;
+	return `${clock} ${count} · ${hint}`;
 }
 
 function pollingIntervalForLeaf(job: ReturnOnJob, condition: LeafCondition): number | undefined {
@@ -2574,18 +2644,49 @@ function formatTimeoutSummary(job: ReturnOnJob): string {
 	return remaining <= 0 ? `due ${formatDuration(-remaining)} ago` : `in ${formatDuration(remaining)}`;
 }
 
-function latestJobActivityAt(job: ReturnOnJob): number {
+function latestJobCheckAt(job: ReturnOnJob): number | undefined {
 	const leafChecks = Object.values(job.leafState).map((state) => state.lastCheckAt ?? 0);
 	const latchTimes = Object.values(job.latches).map((latch) => latch.trueAt);
-	return Math.max(
-		job.updatedAt ?? 0,
-		job.lastFiredAt ?? 0,
-		job.firedAt ?? 0,
-		job.cancelledAt ?? 0,
-		...leafChecks,
-		...latchTimes,
-		job.createdAt,
-	);
+	const latest = Math.max(0, ...leafChecks, ...latchTimes);
+	return latest > 0 ? latest : undefined;
+}
+
+function timerTargetAt(job: ReturnOnJob, condition: TimerCondition): number | undefined {
+	const afterMs = parseDuration(condition.after);
+	const afterAt = afterMs !== undefined ? job.createdAt + afterMs : undefined;
+	return afterAt ?? parseAt(condition.at, job.createdAt);
+}
+
+function formatJobCheckSchedule(job: ReturnOnJob, now = Date.now()): string | undefined {
+	const leaves = collectConditionLeafTargets(job.condition);
+	const pollable = leaves
+		.map((target) => {
+			const everyMs = pollingIntervalForLeaf(job, target.condition);
+			if (everyMs === undefined) return undefined;
+			const lastCheckAt = job.leafState[target.key]?.lastCheckAt;
+			return { everyMs, nextAt: lastCheckAt ? lastCheckAt + everyMs : now };
+		})
+		.filter((value): value is { everyMs: number; nextAt: number } => value !== undefined);
+	if (pollable.length > 0) {
+		const minEvery = Math.min(...pollable.map((item) => item.everyMs));
+		const maxEvery = Math.max(...pollable.map((item) => item.everyMs));
+		const nextAt = Math.min(...pollable.map((item) => item.nextAt));
+		const everyText = minEvery === maxEvery
+			? `checks every ${formatDuration(minEvery)}`
+			: `checks every ${formatDuration(minEvery)}–${formatDuration(maxEvery)}`;
+		const remaining = nextAt - now;
+		return `${everyText} · ${remaining <= 0 ? "next check now" : `next check in ${formatDuration(remaining)}`}`;
+	}
+	const timers = leaves
+		.map((target) => "type" in target.condition && target.condition.type === "timer" ? timerTargetAt(job, target.condition) : undefined)
+		.filter((target): target is number => target !== undefined);
+	if (timers.length > 0) {
+		const nextTimer = Math.min(...timers);
+		const remaining = nextTimer - now;
+		return remaining <= 0 ? "timer due now" : `timer due in ${formatDuration(remaining)}`;
+	}
+	if (leaves.some((target) => "type" in target.condition && target.condition.type === "webhook")) return "waiting for webhook";
+	return undefined;
 }
 
 function formatJobStatusBadge(job: ReturnOnJob): string {
@@ -2594,17 +2695,32 @@ function formatJobStatusBadge(job: ReturnOnJob): string {
 	return "× CANCELLED";
 }
 
+function colorJobStatusBadge(job: ReturnOnJob, theme: Theme): string {
+	const badge = formatJobStatusBadge(job);
+	if (job.status === "active") return theme.fg("warning", badge);
+	if (job.status === "fired") return theme.fg("success", badge);
+	return theme.fg("muted", badge);
+}
+
 function formatJobAgeSummary(job: ReturnOnJob): string {
 	const now = Date.now();
 	const started = `started ${formatAge(job.createdAt, now)}`;
-	if (job.status === "active") return `${started} · last check ${formatAge(latestJobActivityAt(job), now)}`;
+	if (job.status === "active") {
+		const checkedAt = latestJobCheckAt(job);
+		const schedule = formatJobCheckSchedule(job, now);
+		return `${started} · ${checkedAt ? `last check ${formatAge(checkedAt, now)}` : "not checked yet"}${schedule ? ` · ${schedule}` : ""}`;
+	}
 	if (job.status === "fired") return `${started} · returned ${formatAge(job.lastFiredAt ?? job.firedAt ?? job.updatedAt, now)}`;
 	return `${started} · cancelled ${formatAge(job.cancelledAt ?? job.updatedAt, now)}`;
 }
 
-function formatJobModalLine(job: ReturnOnJob): string {
+function formatJobModalLine(job: ReturnOnJob, theme?: Theme): string {
 	const timeout = job.status === "active" && job.timeoutAt ? ` · timeout ${formatTimeoutSummary(job)}` : "";
-	return `${formatJobStatusBadge(job)} — ${truncateInline(job.label, 56)} · ${formatJobAgeSummary(job)}${timeout}`;
+	const badge = theme ? colorJobStatusBadge(job, theme) : formatJobStatusBadge(job);
+	const label = truncateInline(job.label, 56);
+	const meta = `${formatJobAgeSummary(job)}${timeout}`;
+	if (!theme) return `${badge} — ${label} · ${meta}`;
+	return `${badge} ${theme.fg("muted", "—")} ${theme.fg("accent", label)} ${theme.fg("muted", "·")} ${theme.fg("dim", meta)}`;
 }
 
 const RETURN_ON_WAITERS_SORTS = ["status", "updated", "created", "timeout", "label"] as const;
@@ -2741,7 +2857,7 @@ class ReturnOnWaitersModal implements Component {
 			this.border("├", "┤", frameWidth),
 			this.frameLine(help, frameWidth),
 			this.border("└", "┘", frameWidth),
-		];
+		].map((line) => line.startsWith("│") ? line : this.theme.fg("muted", line));
 	}
 
 	invalidate(): void {
@@ -2803,7 +2919,7 @@ class ReturnOnWaitersModal implements Component {
 			}
 			for (const wrapped of wrapTextWithAnsi(line, innerWidth)) push(wrapped);
 		};
-		pushWrapped(this.theme.fg("dim", `Scope: ${this.scopeDescription()} · sort: ${this.sort} ${this.sortDescending ? "desc" : "asc"}`));
+		pushWrapped(`${this.theme.fg("dim", "Scope:")} ${this.theme.fg("accent", this.scopeDescription())} ${this.theme.fg("muted", "· sort:")} ${this.theme.fg("accent", `${this.sort} ${this.sortDescending ? "desc" : "asc"}`)}`);
 		pushWrapped(this.theme.fg("dim", "Keys: ↑/↓ or j/k select · Enter/d details · a scope · s sort · r reverse · Shift+J/K line-scroll"));
 		push("");
 		pushWrapped(this.theme.fg("accent", `Waiters (${visibleJobs.length}, ${activeCount} waiting)`));
@@ -2812,18 +2928,19 @@ class ReturnOnWaitersModal implements Component {
 		} else {
 			visibleJobs.forEach((job, index) => {
 				const selected = index === this.selectedIndex;
-				const marker = selected ? "›" : " ";
-				const line = `${marker} ${index + 1}. ${formatJobModalLine(job)}`;
-				pushWrapped(selected ? this.theme.fg("accent", line) : line);
+				const marker = selected ? this.theme.fg("accent", "›") : " ";
+				const indexText = selected ? this.theme.fg("accent", `${index + 1}.`) : this.theme.fg("dim", `${index + 1}.`);
+				const line = `${marker} ${indexText} ${formatJobModalLine(job, this.theme)}`;
+				pushWrapped(line);
 			});
 		}
 		const selectedJob = visibleJobs[this.selectedIndex];
 		if (selectedJob && this.showDetails) {
 			push("");
 			pushWrapped(this.theme.fg("accent", `Details: ${selectedJob.label}`));
-			pushWrapped(`id/state: ${selectedJob.id} / ${formatJobStatusBadge(selectedJob)}`);
-			pushWrapped(`waiting: ${formatJobWaitSummary(selectedJob)}`);
-			pushWrapped(`timeout: ${formatTimeoutSummary(selectedJob)}`);
+			pushWrapped(`${this.theme.fg("dim", "id/state:")} ${selectedJob.id} / ${colorJobStatusBadge(selectedJob, this.theme)}`);
+			pushWrapped(`${this.theme.fg("dim", "waiting:")} ${formatJobWaitSummary(selectedJob)}`);
+			pushWrapped(`${this.theme.fg("dim", "timeout:")} ${formatTimeoutSummary(selectedJob)}`);
 			pushWrapped(`${formatJobAgeSummary(selectedJob)} · timeout ${formatTimeoutSummary(selectedJob)}`);
 			pushWrapped(`session: ${selectedJob.sessionFile ?? "unknown"}`);
 			pushWrapped(`cwd: ${selectedJob.cwd}`);
@@ -3204,12 +3321,10 @@ export default function (pi: ExtensionAPI) {
 			}
 			ensureTicker(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
-			const webhookText = incomingWebhooks.length > 0 ? `\nIncoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
-			const timeoutText = `\nTimeout: ${formatDuration(timeoutMs)} (max ${formatDuration(returnOnConfig.maxTimeoutMs)})`;
-			const firesText = maxFires > 1 ? `\nMax fires: ${maxFires} (edge-triggered; condition must go false between fires)` : "";
+			const webhookText = incomingWebhooks.length > 0 ? `Incoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
 			const endTurn = params.endTurn !== false;
 			return {
-				content: [{ type: "text", text: `Registered return_on job ${job.id}: ${job.label}.\nWaiting for: ${formatJobWaitSummary(job)}${timeoutText}${firesText}\n${endTurn ? "I will wake the session when it fires; do not poll or wait manually." : "Continuing this turn; the watcher will still fire in the background."}${webhookText}` }],
+				content: [{ type: "text", text: formatRegisteredJobMessage(job, timeoutMs, returnOnConfig.maxTimeoutMs, maxFires, endTurn, webhookText) }],
 				details: { job, incomingWebhooks },
 				terminate: endTurn,
 			};
