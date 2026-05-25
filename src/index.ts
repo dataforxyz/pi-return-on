@@ -25,6 +25,7 @@ const FIRED_DIR = path.join(STATE_DIR, "fired");
 const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
 const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
 const DIRECT_WAIT_AUDIT_FILE = path.join(STATE_DIR, "direct-wait-audit.jsonl");
+const LIFECYCLE_AUDIT_FILE = path.join(STATE_DIR, "lifecycle-audit.jsonl");
 const DEFAULT_TICK_MS = 1000;
 const DEFAULT_EXEC_EVERY_MS = 5000;
 const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
@@ -91,6 +92,8 @@ interface ExecCondition extends Record<string, unknown> {
 	runner?: Runner;
 	shell?: Runner;
 	command?: string;
+	/** Compatibility alias normalized to command. Prefer command in new calls. */
+	cmd?: string;
 	code?: string;
 	every?: string | number;
 	timeout?: string | number;
@@ -754,6 +757,16 @@ async function saveHandlers(): Promise<void> {
 	await fsp.rename(tmp, HANDLERS_FILE);
 }
 
+async function appendLifecycleAudit(action: string, fields: Record<string, unknown> = {}): Promise<void> {
+	try {
+		await fsp.mkdir(STATE_DIR, { recursive: true });
+		const entry = { version: 1, event: "return_on.lifecycle", timestamp: Date.now(), action, ...fields };
+		await fsp.appendFile(LIFECYCLE_AUDIT_FILE, `${JSON.stringify(entry)}\n`, "utf8");
+	} catch (error) {
+		console.error(`[${EXTENSION_NAME}] Failed to append lifecycle audit:`, error);
+	}
+}
+
 function firedEventPath(jobId: string, fireCount?: number): string {
 	if (fireCount && fireCount > 1) return path.join(FIRED_DIR, `${jobId}.${fireCount}.json`);
 	return path.join(FIRED_DIR, `${jobId}.json`);
@@ -985,6 +998,7 @@ async function markFiredEventDelivered(eventPath: string, reason: string, status
 	if (eventPath !== firedEventPath(job.id)) {
 		await fsp.rm(eventPath, { force: true });
 	}
+	await appendLifecycleAudit("delivery_marked", { jobId: job.id, label: job.label, reason, status, eventPath, handlerRunId: job.handlerRunId, error: error instanceof Error ? error.message : error ? String(error) : undefined });
 }
 
 async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
@@ -1211,8 +1225,12 @@ function normalizeCondition(input: unknown): Condition {
 		return conditionInput as FileCondition;
 	}
 	if (conditionInput.type === "exec") {
+		if (conditionInput.command === undefined && typeof conditionInput.cmd === "string") {
+			const { cmd, ...rest } = conditionInput;
+			conditionInput = { ...rest, command: cmd };
+		}
 		if (typeof conditionInput.command !== "string" && typeof conditionInput.code !== "string") {
-			throw new Error("exec condition requires command or code");
+			throw new Error("exec condition requires command or code (or cmd as a compatibility alias for command)");
 		}
 		for (const field of ["runner", "shell"] as const) {
 			const runner = conditionInput[field];
@@ -2152,6 +2170,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	run.status = code === 0 ? "complete" : "failed";
 	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
 	await saveHandlers();
+	await appendLifecycleAudit("handler_finished", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, exitCode: code, signal, endedAt: run.endedAt, error: run.error });
 	try {
 		pi.appendEntry?.("return-on-handler-finished", { id: run.id, jobId: run.jobId, status: run.status, exitCode: code, signal, endedAt: run.endedAt });
 	} catch {
@@ -2195,6 +2214,7 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		}
 		changed = true;
 		reconciled += 1;
+		await appendLifecycleAudit("handler_reconciled", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, pid: run.pid, endedAt: run.endedAt, error: run.error });
 		try {
 			pi.appendEntry?.("return-on-handler-reconciled", { id: run.id, jobId: run.jobId, status: run.status, pid: run.pid, endedAt: run.endedAt });
 		} catch {
@@ -2248,6 +2268,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 	job.handlerRunId = run.id;
 	await saveHandlers();
 	await saveJobs();
+	await appendLifecycleAudit("handler_queued", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, startedAt: run.startedAt, notify: run.notify });
 
 	const command = getHandlerCommand(delivery);
 	const args = buildHandlerArgs(job, run);
@@ -2273,6 +2294,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 			run.endedAt = Date.now();
 			run.error = launch.error instanceof Error ? launch.error.message : String(launch.error);
 			await saveHandlers();
+			await appendLifecycleAudit("handler_launch_failed", { id: run.id, jobId: run.jobId, label: run.label, error: run.error, endedAt: run.endedAt });
 			console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, launch.error);
 			return false;
 		}
@@ -2280,6 +2302,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		run.pid = launch.pid;
 		run.status = "running";
 		await saveHandlers();
+		await appendLifecycleAudit("handler_running", { id: run.id, jobId: run.jobId, label: run.label, pid: run.pid, startedAt: run.startedAt });
 		if (delivery.notify === "ack-and-summary") {
 			pi.sendMessage(
 				{
@@ -2297,6 +2320,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		run.endedAt = Date.now();
 		run.error = error instanceof Error ? error.message : String(error);
 		await saveHandlers();
+		await appendLifecycleAudit("handler_launch_failed", { id: run.id, jobId: run.jobId, label: run.label, error: run.error, endedAt: run.endedAt });
 		console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, error);
 		return false;
 	}
@@ -2322,6 +2346,7 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 		job.rearmPending = true;
 	}
 	await saveJobs();
+	await appendLifecycleAudit("job_fired", { id: job.id, label: job.label, reason, fireCount: job.fireCount, exhausted, status: job.status, firedAt: job.lastFiredAt, timedOut: reason === "timeout" });
 	let eventPath: string | undefined;
 	try {
 		eventPath = await writeFiredEvent(job, reason);
@@ -2733,7 +2758,7 @@ function formatJobModalLine(job: ReturnOnJob, theme?: Theme): string {
 
 const RETURN_ON_WAITERS_SORTS = ["status", "updated", "created", "timeout", "label"] as const;
 type ReturnOnWaitersSort = typeof RETURN_ON_WAITERS_SORTS[number];
-type ReturnOnWaitersScope = "all" | "session";
+type ReturnOnWaitersScope = "related" | "session" | "all";
 
 function statusRank(job: ReturnOnJob): number {
 	return job.status === "active" ? 0 : job.status === "fired" ? 1 : 2;
@@ -2774,21 +2799,121 @@ function sortJobsForDisplay(items: ReturnOnJob[], sort: ReturnOnWaitersSort = "s
 	});
 }
 
+function formatByteCount(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KiB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function safeHandlerPath(filePath: string | undefined): string | undefined {
+	if (!filePath || !isPathInside(HANDLERS_DIR, filePath)) return undefined;
+	return filePath;
+}
+
+function handlerLogSize(filePath: string | undefined): number | undefined {
+	const safePath = safeHandlerPath(filePath);
+	if (!safePath) return undefined;
+	try {
+		return fs.statSync(safePath).size;
+	} catch {
+		return undefined;
+	}
+}
+
+function formatHandlerLogPathForModal(filePath: string | undefined): string {
+	if (!filePath) return "none";
+	const size = handlerLogSize(filePath);
+	return `${filePath}${size !== undefined ? ` (${formatByteCount(size)})` : ""}`;
+}
+
+function readHandlerLogTail(filePath: string | undefined, maxBytes = 1600, maxLines = 8): string | undefined {
+	const safePath = safeHandlerPath(filePath);
+	if (!safePath) return undefined;
+	try {
+		const stats = fs.statSync(safePath);
+		if (!stats.isFile() || stats.size <= 0) return undefined;
+		const fd = fs.openSync(safePath, "r");
+		try {
+			const length = Math.min(maxBytes, stats.size);
+			const buffer = Buffer.alloc(length);
+			fs.readSync(fd, buffer, 0, length, stats.size - length);
+			return buffer.toString("utf8").split("\n").filter((line) => line.trim().length > 0).slice(-maxLines).join("\n");
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+function commandAvailable(command: string): boolean {
+	if (command.includes(path.sep)) {
+		try {
+			fs.accessSync(command, fs.constants.X_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		try {
+			fs.accessSync(path.join(dir, command), fs.constants.X_OK);
+			return true;
+		} catch {
+			// Try next PATH entry.
+		}
+	}
+	return false;
+}
+
+function openHandlerDirInTerminal(dir: string | undefined): { ok: boolean; message: string } {
+	const safeDir = safeHandlerPath(dir);
+	if (!safeDir) return { ok: false, message: "Refusing to open handler logs outside the return_on handlers directory." };
+	const candidates: Array<{ command: string; args: string[] }> = [];
+	if (process.env.TERMINAL && !process.env.TERMINAL.includes(" ")) candidates.push({ command: process.env.TERMINAL, args: [] });
+	candidates.push(
+		{ command: "ghostty", args: ["--working-directory", safeDir] },
+		{ command: "kitty", args: ["--directory", safeDir] },
+		{ command: "alacritty", args: ["--working-directory", safeDir] },
+		{ command: "wezterm", args: ["start", "--cwd", safeDir] },
+		{ command: "x-terminal-emulator", args: ["--working-directory", safeDir] },
+		{ command: "gnome-terminal", args: ["--working-directory", safeDir] },
+	);
+	for (const candidate of candidates) {
+		if (!commandAvailable(candidate.command)) continue;
+		try {
+			const child = spawn(candidate.command, candidate.args, { cwd: safeDir, detached: true, stdio: "ignore" });
+			child.on("error", () => undefined);
+			child.unref();
+			return { ok: true, message: `Opened handler logs in ${candidate.command}: ${safeDir}` };
+		} catch {
+			// Try the next known terminal command.
+		}
+	}
+	return { ok: false, message: `No supported terminal was found. Handler logs are in ${safeDir}` };
+}
+
 class ReturnOnWaitersModal implements Component {
 	private scroll = 0;
 	private selectedIndex = 0;
 	private showDetails = false;
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
-	private scope: ReturnOnWaitersScope = "session";
+	private scope: ReturnOnWaitersScope = "related";
+	private showCompleted = false;
 	private sort: ReturnOnWaitersSort = "status";
 	private sortDescending = defaultSortDescending(this.sort);
 
 	constructor(
 		private readonly allJobs: ReturnOnJob[],
+		private readonly allHandlers: ReturnOnHandlerRun[],
 		private readonly session: string | undefined,
+		private readonly sessionId: string | undefined,
+		private readonly sessionName: string | undefined,
 		private readonly theme: Theme,
 		private readonly done: () => void,
+		private readonly notify: (message: string, type?: "info" | "warning" | "error") => void,
 	) {}
 
 	handleInput(data: string): void {
@@ -2801,8 +2926,13 @@ class ReturnOnWaitersModal implements Component {
 			return;
 		}
 		if (data === "a") {
-			this.scope = this.scope === "all" ? "session" : "all";
+			this.scope = this.scope === "related" ? "session" : this.scope === "session" ? "all" : "related";
 			this.resetView();
+		} else if (data === "c") {
+			this.showCompleted = !this.showCompleted;
+			this.resetView();
+		} else if (data === "o") {
+			this.openSelectedHandler(visibleJobs);
 		} else if (data === "s") {
 			const current = RETURN_ON_WAITERS_SORTS.indexOf(this.sort);
 			this.sort = RETURN_ON_WAITERS_SORTS[(current + 1) % RETURN_ON_WAITERS_SORTS.length];
@@ -2848,14 +2978,14 @@ class ReturnOnWaitersModal implements Component {
 		const maxScroll = Math.max(0, body.length - RETURN_ON_MODAL_BODY_LINES);
 		this.scroll = Math.min(this.scroll, maxScroll);
 		const visibleBody = body.slice(this.scroll, this.scroll + RETURN_ON_MODAL_BODY_LINES);
-		const scopeLabel = this.scope === "all" ? "all sessions" : "this chat";
+		const scopeLabel = this.scope === "all" ? "all sessions" : this.scope === "related" ? "related" : "this chat";
 		const sortLabel = `${this.sort} ${this.sortDescending ? "desc" : "asc"}`;
 		const selected = visibleJobs.length > 0 ? ` · ${this.selectedIndex + 1}/${visibleJobs.length}` : "";
 		const title = `${this.theme.fg("accent", "⏰ return_on waiters")} ${this.theme.fg("dim", `${activeCount} waiting · ${visibleJobs.length} total · ${scopeLabel} · ${sortLabel}${selected}`)}`;
 		const range = body.length > RETURN_ON_MODAL_BODY_LINES
 			? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + RETURN_ON_MODAL_BODY_LINES)}/${body.length}`
 			: "";
-		const help = this.theme.fg("dim", `↑/↓ select · Enter details · a all/this-chat · s sort · r reverse · q close${range}`);
+		const help = this.theme.fg("dim", `↑/↓ select · Enter details · a scope · c completed · s sort · r reverse · o open logs · q close${range}`);
 		return [
 			this.border("┌", "┐", frameWidth),
 			this.frameLine(title, frameWidth),
@@ -2903,13 +3033,46 @@ class ReturnOnWaitersModal implements Component {
 		return this.cachedLines?.length ?? 0;
 	}
 
+	private handlerForJob(job: ReturnOnJob): ReturnOnHandlerRun | undefined {
+		if (!job.handlerRunId) return undefined;
+		return this.allHandlers.find((run) => run.id === job.handlerRunId);
+	}
+
+	private jobIsRelated(job: ReturnOnJob): boolean {
+		if (jobVisibleForSession(job, this.session)) return true;
+		const handler = this.handlerForJob(job);
+		if (!handler) return false;
+		if (this.session && handler.parentSessionFile === this.session) return true;
+		if (this.sessionId && handler.parentSessionId === this.sessionId) return true;
+		if (this.sessionName && (handler.parentSessionName === this.sessionName || handler.parentIntercomTarget === this.sessionName)) return true;
+		if (this.session && handler.sessionDir && isPathInside(handler.sessionDir, this.session)) return true;
+		return false;
+	}
+
 	private visibleJobs(): ReturnOnJob[] {
-		const scoped = this.scope === "all" ? this.allJobs : this.allJobs.filter((job) => jobVisibleForSession(job, this.session));
-		return sortJobsForDisplay(scoped, this.sort, this.sortDescending);
+		const scoped = this.scope === "all"
+			? this.allJobs
+			: this.scope === "related"
+				? this.allJobs.filter((job) => this.jobIsRelated(job))
+				: this.allJobs.filter((job) => jobVisibleForSession(job, this.session));
+		const statusFiltered = this.showCompleted ? scoped : scoped.filter((job) => job.status === "active");
+		return sortJobsForDisplay(statusFiltered, this.sort, this.sortDescending);
+	}
+
+	private openSelectedHandler(visibleJobs: ReturnOnJob[]): void {
+		const job = visibleJobs[this.selectedIndex];
+		const handler = job ? this.handlerForJob(job) : undefined;
+		if (!job || !handler) {
+			this.notify("No return_on handler logs are attached to the selected waiter yet.", "info");
+			return;
+		}
+		const result = openHandlerDirInTerminal(handler.dir);
+		this.notify(result.message, result.ok ? "info" : "warning");
 	}
 
 	private scopeDescription(): string {
 		if (this.scope === "all") return "all sessions";
+		if (this.scope === "related") return this.session ? `related to this chat (${this.session})` : "related to this chat";
 		return this.session ? `this chat (${this.session})` : "this chat (unsaved session)";
 	}
 
@@ -2927,12 +3090,12 @@ class ReturnOnWaitersModal implements Component {
 			}
 			for (const wrapped of wrapTextWithAnsi(line, innerWidth)) push(wrapped);
 		};
-		pushWrapped(`${this.theme.fg("dim", "Scope:")} ${this.theme.fg("accent", this.scopeDescription())} ${this.theme.fg("muted", "· sort:")} ${this.theme.fg("accent", `${this.sort} ${this.sortDescending ? "desc" : "asc"}`)}`);
-		pushWrapped(this.theme.fg("dim", "Keys: ↑/↓ or j/k select · Enter/d details · a scope · s sort · r reverse · Shift+J/K line-scroll"));
+		pushWrapped(`${this.theme.fg("dim", "Scope:")} ${this.theme.fg("accent", this.scopeDescription())} ${this.theme.fg("muted", "· completed:")} ${this.theme.fg("accent", this.showCompleted ? "shown" : "hidden")} ${this.theme.fg("muted", "· sort:")} ${this.theme.fg("accent", `${this.sort} ${this.sortDescending ? "desc" : "asc"}`)}`);
+		pushWrapped(this.theme.fg("dim", "Keys: ↑/↓ or j/k select · Enter/d details · a scope · c completed · s sort · r reverse · o open logs"));
 		push("");
 		pushWrapped(this.theme.fg("accent", `Waiters (${visibleJobs.length}, ${activeCount} waiting)`));
 		if (visibleJobs.length === 0) {
-			pushWrapped(this.theme.fg("warning", `No return_on waiters for ${this.scope === "all" ? "any session" : "this chat"}.`));
+			pushWrapped(this.theme.fg("warning", `No return_on waiters for ${this.scope === "all" ? "any session" : this.scope === "related" ? "related jobs" : "this chat"}.`));
 		} else {
 			visibleJobs.forEach((job, index) => {
 				const selected = index === this.selectedIndex;
@@ -2953,7 +3116,27 @@ class ReturnOnWaitersModal implements Component {
 			pushWrapped(`session: ${selectedJob.sessionFile ?? "unknown"}`);
 			pushWrapped(`cwd: ${selectedJob.cwd}`);
 			if (selectedJob.delivery) pushWrapped(`delivery: ${selectedJob.delivery.mode} notify=${selectedJob.delivery.notify}`);
-			if (selectedJob.handlerRunId) pushWrapped(`handler: ${selectedJob.handlerRunId}`);
+			const handler = this.handlerForJob(selectedJob);
+			if (selectedJob.handlerRunId) pushWrapped(`handler: ${selectedJob.handlerRunId}${handler ? ` (${handler.status})` : ""}`);
+			if (handler) {
+				pushWrapped(`${this.theme.fg("dim", "handler dir:")} ${handler.dir}`);
+				pushWrapped(`${this.theme.fg("dim", "handler session:")} ${handler.sessionDir}`);
+				pushWrapped(`${this.theme.fg("dim", "stdout:")} ${formatHandlerLogPathForModal(handler.stdoutPath)}`);
+				pushWrapped(`${this.theme.fg("dim", "stderr:")} ${formatHandlerLogPathForModal(handler.stderrPath)}`);
+				if (handler.pid) pushWrapped(`handler pid: ${handler.pid}`);
+				if (handler.summary) pushWrapped(`summary: ${truncateInline(handler.summary, 180)}`);
+				if (handler.error) pushWrapped(this.theme.fg("error", `error: ${truncateInline(handler.error, 180)}`));
+				const stdoutTail = readHandlerLogTail(handler.stdoutPath);
+				const stderrTail = readHandlerLogTail(handler.stderrPath);
+				if (stdoutTail) {
+					pushWrapped(this.theme.fg("dim", "stdout tail:"));
+					for (const line of stdoutTail.split("\n")) pushWrapped(`  ${line}`);
+				}
+				if (stderrTail) {
+					pushWrapped(this.theme.fg("dim", "stderr tail:"));
+					for (const line of stderrTail.split("\n")) pushWrapped(`  ${line}`);
+				}
+			}
 			const maxFires = Math.max(1, selectedJob.maxFires ?? 1);
 			if (maxFires > 1) pushWrapped(`fires: ${selectedJob.fireCount ?? 0}/${maxFires}${selectedJob.rearmPending ? " (re-arm pending)" : ""}`);
 			pushWrapped("condition tree:");
@@ -2988,14 +3171,17 @@ async function showWaitersModal(ctx: ExtensionContext): Promise<void> {
 	latestCtx = ctx;
 	currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 	await loadJobs();
+	await loadHandlers();
 	const session = ctx.sessionManager.getSessionFile() ?? undefined;
+	const sessionId = ctx.sessionManager.getSessionId() ?? undefined;
+	const sessionName = ctx.sessionManager.getSessionName() ?? undefined;
 	const allJobs = sortJobsForDisplay(jobs, "status");
 	if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
 		ctx.ui.notify(allJobs.length ? allJobs.map(summarizeJob).join("\n") : "No return_on jobs.", "info");
 		return;
 	}
 	await ctx.ui.custom<void>(
-		(_tui, theme, _keybindings, done) => new ReturnOnWaitersModal(allJobs, session, theme, done),
+		(_tui, theme, _keybindings, done) => new ReturnOnWaitersModal(allJobs, handlerRuns, session, sessionId, sessionName, theme, done, (message, type = "info") => ctx.ui.notify(message, type)),
 		{
 			overlay: true,
 			overlayOptions: {
@@ -3115,7 +3301,7 @@ export default function (pi: ExtensionAPI) {
 		await loadJobs();
 		await loadHandlers();
 		try {
-			await reconcileHandlerRunsOnStartup(pi, undefined, false);
+			await reconcileHandlerRunsOnStartup(pi, currentSessionFile, true);
 		} catch (error) {
 			console.error(`[${EXTENSION_NAME}] Failed to reconcile handler runs:`, error);
 		}
@@ -3324,6 +3510,7 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
+			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
 			try {
 				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
 			} catch {
@@ -3356,6 +3543,7 @@ export default function (pi: ExtensionAPI) {
 			job.cancelledAt = Date.now();
 			job.updatedAt = job.cancelledAt;
 			await saveJobs();
+			await appendLifecycleAudit("job_cancelled", { id: job.id, label: job.label, cancelledAt: job.cancelledAt });
 			ensureTicker(pi);
 			return { content: [{ type: "text", text: `Cancelled ${job.id}.` }], details: { job } };
 		},

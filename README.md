@@ -41,7 +41,7 @@ Slash commands:
 Visibility:
 
 - Active waits update the Pi status footer with a compact green status such as `⏰ 1 · Ctrl+Alt+W` or `⏰ 2 · Ctrl+Alt+W` instead of noisy partial job titles.
-- Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a compact, color-coded modal for this chat. It shows one basic row per waiter by default, with clear states (`● WAITING`, `✓ RETURNED`, `× CANCELLED`) plus how long ago it started, when it last checked/returned, how often active waiters check, and when the next check is due; use `↑`/`↓` or `j`/`k` to move between waiters, `Enter`/`d` to expand details for the selected waiter, `a` to toggle this chat vs all sessions, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), and `r` to reverse sort order.
+- Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a compact, color-coded modal scoped to waiters related to this chat by default. It shows one basic row per active waiter by default, with clear states (`● WAITING`, `✓ RETURNED`, `× CANCELLED`) plus how long ago it started, when it last checked/returned, how often active waiters check, and when the next check is due; use `↑`/`↓` or `j`/`k` to move between waiters, `Enter`/`d` to expand details for the selected waiter, `a` to cycle related/this-chat/all sessions, `c` to include returned/cancelled waiters, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), `r` to reverse sort order, and `o` to open attached handler logs in a new terminal when available.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
 - The `return_on` registration result is a short WAITING receipt: it shows the job id/label, plain-language trigger bullets, check cadence, timeout, and the `Ctrl+Alt+W`/`/return-on-waiters` status shortcut.
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
@@ -64,9 +64,12 @@ Diagnostics:
 - `npm run scan-errors:recent` is `scan-errors --days 7` — the quick rolling check after fixes ship.
 - `npm run prune-sessions` dry-runs deletion of `~/.pi/agent/sessions/**/*.jsonl` files older than 30 days (configurable with `--days`); pass `--apply` to actually delete. Files modified within the last 24h are always kept so the active session can't be removed. Use this to keep the scan inputs from accumulating indefinitely.
 - `npm run audit:direct-waits` summarizes the structured direct-wait audit plus raw textual candidates in local Pi session logs, including long tool runtimes inferred from session timestamps (the same kind of wait shown in the feed as `Took 1371.6s`). Long runtimes are grouped by command pattern with a short return_on-oriented follow-up recommendation.
+- `npm run scan-lifecycle` summarizes local lifecycle health from `jobs.json`, `handlers.json`, fired event capsules, and `lifecycle-audit.jsonl`: timeout rate, expired/stale active jobs, failed/dead handlers, delivery gaps, and fire latency. Use `--json`, `--days N`, or `--since <iso>` for automation.
+- `npm run repair-lifecycle` dry-runs safe repairs for expired active jobs and in-flight handlers whose pids are dead; add `-- --apply` to mark expired jobs as timed out, create pending fired-event capsules, and reconcile dead handlers from stdout/stderr.
+- `npm run check:lifecycle` is the CI/automation gate. It runs the lifecycle scan and fails when counts exceed threshold env vars such as `RETURN_ON_MAX_EXPIRED_ACTIVE` or `RETURN_ON_MAX_DEAD_HANDLER_PIDS`.
 - `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns or long runtime thresholds and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
 - `npm run review:direct-waits` summarizes/dedupes that corpus, samples unreviewed examples, and can append human verdicts to the sidecar `~/.local/state/pi-return-on/direct-wait-example-reviews.jsonl` without mutating session logs.
-- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, append-only `lifecycle-audit.jsonl`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
 - Startup cleanup reconciles stale fork-handler ledger entries, keeps active jobs, pending/failed fired events, still-running handlers, and direct-wait example corpora, while pruning terminal jobs, delivered fired-event capsules, completed handler artifacts, and old direct-wait audit entries after 30 days by default. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window.
 
 ## `return_on` parameters
@@ -114,6 +117,8 @@ Flat leaves always include `type`:
 { "type": "timer",   "after": "30s" }
 { "type": "exec",    "command": "test -f out/done" }
 ```
+
+For exec leaves, prefer `command`; `cmd` is accepted as a compatibility alias and normalized to `command`.
 
 Groups should wrap flat leaves:
 

@@ -500,6 +500,17 @@ async function testCommonShorthandAccepted(harness: Harness) {
   if (execJob.condition.type !== "exec" || execJob.condition.command !== "exit 1") throw new Error(`exec shorthand was not normalized: ${JSON.stringify(execJob.condition)}`);
   await harness.cancel(execJob.id);
 
+  const execCmdAlias = await tool.execute("exec-cmd-alias", {
+    label: "exec cmd alias",
+    condition: { type: "exec", cmd: "exit 0", success: true, every: "2s" },
+    allowExec: true,
+    resume: "exec cmd alias resume",
+  }, new AbortController().signal, () => {}, harness.ctx);
+  const execCmdAliasJob = execCmdAlias.details.job;
+  allJobIds.push(execCmdAliasJob.id);
+  if (execCmdAliasJob.condition.type !== "exec" || execCmdAliasJob.condition.command !== "exit 0" || "cmd" in execCmdAliasJob.condition) throw new Error(`exec cmd alias was not normalized: ${JSON.stringify(execCmdAliasJob.condition)}`);
+  await harness.cancel(execCmdAliasJob.id);
+
   const wrapped = await tool.execute("wrapped-leaves", {
     label: "wrapped leaves",
     condition: {

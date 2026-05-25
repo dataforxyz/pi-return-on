@@ -287,3 +287,63 @@ Follow-up: in a couple weeks, re-run with `--since` set to the latest fix
 date and append a new dated section; the wrapper-shape hits should trend
 toward zero as the clearer error nudges agents to retry with the canonical
 shape on first failure.
+
+## 2026-05-25 current scan + exec `cmd` alias
+
+Refreshed scans:
+
+```bash
+node scripts/scan-return-on-errors.mjs --json
+node scripts/scan-return-on-errors.mjs --days 7 --json
+node scripts/scan-direct-waits.mjs --audit-only --json
+```
+
+Before today's compatibility tweak, the 7-day `return_on` error scan showed
+**1 unresolved / 4 total** recent errors:
+
+| Count | Error | Diagnosis |
+|------:|-------|-----------|
+| 1 | `exec condition requires command or code` | Agent supplied `{type:"exec", cmd:"..."}` instead of canonical `command`. |
+
+All other recent errors were historical wrapper-shape messages that are already
+covered by current condition compatibility. The cumulative scan had **2
+unresolved / 281 total** before the tweak: the same exec `cmd` alias issue plus
+one real `return_on timeout 4h exceeds max 2h` event.
+
+Fix: `normalizeCondition` now accepts `cmd` as a compatibility alias for exec
+conditions and normalizes it to `command`; the error scanner suppresses the old
+`exec condition requires command or code` entries when the failed call used
+that now-supported alias. Post-fix scan result:
+
+| Scope | Unresolved | Resolved / total |
+|-------|-----------:|-----------------:|
+| 7 days | 0 | 4 / 4 |
+| cumulative | 1 | 280 / 281 |
+
+Remaining unresolved cumulative issue: a single `4h` watcher request exceeding
+the current `2h` max. Keep this as a real signal unless it recurs; callers
+should choose a shorter watcher, chain follow-up watchers, or opt into a larger
+`returnOn.maxTimeout` in settings.
+
+Direct-wait audit entries are small and mostly benign: **28** audited events
+(**21** allowed short sleeps, **6** allowed short `timeout` commands, **1**
+blocked long sleep). The blocked case was `sleep 30s` inside a remote tmux
+smoke-check; the existing policy message suggested a timer watcher and captured
+artifacts, so no scanner/code change was needed for that pattern.
+
+Follow-up lifecycle tooling added:
+
+- `npm run scan-lifecycle` / `node scripts/scan-return-on-lifecycle.mjs --json` reads `~/.local/state/pi-return-on/{jobs.json,handlers.json,fired/,lifecycle-audit.jsonl}` and summarizes:
+
+- watcher outcomes: active/fired/cancelled, timeout count/rate, fire latency;
+- active health: expired active jobs, stale active jobs, never-checked jobs;
+- delivery health: fired events by status, fired jobs with no observed delivery;
+- handler health: failed handlers, stale in-flight handlers, in-flight handlers whose pid is already dead, completed handlers with no summary.
+
+Initial run on current state showed useful signals that the error scanner cannot see: **6 timed-out fired jobs**, **11 expired active jobs**, **12 stale active jobs**, **4 failed handlers**, and **2 in-flight handlers with dead pids**. Fired-event capsules themselves looked healthy (**153 handler-launched, 0 undelivered**).
+
+Additional upgrades in the same pass:
+
+- Extension now appends lifecycle events to `lifecycle-audit.jsonl` for registration, firing/timeouts, delivery marking, handler queue/running/finish/launch-failure, cancellation, and handler reconciliation. This preserves trend data even when retained state is pruned.
+- `npm run repair-lifecycle` dry-runs safe cleanup; `-- --apply` marks expired active jobs as timeout-fired with pending fired capsules and reconciles dead in-flight handler pids from their stdout/stderr artifacts.
+- `npm run check:lifecycle` fails automation if lifecycle health exceeds threshold env vars (`RETURN_ON_MAX_EXPIRED_ACTIVE`, `RETURN_ON_MAX_STALE_ACTIVE`, `RETURN_ON_MAX_DEAD_HANDLER_PIDS`, `RETURN_ON_MAX_STALE_HANDLERS`, `RETURN_ON_MAX_FAILED_HANDLERS`, `RETURN_ON_MAX_UNDELIVERED_EVENTS`, etc.). CI runs it over the last 7 days after tests.

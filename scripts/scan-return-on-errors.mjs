@@ -156,7 +156,22 @@ function classifyResolved(text, args) {
 	) {
 		if (hasCompatConditionShape(args?.condition)) return "supported_by_current_condition_compat";
 	}
+	if (text.startsWith("exec condition requires command or code") && hasExecCmdAlias(args?.condition)) {
+		return "supported_by_current_exec_cmd_alias";
+	}
 	return undefined;
+}
+
+function hasExecCmdAlias(condition) {
+	condition = parseConditionMaybe(condition);
+	if (!condition || typeof condition !== "object" || Array.isArray(condition)) return false;
+	if (Array.isArray(condition.any)) return condition.any.some(hasExecCmdAlias);
+	if (Array.isArray(condition.all)) return condition.all.some(hasExecCmdAlias);
+	if (condition.not !== undefined) return hasExecCmdAlias(condition.not);
+	if (Array.isArray(condition.children)) return condition.children.some(hasExecCmdAlias);
+	if (condition.type === "exec" && typeof condition.cmd === "string" && condition.command === undefined) return true;
+	if (isPlainObject(condition.exec) && typeof condition.exec.cmd === "string" && condition.exec.command === undefined) return true;
+	return false;
 }
 
 function addMapItem(map, key, item) {
