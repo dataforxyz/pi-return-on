@@ -252,6 +252,7 @@ interface ReturnOnHandlerRun {
 	triggerParentOnSummary?: boolean;
 	summary?: string;
 	error?: string;
+	finishSource?: "close" | "reconciled";
 }
 
 interface JobsState {
@@ -2146,6 +2147,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	run.endedAt = Date.now();
 	run.exitCode = code;
 	run.signal = signal;
+	run.finishSource = "close";
 	const { stderr } = await fillHandlerOutput(run);
 	run.status = code === 0 ? "complete" : "failed";
 	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
@@ -2168,8 +2170,9 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	}
 }
 
-async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: string | undefined): Promise<void> {
+async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: string | undefined, notifyReconciled = true): Promise<number> {
 	let changed = false;
+	let reconciled = 0;
 	for (const run of handlerRuns) {
 		if (run.status !== "starting" && run.status !== "running") continue;
 		if (!handlerVisibleForSession(run, sessionFile)) continue;
@@ -2180,6 +2183,7 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		run.endedAt = run.endedAt ?? Date.now();
 		run.exitCode = run.exitCode ?? null;
 		run.signal = run.signal ?? null;
+		run.finishSource = "reconciled";
 		if (run.status === "starting") {
 			run.status = "failed";
 			run.error = run.error || stderr.trim() || "handler was still starting when the parent session ended";
@@ -2190,13 +2194,14 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 			run.status = "complete";
 		}
 		changed = true;
+		reconciled += 1;
 		try {
 			pi.appendEntry?.("return-on-handler-reconciled", { id: run.id, jobId: run.jobId, status: run.status, pid: run.pid, endedAt: run.endedAt });
 		} catch {
 			// Best-effort audit trail.
 		}
 		const notify = run.notify ?? storedJob?.delivery?.notify ?? "summary";
-		if (notify === "summary" || notify === "ack-and-summary") {
+		if (notifyReconciled && (notify === "summary" || notify === "ack-and-summary")) {
 			try {
 				pi.sendMessage(
 					{
@@ -2213,9 +2218,12 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		}
 	}
 	if (changed) await saveHandlers();
+	return reconciled;
 }
 
 async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig): Promise<boolean> {
+	await loadHandlers();
+	await reconcileHandlerRunsOnStartup(pi, undefined, false);
 	await loadHandlers();
 	const id = makeHandlerId(job);
 	const run: ReturnOnHandlerRun = {
@@ -3107,7 +3115,7 @@ export default function (pi: ExtensionAPI) {
 		await loadJobs();
 		await loadHandlers();
 		try {
-			await reconcileHandlerRunsOnStartup(pi, currentSessionFile);
+			await reconcileHandlerRunsOnStartup(pi, undefined, false);
 		} catch (error) {
 			console.error(`[${EXTENSION_NAME}] Failed to reconcile handler runs:`, error);
 		}
@@ -3164,6 +3172,8 @@ export default function (pi: ExtensionAPI) {
 		description: "List background return_on fork handlers",
 		handler: async (_args, ctx) => {
 			latestCtx = ctx;
+			await loadHandlers();
+			await reconcileHandlerRunsOnStartup(pi, undefined, false);
 			await loadHandlers();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
 			const relevant = handlerRuns.filter((run) => handlerVisibleForSession(run, session));
@@ -3421,6 +3431,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ status: Type.Optional(StringEnum(["starting", "running", "complete", "failed", "all"] as const)) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
+			await loadHandlers();
+			await reconcileHandlerRunsOnStartup(pi, undefined, false);
 			await loadHandlers();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
 			const status = params.status ?? "all";
