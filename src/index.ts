@@ -48,6 +48,11 @@ const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
+const RETURN_ON_HANDLER_ENV = "PI_RETURN_ON_HANDLER";
+const RETURN_ON_PARENT_SESSION_FILE_ENV = "PI_RETURN_ON_PARENT_SESSION_FILE";
+const RETURN_ON_PARENT_SESSION_ID_ENV = "PI_RETURN_ON_PARENT_SESSION_ID";
+const RETURN_ON_PARENT_SESSION_NAME_ENV = "PI_RETURN_ON_PARENT_SESSION_NAME";
+const RETURN_ON_PARENT_INTERCOM_TARGET_ENV = "PI_RETURN_ON_PARENT_INTERCOM_TARGET";
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
@@ -1939,7 +1944,28 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 	}
 }
 
+function inheritedParentEnv(name: string): string | undefined {
+	const value = process.env[name]?.trim();
+	return value ? value : undefined;
+}
+
+function isReturnOnHandlerProcess(): boolean {
+	return process.env[RETURN_ON_HANDLER_ENV] === "1";
+}
+
+function getParentSessionFile(ctx = latestCtx): string | undefined {
+	if (isReturnOnHandlerProcess()) {
+		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_FILE_ENV);
+		if (inherited) return inherited;
+	}
+	return ctx?.sessionManager.getSessionFile() ?? undefined;
+}
+
 function getParentSessionId(ctx = latestCtx): string | undefined {
+	if (isReturnOnHandlerProcess()) {
+		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_ID_ENV);
+		if (inherited) return inherited;
+	}
 	try {
 		const sessionManager = ctx?.sessionManager as { getSessionId?: () => string } | undefined;
 		return sessionManager?.getSessionId?.();
@@ -1949,6 +1975,10 @@ function getParentSessionId(ctx = latestCtx): string | undefined {
 }
 
 function getParentSessionName(pi: ExtensionAPI): string | undefined {
+	if (isReturnOnHandlerProcess()) {
+		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_NAME_ENV);
+		if (inherited) return inherited;
+	}
 	try {
 		return pi.getSessionName?.();
 	} catch {
@@ -1957,6 +1987,10 @@ function getParentSessionName(pi: ExtensionAPI): string | undefined {
 }
 
 function resolveParentIntercomTarget(pi: ExtensionAPI, ctx = latestCtx): string | undefined {
+	if (isReturnOnHandlerProcess()) {
+		const inherited = inheritedParentEnv(RETURN_ON_PARENT_INTERCOM_TARGET_ENV);
+		if (inherited) return inherited;
+	}
 	const name = getParentSessionName(pi)?.trim();
 	if (name) return name;
 	const sessionId = getParentSessionId(ctx);
@@ -2246,15 +2280,18 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 	await reconcileHandlerRunsOnStartup(pi, undefined, false);
 	await loadHandlers();
 	const id = makeHandlerId(job);
+	const parentSessionId = getParentSessionId();
+	const parentSessionName = getParentSessionName(pi);
+	const parentIntercomTarget = resolveParentIntercomTarget(pi);
 	const run: ReturnOnHandlerRun = {
 		...buildForkRunPaths("return_on", id),
 		jobId: job.id,
 		label: job.label,
 		cwd: job.cwd,
 		...(job.sessionFile ? { parentSessionFile: job.sessionFile } : {}),
-		...(getParentSessionId() ? { parentSessionId: getParentSessionId() } : {}),
-		...(getParentSessionName(pi) ? { parentSessionName: getParentSessionName(pi) } : {}),
-		...(resolveParentIntercomTarget(pi) ? { parentIntercomTarget: resolveParentIntercomTarget(pi) } : {}),
+		...(parentSessionId ? { parentSessionId } : {}),
+		...(parentSessionName ? { parentSessionName } : {}),
+		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
 		status: "starting",
 		startedAt: Date.now(),
 		notify: delivery.notify,
@@ -2281,7 +2318,10 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 			stderrPath: run.stderrPath,
 			env: buildForkHandlerEnv("return_on", run.id, {
 				...process.env,
-				...(job.sessionFile ? { PI_RETURN_ON_PARENT_SESSION_FILE: job.sessionFile } : {}),
+				...(job.sessionFile ? { [RETURN_ON_PARENT_SESSION_FILE_ENV]: job.sessionFile } : {}),
+				...(parentSessionId ? { [RETURN_ON_PARENT_SESSION_ID_ENV]: parentSessionId } : {}),
+				...(parentSessionName ? { [RETURN_ON_PARENT_SESSION_NAME_ENV]: parentSessionName } : {}),
+				...(parentIntercomTarget ? { [RETURN_ON_PARENT_INTERCOM_TARGET_ENV]: parentIntercomTarget } : {}),
 			}),
 			onClose: (code, signal) => {
 				void markHandlerFinished(pi, job, run.id, code, signal, delivery.notify, delivery.triggerParentOnSummary).catch((error) => {
@@ -3486,11 +3526,12 @@ export default function (pi: ExtensionAPI) {
 			if (maxFires > 1 && conditionIsTimerOnly(condition)) {
 				throw new Error("maxFires > 1 requires a re-armable condition. A timer-only condition cannot fire more than once because a passed deadline stays passed. Combine the timer with a file/process/port/url/exec/webhook leaf, or use multiple separate watchers.");
 			}
+			const registrationSessionFile = getParentSessionFile(ctx);
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
 				cwd: ctx.cwd,
-				sessionFile: currentSessionFile,
+				...(registrationSessionFile ? { sessionFile: registrationSessionFile } : {}),
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 				status: "active",
@@ -3510,7 +3551,7 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
-			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
+			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, inheritedParentSession: isReturnOnHandlerProcess() && !!registrationSessionFile, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
 			try {
 				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
 			} catch {
