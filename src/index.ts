@@ -2031,22 +2031,23 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		? `Parent intercom target, if pi-intercom is available: ${run.parentIntercomTarget}`
 		: "No parent intercom target was resolved; rely on your final summary.";
 	return [
-		"You are a background return_on handler running in a fork/sibling Pi session.",
-		"The parent chat should stay undistracted. Handle the fired event as independently as safely possible.",
+		"You are a background return_on handler running in a forked sibling Pi session.",
+		"The parent chat should stay undistracted. Handle the fired event capsule as independently as safely possible.",
 		"",
 		"Operating rules:",
-		"- Treat the inherited session/context as a snapshot, not live state.",
+		"- Treat the forked parent transcript as context only, not live transcript work to continue.",
 		"- You are delegated to handle this return event directly when safe; do not defer routine work back to the parent.",
 		"- You may answer or act when the needed response is derivable from the event, inherited context, repo state, or prior user instructions.",
 		"- Escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
-		"- You may use normal Pi tools and extensions available in this top-level session, including subagent(...) if it is available and useful.",
+		"- You may use normal Pi tools and extensions available in this top-level session.",
+		"- Start subagents only when the resume instruction explicitly requires delegation/review or when needed to safely triage the event; async subagents should route to the inherited parent/main session unless intentionally private to this ephemeral handler.",
 		"- Do not ask the parent routine completion questions. Only contact the parent for a blocker, risky action, approval, or user decision.",
 		"- If pi-intercom is available and a parent target is provided, use intercom.send for non-blocking progress, blocker, or escalation notices.",
 		"- Use intercom.ask only when you cannot safely continue without a parent decision; it blocks this handler until reply or timeout.",
 		"- If you do contact the parent, keep it brief and include the handler id.",
 		"- Prefer producing a concise final summary.",
 		...handlerParentNotificationLines(run).map((line) => `- ${line}`),
-		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting for an external event.",
+		"- Do not register another return_on watcher unless the resume instruction explicitly requires continued background waiting for an external event; when you do, route it to the inherited parent/main session unless intentionally private to this ephemeral handler.",
 		"- Never wait for this handler's own pid or status. If return_on_handlers shows this handler as running, that is expected while you are executing; summarize that observation instead of waiting.",
 		"",
 		parentContact,
@@ -2065,12 +2066,13 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 
 function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 	return [
-		"You are a background return_on handler in a sibling Pi process.",
+		"You are a background return_on handler in a forked sibling Pi process.",
 		"Your only task is to handle the return_on event capsule supplied in the latest user message.",
-		"Do not continue unrelated inherited parent work. Treat inherited conversation as context only.",
+		"Do not continue unrelated parent work. Treat the forked parent transcript as context only.",
 		"You have delegated authority to handle routine work when safe; escalate only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
 		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
 		"If pi-intercom is available, use intercom.send for non-blocking parent notices and intercom.ask only for true blocking parent decisions.",
+		"Start subagents or nested return_on watchers only when the resume instruction requires it; route follow-up results to the inherited parent/main session unless intentionally private to this ephemeral handler.",
 		...(run.parentIntercomTarget ? [`Parent intercom target: ${run.parentIntercomTarget}`] : []),
 		...handlerParentNotificationLines(run),
 		`Handler id: ${run.id}`,
@@ -2160,10 +2162,23 @@ function isProcessAlive(pid: number | undefined): boolean {
 	}
 }
 
-async function fillHandlerOutput(run: ReturnOnHandlerRun): Promise<{ stdout: string; stderr: string }> {
+function fallbackSummaryForEmptyHandler(job: { label: string }, run: ReturnOnHandlerRun): string {
+	return truncateText([
+		"Handler exited without a final response. No stdout/stderr output was captured.",
+		"The handler may have delegated follow-up work (for example async subagents or another return_on watcher) and ended before producing a final text summary.",
+		`Job: ${job.label} (${run.jobId})`,
+		`Handler: ${run.id}`,
+		`Event: ${run.eventPath}`,
+	].join("\n"), HANDLER_SUMMARY_LIMIT_BYTES);
+}
+
+async function fillHandlerOutput(run: ReturnOnHandlerRun, job?: { label: string }): Promise<{ stdout: string; stderr: string }> {
 	const stdout = await readOptionalText(run.stdoutPath);
 	const stderr = await readOptionalText(run.stderrPath);
-	run.summary = truncateText(stdout.trim() || stderr.trim(), HANDLER_SUMMARY_LIMIT_BYTES);
+	const rawSummary = stdout.trim() || stderr.trim();
+	run.summary = rawSummary
+		? truncateText(rawSummary, HANDLER_SUMMARY_LIMIT_BYTES)
+		: fallbackSummaryForEmptyHandler(job ?? { label: run.label }, run);
 	return { stdout, stderr };
 }
 
@@ -2175,7 +2190,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	run.exitCode = code;
 	run.signal = signal;
 	run.finishSource = "close";
-	const { stderr } = await fillHandlerOutput(run);
+	const { stderr } = await fillHandlerOutput(run, job);
 	run.status = code === 0 ? "complete" : "failed";
 	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
 	await saveHandlers();
@@ -2214,7 +2229,7 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		if (run.status === "running" && isProcessAlive(run.pid)) continue;
 		const storedJob = jobs.find((candidate) => candidate.id === run.jobId);
 		const job = storedJob ?? { id: run.jobId, label: run.label };
-		const { stderr } = await fillHandlerOutput(run);
+		const { stderr } = await fillHandlerOutput(run, job);
 		run.endedAt = run.endedAt ?? Date.now();
 		run.exitCode = run.exitCode ?? null;
 		run.signal = run.signal ?? null;

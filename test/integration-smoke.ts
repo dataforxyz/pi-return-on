@@ -381,6 +381,7 @@ async function testForkDelivery(harness: Harness) {
       if (!summaryContent.includes("fake return_on handler summary")) throw new Error("fork delivery summary missed fake handler output");
       if (!summaryContent.includes("Output:") || !summaryContent.includes("Errors: none")) throw new Error("fork delivery summary missed log pointers");
       const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
+      if (!args.includes("--fork")) throw new Error(`fork delivery should fork the parent transcript when safe: ${JSON.stringify(args)}`);
       const systemPromptIndex = args.indexOf("--append-system-prompt");
       if (systemPromptIndex === -1) throw new Error("fork delivery did not pass a handler system prompt");
       const handlerSystemPrompt = String(args[systemPromptIndex + 1] ?? "");
@@ -396,6 +397,31 @@ async function testForkDelivery(harness: Harness) {
     await sleep(50);
   }
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
+}
+
+async function testEmptyForkHandlerSummaryFallback(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-empty-handler-pi.mjs");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\n`, { mode: 0o755 });
+  const label = "smoke empty fork summary";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume: "empty handler summary resume",
+    delivery: { mode: "fork", piCommand: fakePi, notify: "summary", triggerParentOnSummary: true },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const handlerMessages = harness.messages.filter((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId);
+    const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
+    if (summary) {
+      const content = String(summary.message?.content ?? "");
+      if (!content.includes("Handler exited without a final response")) throw new Error(`empty handler summary missed fallback: ${content}`);
+      if (content.includes("(no handler output)")) throw new Error(`empty handler summary used old placeholder: ${content}`);
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for empty fork handler summary");
 }
 
 async function testCancelledForkHandlerSuppressesSummary(harness: Harness) {
@@ -1554,6 +1580,7 @@ await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
+await testEmptyForkHandlerSummaryFallback(harness);
 await testCancelledForkHandlerSuppressesSummary(harness);
 await testForkLaunchFailureFallsBackToWake(harness);
 await testAgentArtifactForkDelivery(harness);
