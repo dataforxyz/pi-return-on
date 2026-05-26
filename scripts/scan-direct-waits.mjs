@@ -3,9 +3,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import { parseDurationMs } from "./lib/time-utils.mjs";
+import { getAuditFile } from "./lib/state-paths.mjs";
 
 const home = os.homedir();
-const defaultAuditFile = path.join(home, ".local", "state", "pi-return-on", "direct-wait-audit.jsonl");
+const defaultAuditFile = getAuditFile();
 const defaultRoots = [
   defaultAuditFile,
   path.join(home, ".pi", "agent", "sessions"),

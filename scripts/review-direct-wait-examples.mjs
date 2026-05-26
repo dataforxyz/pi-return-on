@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as os from "node:os";
+import { getStateDir } from "./lib/state-paths.mjs";
 
-const home = os.homedir();
-const stateDir = path.join(home, ".local", "state", "pi-return-on");
+const stateDir = getStateDir();
 const defaultCorpus = path.join(stateDir, "direct-wait-examples.jsonl");
 const defaultReviews = path.join(stateDir, "direct-wait-example-reviews.jsonl");
 const allowedVerdicts = new Set([

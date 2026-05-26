@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { getFiredDir, getHandlersPath, getJobsPath, getLifecycleAuditFile, getStateDir } from "./lib/state-paths.mjs";
 
 const args = process.argv.slice(2);
 let jsonOut = false;
 let staleMs = 10 * 60_000;
 let sinceMs;
-let stateDir = join(homedir(), ".local", "state", "pi-return-on");
+let stateDir = getStateDir();
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -96,17 +96,17 @@ function pidAlive(pid) {
 }
 
 const now = Date.now();
-const jobsAll = readJson(join(stateDir, "jobs.json"), { jobs: [] }).jobs ?? [];
-const handlersAll = readJson(join(stateDir, "handlers.json"), { handlers: [] }).handlers ?? [];
+const jobsAll = readJson(getJobsPath(stateDir), { jobs: [] }).jobs ?? [];
+const handlersAll = readJson(getHandlersPath(stateDir), { handlers: [] }).handlers ?? [];
 const jobs = sinceMs ? jobsAll.filter((job) => (job.createdAt ?? 0) >= sinceMs || (job.updatedAt ?? 0) >= sinceMs || (job.firedAt ?? 0) >= sinceMs) : jobsAll;
 const jobIds = new Set(jobs.map((job) => job.id));
 const handlers = sinceMs ? handlersAll.filter((handler) => jobIds.has(handler.jobId) || (handler.startedAt ?? 0) >= sinceMs || (handler.endedAt ?? 0) >= sinceMs) : handlersAll;
 
-const lifecycleAudit = readJsonl(join(stateDir, "lifecycle-audit.jsonl"))
+const lifecycleAudit = readJsonl(getLifecycleAuditFile(stateDir))
   .filter((entry) => !sinceMs || (entry.timestamp ?? 0) >= sinceMs);
 
 const firedEvents = [];
-const firedDir = join(stateDir, "fired");
+const firedDir = getFiredDir(stateDir);
 if (existsSync(firedDir)) {
   for (const name of readdirSync(firedDir)) {
     if (!name.endsWith(".json")) continue;

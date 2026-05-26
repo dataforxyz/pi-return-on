@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import { getFiredDir, getHandlersPath, getJobsPath, getLifecycleAuditFile, getStateDir } from "./lib/state-paths.mjs";
 
 const args = process.argv.slice(2);
 let apply = false;
 let staleMs = 10 * 60_000;
-let stateDir = join(homedir(), ".local", "state", "pi-return-on");
+let stateDir = getStateDir();
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -42,7 +42,7 @@ function atomicWriteJson(file, value) {
 function appendLifecycleAudit(action, fields = {}) {
   mkdirSync(stateDir, { recursive: true });
   const entry = { version: 1, event: "return_on.lifecycle", timestamp: Date.now(), action, source: "repair-script", ...fields };
-  appendFileSync(join(stateDir, "lifecycle-audit.jsonl"), `${JSON.stringify(entry)}\n`, "utf8");
+  appendFileSync(getLifecycleAuditFile(stateDir), `${JSON.stringify(entry)}\n`, "utf8");
 }
 
 function pidAlive(pid) {
@@ -61,11 +61,11 @@ function truncate(text, max = 24 * 1024) {
 
 function firedEventPath(job, fireCount) {
   const name = fireCount && fireCount > 1 ? `${job.id}.${fireCount}.json` : `${job.id}.json`;
-  return join(stateDir, "fired", name);
+  return join(getFiredDir(stateDir), name);
 }
 
 function writePendingFiredEvent(job, reason) {
-  mkdirSync(join(stateDir, "fired"), { recursive: true });
+  mkdirSync(getFiredDir(stateDir), { recursive: true });
   const eventPath = firedEventPath(job, job.fireCount);
   const event = {
     version: 1,
@@ -88,8 +88,8 @@ function writePendingFiredEvent(job, reason) {
 }
 
 const now = Date.now();
-const jobsFile = join(stateDir, "jobs.json");
-const handlersFile = join(stateDir, "handlers.json");
+const jobsFile = getJobsPath(stateDir);
+const handlersFile = getHandlersPath(stateDir);
 const jobsState = readJson(jobsFile, { version: 1, jobs: [] });
 const handlersState = readJson(handlersFile, { version: 1, handlers: [] });
 const jobs = Array.isArray(jobsState.jobs) ? jobsState.jobs : [];

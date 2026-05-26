@@ -4,10 +4,11 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { createHash } from "node:crypto";
 import { parseDurationMs } from "./lib/time-utils.mjs";
+import { getStateDir } from "./lib/state-paths.mjs";
 
 const scannerVersion = 1;
 const home = os.homedir();
-const stateDir = path.join(home, ".local", "state", "pi-return-on");
+const stateDir = getStateDir();
 const defaultSessionsRoot = path.join(home, ".pi", "agent", "sessions");
 const defaultOutput = path.join(stateDir, "direct-wait-examples.jsonl");
 const maxFileBytes = 20 * 1024 * 1024;
