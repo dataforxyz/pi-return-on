@@ -2,6 +2,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import { parseDurationMs } from "./lib/time-utils.mjs";
 
 const home = os.homedir();
 const defaultAuditFile = path.join(home, ".local", "state", "pi-return-on", "direct-wait-audit.jsonl");
@@ -32,24 +33,6 @@ Examples:
   node scripts/scan-direct-waits.mjs --json ~/.pi/agent/sessions
   node scripts/scan-direct-waits.mjs --audit-only`);
   process.exit(0);
-}
-
-function parseDurationMs(value, unit = "s") {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return undefined;
-  const normalized = unit.toLowerCase();
-  const multiplier = normalized === "" || normalized === "s"
-    ? 1000
-    : normalized === "m"
-      ? 60_000
-      : normalized === "h"
-        ? 3_600_000
-        : normalized === "d"
-          ? 86_400_000
-          : normalized === "ms"
-            ? 1
-            : undefined;
-  return multiplier === undefined ? undefined : Math.round(numeric * multiplier);
 }
 
 function isBackgrounded(text) {
