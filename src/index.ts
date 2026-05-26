@@ -1311,7 +1311,7 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 
 export function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: IncomingWebhookTarget[] = []): IncomingWebhookTarget[] {
 	walkConditionLeaves(condition, (leaf, leafKey) => {
-		if (leaf.type === "webhook") targets.push({ jobId: job.id, key: leafKey, condition: leaf as IncomingWebhookCondition });
+		if (leaf.type === "webhook") targets.push({ jobId: job.id, key: leafKey, condition: leaf });
 	}, key);
 	return targets;
 }
