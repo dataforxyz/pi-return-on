@@ -1252,15 +1252,20 @@ function prepareIncomingWebhooks(condition: Condition): void {
 	condition.method ??= "POST";
 }
 
-export function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
+function walkConditionLeaves(condition: Condition, visit: (leaf: Exclude<Condition, GroupCondition>, key: string) => void, key = "root"): void {
 	if (isGroupCondition(condition)) {
-		condition.children.forEach((child, index) => collectFileWatchTargets(job, child, `${key}.${index}`, targets));
-		return targets;
+		condition.children.forEach((child, index) => walkConditionLeaves(child, visit, `${key}.${index}`));
+		return;
 	}
-	if (condition.type === "file") {
-		const filePath = path.resolve(job.cwd, condition.path);
-		targets.push({ jobId: job.id, key, filePath, dir: path.dirname(filePath), basename: path.basename(filePath) });
-	}
+	visit(condition as Exclude<Condition, GroupCondition>, key);
+}
+
+export function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
+	walkConditionLeaves(condition, (leaf, leafKey) => {
+		if (leaf.type !== "file") return;
+		const filePath = path.resolve(job.cwd, leaf.path);
+		targets.push({ jobId: job.id, key: leafKey, filePath, dir: path.dirname(filePath), basename: path.basename(filePath) });
+	}, key);
 	return targets;
 }
 
@@ -1305,20 +1310,16 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 }
 
 export function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: IncomingWebhookTarget[] = []): IncomingWebhookTarget[] {
-	if (isGroupCondition(condition)) {
-		condition.children.forEach((child, index) => collectIncomingWebhookTargets(job, child, `${key}.${index}`, targets));
-		return targets;
-	}
-	if (condition.type === "webhook") targets.push({ jobId: job.id, key, condition });
+	walkConditionLeaves(condition, (leaf, leafKey) => {
+		if (leaf.type === "webhook") targets.push({ jobId: job.id, key: leafKey, condition: leaf as IncomingWebhookCondition });
+	}, key);
 	return targets;
 }
 
 export function collectConditionLeafTargets(condition: Condition, key = "root", targets: ConditionLeafTarget[] = []): ConditionLeafTarget[] {
-	if (isGroupCondition(condition)) {
-		condition.children.forEach((child, index) => collectConditionLeafTargets(child, `${key}.${index}`, targets));
-		return targets;
-	}
-	targets.push({ key, condition });
+	walkConditionLeaves(condition, (leaf, leafKey) => {
+		targets.push({ key: leafKey, condition: leaf });
+	}, key);
 	return targets;
 }
 
