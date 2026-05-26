@@ -48,11 +48,18 @@ const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
-const RETURN_ON_HANDLER_ENV = "PI_RETURN_ON_HANDLER";
 const RETURN_ON_PARENT_SESSION_FILE_ENV = "PI_RETURN_ON_PARENT_SESSION_FILE";
 const RETURN_ON_PARENT_SESSION_ID_ENV = "PI_RETURN_ON_PARENT_SESSION_ID";
 const RETURN_ON_PARENT_SESSION_NAME_ENV = "PI_RETURN_ON_PARENT_SESSION_NAME";
 const RETURN_ON_PARENT_INTERCOM_TARGET_ENV = "PI_RETURN_ON_PARENT_INTERCOM_TARGET";
+const INTERCOM_PARENT_SESSION_FILE_ENV = "PI_INTERCOM_PARENT_SESSION_FILE";
+const INTERCOM_PARENT_SESSION_ID_ENV = "PI_INTERCOM_PARENT_SESSION_ID";
+const INTERCOM_PARENT_SESSION_NAME_ENV = "PI_INTERCOM_PARENT_SESSION_NAME";
+const INTERCOM_PARENT_INTERCOM_TARGET_ENV = "PI_INTERCOM_PARENT_INTERCOM_TARGET";
+const PARENT_SESSION_FILE_ENVS = [RETURN_ON_PARENT_SESSION_FILE_ENV, INTERCOM_PARENT_SESSION_FILE_ENV] as const;
+const PARENT_SESSION_ID_ENVS = [RETURN_ON_PARENT_SESSION_ID_ENV, INTERCOM_PARENT_SESSION_ID_ENV] as const;
+const PARENT_SESSION_NAME_ENVS = [RETURN_ON_PARENT_SESSION_NAME_ENV, INTERCOM_PARENT_SESSION_NAME_ENV] as const;
+const PARENT_INTERCOM_TARGET_ENVS = [RETURN_ON_PARENT_INTERCOM_TARGET_ENV, INTERCOM_PARENT_INTERCOM_TARGET_ENV] as const;
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
@@ -64,6 +71,7 @@ const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 
 type GroupOp = "and" | "or" | "not";
 type Runner = "sh" | "bash" | "xonsh" | "python" | "node";
+type ParentRouting = "auto" | "main" | "current";
 
 const SUPPORTED_RUNNERS = new Set<Runner>(["sh", "bash", "xonsh", "python", "node"]);
 
@@ -212,6 +220,10 @@ interface ReturnOnJob {
 	label: string;
 	cwd: string;
 	sessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
+	parentIntercomTarget?: string;
+	parentRouting?: ParentRouting;
 	createdAt: number;
 	updatedAt: number;
 	status: "active" | "fired" | "cancelled";
@@ -1944,28 +1956,33 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 	}
 }
 
-function inheritedParentEnv(name: string): string | undefined {
-	const value = process.env[name]?.trim();
-	return value ? value : undefined;
-}
-
-function isReturnOnHandlerProcess(): boolean {
-	return process.env[RETURN_ON_HANDLER_ENV] === "1";
-}
-
-function getParentSessionFile(ctx = latestCtx): string | undefined {
-	if (isReturnOnHandlerProcess()) {
-		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_FILE_ENV);
-		if (inherited) return inherited;
+function inheritedParentEnv(names: readonly string[]): string | undefined {
+	for (const name of names) {
+		const value = process.env[name]?.trim();
+		if (value) return value;
 	}
+	return undefined;
+}
+
+function hasInheritedParentEnv(): boolean {
+	return !!(inheritedParentEnv(PARENT_SESSION_FILE_ENVS) || inheritedParentEnv(PARENT_SESSION_ID_ENVS) || inheritedParentEnv(PARENT_INTERCOM_TARGET_ENVS));
+}
+
+function normalizeParentRouting(value: unknown): ParentRouting {
+	if (value === undefined || value === null || value === "") return "auto";
+	if (value === "auto" || value === "main" || value === "current") return value;
+	throw new Error("parent must be one of 'auto', 'main', or 'current'");
+}
+
+function shouldUseInheritedParent(route: ParentRouting): boolean {
+	return route === "main" || (route === "auto" && hasInheritedParentEnv());
+}
+
+function getCurrentSessionFile(ctx = latestCtx): string | undefined {
 	return ctx?.sessionManager.getSessionFile() ?? undefined;
 }
 
-function getParentSessionId(ctx = latestCtx): string | undefined {
-	if (isReturnOnHandlerProcess()) {
-		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_ID_ENV);
-		if (inherited) return inherited;
-	}
+function getCurrentSessionId(ctx = latestCtx): string | undefined {
 	try {
 		const sessionManager = ctx?.sessionManager as { getSessionId?: () => string } | undefined;
 		return sessionManager?.getSessionId?.();
@@ -1974,11 +1991,7 @@ function getParentSessionId(ctx = latestCtx): string | undefined {
 	}
 }
 
-function getParentSessionName(pi: ExtensionAPI): string | undefined {
-	if (isReturnOnHandlerProcess()) {
-		const inherited = inheritedParentEnv(RETURN_ON_PARENT_SESSION_NAME_ENV);
-		if (inherited) return inherited;
-	}
+function getCurrentSessionName(pi: ExtensionAPI): string | undefined {
 	try {
 		return pi.getSessionName?.();
 	} catch {
@@ -1986,17 +1999,44 @@ function getParentSessionName(pi: ExtensionAPI): string | undefined {
 	}
 }
 
-function resolveParentIntercomTarget(pi: ExtensionAPI, ctx = latestCtx): string | undefined {
-	if (isReturnOnHandlerProcess()) {
-		const inherited = inheritedParentEnv(RETURN_ON_PARENT_INTERCOM_TARGET_ENV);
-		if (inherited) return inherited;
-	}
-	const name = getParentSessionName(pi)?.trim();
+function resolveIntercomTarget(sessionName: string | undefined, sessionId: string | undefined): string | undefined {
+	const name = sessionName?.trim();
 	if (name) return name;
-	const sessionId = getParentSessionId(ctx);
 	if (!sessionId) return undefined;
 	const normalized = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
 	return `subagent-chat-${normalized.slice(0, 8)}`;
+}
+
+function getParentSessionFile(ctx = latestCtx, route: ParentRouting = "auto"): string | undefined {
+	if (shouldUseInheritedParent(route)) {
+		const inherited = inheritedParentEnv(PARENT_SESSION_FILE_ENVS);
+		if (inherited) return inherited;
+	}
+	return getCurrentSessionFile(ctx);
+}
+
+function getParentSessionId(ctx = latestCtx, route: ParentRouting = "auto"): string | undefined {
+	if (shouldUseInheritedParent(route)) {
+		const inherited = inheritedParentEnv(PARENT_SESSION_ID_ENVS);
+		if (inherited) return inherited;
+	}
+	return getCurrentSessionId(ctx);
+}
+
+function getParentSessionName(pi: ExtensionAPI, route: ParentRouting = "auto"): string | undefined {
+	if (shouldUseInheritedParent(route)) {
+		const inherited = inheritedParentEnv(PARENT_SESSION_NAME_ENVS);
+		if (inherited) return inherited;
+	}
+	return getCurrentSessionName(pi);
+}
+
+function resolveParentIntercomTarget(pi: ExtensionAPI, ctx = latestCtx, route: ParentRouting = "auto"): string | undefined {
+	if (shouldUseInheritedParent(route)) {
+		const inherited = inheritedParentEnv(PARENT_INTERCOM_TARGET_ENVS);
+		if (inherited) return inherited;
+	}
+	return resolveIntercomTarget(getParentSessionName(pi, route), getParentSessionId(ctx, route));
 }
 
 function makeHandlerId(job: ReturnOnJob): string {
@@ -2280,9 +2320,9 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 	await reconcileHandlerRunsOnStartup(pi, undefined, false);
 	await loadHandlers();
 	const id = makeHandlerId(job);
-	const parentSessionId = getParentSessionId();
-	const parentSessionName = getParentSessionName(pi);
-	const parentIntercomTarget = resolveParentIntercomTarget(pi);
+	const parentSessionId = job.parentSessionId ?? getParentSessionId(undefined, job.parentRouting ?? "auto");
+	const parentSessionName = job.parentSessionName ?? getParentSessionName(pi, job.parentRouting ?? "auto");
+	const parentIntercomTarget = job.parentIntercomTarget ?? resolveParentIntercomTarget(pi, undefined, job.parentRouting ?? "auto");
 	const run: ReturnOnHandlerRun = {
 		...buildForkRunPaths("return_on", id),
 		jobId: job.id,
@@ -3492,6 +3532,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
 			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
+			parent: Type.Optional(Type.String({ enum: ["auto", "main", "current"], description: "Ownership/routing for watchers created inside fork handlers. auto (default) returns fork-created watchers to the inherited main dialog when available; main forces inherited main-dialog ownership; current keeps the watcher/callback owned by the creating fork/session." })),
 			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 			maxFires: Type.Optional(Type.Number({ description: "How many times this watcher should fire before it is retired. Defaults to 1. After each fire the condition must evaluate false at least once before it can fire again (edge-triggered). The watcher is also retired by its timeout, whichever comes first." })),
@@ -3526,12 +3567,21 @@ export default function (pi: ExtensionAPI) {
 			if (maxFires > 1 && conditionIsTimerOnly(condition)) {
 				throw new Error("maxFires > 1 requires a re-armable condition. A timer-only condition cannot fire more than once because a passed deadline stays passed. Combine the timer with a file/process/port/url/exec/webhook leaf, or use multiple separate watchers.");
 			}
-			const registrationSessionFile = getParentSessionFile(ctx);
+			const parentRouting = normalizeParentRouting(params.parent);
+			const inheritedParentSession = shouldUseInheritedParent(parentRouting) && hasInheritedParentEnv();
+			const registrationSessionFile = getParentSessionFile(ctx, parentRouting);
+			const registrationSessionId = getParentSessionId(ctx, parentRouting);
+			const registrationSessionName = getParentSessionName(pi, parentRouting);
+			const registrationIntercomTarget = resolveParentIntercomTarget(pi, ctx, parentRouting);
 			const job: ReturnOnJob = {
 				id: makeId(),
 				label: params.label?.trim() || "return_on watcher",
 				cwd: ctx.cwd,
 				...(registrationSessionFile ? { sessionFile: registrationSessionFile } : {}),
+				...(registrationSessionId ? { parentSessionId: registrationSessionId } : {}),
+				...(registrationSessionName ? { parentSessionName: registrationSessionName } : {}),
+				...(registrationIntercomTarget ? { parentIntercomTarget: registrationIntercomTarget } : {}),
+				parentRouting,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 				status: "active",
@@ -3551,7 +3601,7 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
-			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, inheritedParentSession: isReturnOnHandlerProcess() && !!registrationSessionFile, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
+			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
 			try {
 				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
 			} catch {
