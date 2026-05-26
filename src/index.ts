@@ -2250,6 +2250,13 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	} catch {
 		// Best-effort audit trail.
 	}
+	await loadJobs();
+	const storedJob = jobs.find((candidate) => candidate.id === run.jobId);
+	const cancelled = storedJob?.status === "cancelled" || job.status === "cancelled";
+	if (cancelled) {
+		await appendLifecycleAudit("handler_summary_suppressed", { id: run.id, jobId: run.jobId, label: run.label, reason: "job_cancelled", endedAt: run.endedAt });
+		return;
+	}
 	if (notify === "summary" || notify === "ack-and-summary") {
 		pi.sendMessage(
 			{
@@ -2295,6 +2302,10 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 			// Best-effort audit trail.
 		}
 		const notify = run.notify ?? storedJob?.delivery?.notify ?? "summary";
+		if (storedJob?.status === "cancelled") {
+			await appendLifecycleAudit("handler_summary_suppressed", { id: run.id, jobId: run.jobId, label: run.label, reason: "job_cancelled", endedAt: run.endedAt, reconciled: true });
+			continue;
+		}
 		if (notifyReconciled && (notify === "summary" || notify === "ack-and-summary")) {
 			try {
 				pi.sendMessage(

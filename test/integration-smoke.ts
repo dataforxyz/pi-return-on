@@ -398,6 +398,46 @@ async function testForkDelivery(harness: Harness) {
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
 }
 
+async function testCancelledForkHandlerSuppressesSummary(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-cancelled-handler-pi.mjs");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nawait new Promise((resolve) => setTimeout(resolve, 350));\nconsole.log("cancelled handler should not notify");\n`, { mode: 0o755 });
+  const label = "smoke cancelled fork summary";
+  const resume = "cancelled fork summary resume";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume,
+    delivery: { mode: "fork", piCommand: fakePi, notify: "summary", triggerParentOnSummary: true },
+  });
+
+  const handlersPath = path.join(stateDir, "handlers.json");
+  let runId: string | undefined;
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const handlers = await fs.readFile(handlersPath, "utf8").then((text) => JSON.parse(text).handlers as any[], () => []);
+    const run = handlers.find((candidate) => candidate.jobId === jobId);
+    if (run?.id) {
+      runId = run.id;
+      break;
+    }
+    await sleep(50);
+  }
+  if (!runId) throw new Error("cancelled fork handler was not launched");
+
+  await harness.cancel(jobId);
+
+  const doneStart = Date.now();
+  while (Date.now() - doneStart < 2_500) {
+    const handlers = await fs.readFile(handlersPath, "utf8").then((text) => JSON.parse(text).handlers as any[], () => []);
+    const run = handlers.find((candidate) => candidate.id === runId);
+    if (run?.status === "complete") break;
+    await sleep(50);
+  }
+  const handlerMessages = harness.messages.filter((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId);
+  const summary = handlerMessages.find((entry) => entry.message?.details?.status === "complete");
+  if (summary) throw new Error(`cancelled fork handler emitted stale summary: ${summary.message?.content}`);
+}
+
 async function testForkLaunchFailureFallsBackToWake(harness: Harness) {
   const label = "smoke fork launch fallback";
   const resume = "fork launch fallback resume";
@@ -1514,6 +1554,7 @@ await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
+await testCancelledForkHandlerSuppressesSummary(harness);
 await testForkLaunchFailureFallsBackToWake(harness);
 await testAgentArtifactForkDelivery(harness);
 await testIncomingWebhookServerStartupFailure(harness);
