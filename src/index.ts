@@ -403,7 +403,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseDuration(input: string | number | undefined, fallbackMs?: number): number | undefined {
+export function parseDuration(input: string | number | undefined, fallbackMs?: number): number | undefined {
 	if (input === undefined || input === null || input === "") return fallbackMs;
 	if (typeof input === "number" && Number.isFinite(input)) return input;
 	if (typeof input !== "string") return fallbackMs;
@@ -457,7 +457,7 @@ async function readJsonObject(file: string): Promise<Record<string, unknown> | u
 	}
 }
 
-function parsePositiveDurationSetting(value: unknown, fallbackMs: number, name: string): number {
+export function parsePositiveDurationSetting(value: unknown, fallbackMs: number, name: string): number {
 	const parsed = parseDuration(typeof value === "string" || typeof value === "number" ? value : undefined, fallbackMs);
 	if (parsed === undefined || parsed <= 0) throw new Error(`${name} must be a positive duration`);
 	return parsed;
@@ -534,7 +534,7 @@ function parseAt(input: string | number | undefined, createdAt: number): number 
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
 	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
@@ -549,7 +549,7 @@ function formatAge(timestamp: number | undefined, now = Date.now()): string {
 	return delta >= 0 ? `${formatDuration(delta)} ago` : `in ${formatDuration(-delta)}`;
 }
 
-function parseShellSleepDurationMs(value: string, unit = "s"): number | undefined {
+export function parseShellSleepDurationMs(value: string, unit = "s"): number | undefined {
 	const numeric = Number(value);
 	if (!Number.isFinite(numeric)) return undefined;
 	const normalizedUnit = unit.toLowerCase();
@@ -1166,7 +1166,7 @@ function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaul
 	};
 }
 
-function normalizeCondition(input: unknown): Condition {
+export function normalizeCondition(input: unknown): Condition {
 	if (typeof input === "string") {
 		const trimmed = input.trim();
 		if (trimmed.startsWith("{")) {
@@ -1318,7 +1318,7 @@ function prepareIncomingWebhooks(condition: Condition): void {
 	condition.method ??= "POST";
 }
 
-function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
+export function collectFileWatchTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: FileWatchTarget[] = []): FileWatchTarget[] {
 	if (isGroupCondition(condition)) {
 		condition.children.forEach((child, index) => collectFileWatchTargets(job, child, `${key}.${index}`, targets));
 		return targets;
@@ -1370,7 +1370,7 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 	}
 }
 
-function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: IncomingWebhookTarget[] = []): IncomingWebhookTarget[] {
+export function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.condition, key = "root", targets: IncomingWebhookTarget[] = []): IncomingWebhookTarget[] {
 	if (isGroupCondition(condition)) {
 		condition.children.forEach((child, index) => collectIncomingWebhookTargets(job, child, `${key}.${index}`, targets));
 		return targets;
@@ -1379,7 +1379,7 @@ function collectIncomingWebhookTargets(job: ReturnOnJob, condition = job.conditi
 	return targets;
 }
 
-function collectConditionLeafTargets(condition: Condition, key = "root", targets: ConditionLeafTarget[] = []): ConditionLeafTarget[] {
+export function collectConditionLeafTargets(condition: Condition, key = "root", targets: ConditionLeafTarget[] = []): ConditionLeafTarget[] {
 	if (isGroupCondition(condition)) {
 		condition.children.forEach((child, index) => collectConditionLeafTargets(child, `${key}.${index}`, targets));
 		return targets;
