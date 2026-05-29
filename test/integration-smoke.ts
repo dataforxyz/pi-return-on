@@ -97,7 +97,7 @@ async function withEnv(overrides: Record<string, string | undefined>, fn: () => 
   }
 }
 
-function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean } = {}) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
@@ -110,6 +110,8 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
   const ctx: any = {
     cwd,
     hasUI: options.hasUI ?? true,
+    isIdle: options.isIdle ?? (() => true),
+    hasPendingMessages: options.hasPendingMessages ?? (() => false),
     sessionManager: { getSessionFile: () => sessionFile },
     ui: {
       confirm: async () => {
@@ -397,6 +399,45 @@ async function testForkDelivery(harness: Harness) {
     await sleep(50);
   }
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
+}
+
+async function testAutoDeliveryWakesIdleParent(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-auto-idle-pi.mjs");
+  const fakePiMarker = path.join(cwd, "fake-auto-idle-launched");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(fakePiMarker)}, "launched");\n`, { mode: 0o755 });
+  const label = "smoke auto idle delivery";
+  const resume = "auto idle resume";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume,
+    delivery: { mode: "auto", piCommand: fakePi },
+  });
+  await waitForWake(harness, { jobId, label, resume }, 2_500);
+  const markerExists = await fs.access(fakePiMarker).then(() => true, () => false);
+  if (markerExists) throw new Error("auto delivery forked even though the parent was idle");
+}
+
+async function testAutoDeliveryForksBusyParent(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-auto-busy-pi.mjs");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nconsole.log("auto busy fork summary");\n`, { mode: 0o755 });
+  const label = "smoke auto busy delivery";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume: "auto busy resume",
+    delivery: { mode: "auto", piCommand: fakePi },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const summary = harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete");
+    if (summary) {
+      if (!String(summary.message?.content ?? "").includes("auto busy fork summary")) throw new Error("auto busy fork summary missed handler output");
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for auto busy fork handler summary");
 }
 
 async function testEmptyForkHandlerSummaryFallback(harness: Harness) {
@@ -1580,6 +1621,11 @@ await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testForkDelivery(harness);
+await testAutoDeliveryWakesIdleParent(harness);
+const busyHarness = createHarness("busy-session", { isIdle: () => false });
+await busyHarness.emit("session_start");
+await testAutoDeliveryForksBusyParent(busyHarness);
+await busyHarness.emit("session_shutdown");
 await testEmptyForkHandlerSummaryFallback(harness);
 await testCancelledForkHandlerSuppressesSummary(harness);
 await testForkLaunchFailureFallsBackToWake(harness);

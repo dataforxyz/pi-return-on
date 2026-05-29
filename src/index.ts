@@ -165,7 +165,7 @@ interface WebhookConfig {
 	timeout?: string | number;
 }
 
-type DeliveryMode = "wake" | "fork";
+type DeliveryMode = "wake" | "fork" | "auto";
 type HandlerNotifyMode = "ack-and-summary" | "summary" | "none";
 
 interface DeliveryConfig {
@@ -425,8 +425,8 @@ async function readJsonObject(file: string): Promise<Record<string, unknown> | u
 
 function parseDeliveryModeSetting(value: unknown, fallback: DeliveryMode, name: string): DeliveryMode {
 	if (value === undefined || value === null || value === "") return fallback;
-	if (value === "wake" || value === "fork") return value;
-	throw new Error(`${name} must be 'wake' or 'fork'`);
+	if (value === "wake" || value === "fork" || value === "auto") return value;
+	throw new Error(`${name} must be 'wake', 'fork', or 'auto'`);
 }
 
 function parseNotifySetting(value: unknown, fallback: HandlerNotifyMode, name: string): HandlerNotifyMode {
@@ -976,7 +976,7 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 		if (changed) await saveJobs();
 		try {
 			const delivery = job.delivery ?? normalizeDelivery(undefined);
-			if (delivery.mode === "fork") {
+			if (await shouldLaunchForkForDelivery(pi, job, delivery)) {
 				const launched = await launchReturnHandler(pi, job, event.reason, delivery);
 				if (launched) {
 					await markFiredEventDelivered(eventPath, event.reason, "handler-launched", job);
@@ -1002,6 +1002,34 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 
 function activeJobsForCurrentSession(): ReturnOnJob[] {
 	return jobs.filter((job) => job.status === "active" && jobVisibleForSession(job, currentSessionFile));
+}
+
+function activeHandlersForCurrentSession(): ReturnOnHandlerRun[] {
+	return handlerRuns.filter((run) => (run.status === "starting" || run.status === "running") && (!currentSessionFile || !run.parentSessionFile || run.parentSessionFile === currentSessionFile));
+}
+
+async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
+	const ctx = latestCtx;
+	if (!ctx) return false;
+	try {
+		if (!ctx.isIdle()) return false;
+		if (ctx.hasPendingMessages()) return false;
+	} catch {
+		return false;
+	}
+	const otherActiveJobs = activeJobsForCurrentSession().filter((candidate) => candidate.id !== job.id);
+	if (otherActiveJobs.length > 0) return false;
+	await loadHandlers();
+	await reconcileHandlerRunsOnStartup(pi, currentSessionFile, false);
+	await loadHandlers();
+	if (activeHandlersForCurrentSession().length > 0) return false;
+	return true;
+}
+
+async function shouldLaunchForkForDelivery(pi: ExtensionAPI, job: ReturnOnJob, delivery: DeliveryConfig): Promise<boolean> {
+	if (delivery.mode === "fork") return true;
+	if (delivery.mode === "auto") return !(await canAutoWakeParentDirect(pi, job));
+	return false;
 }
 
 function updateStatus(ctx = latestCtx): void {
@@ -1075,19 +1103,19 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 
 function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary">): DeliveryConfig {
 	const base: DeliveryConfig = {
-		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" ? "fork" : "wake"),
+		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" || process.env.PI_RETURN_ON_DELIVERY_MODE === "auto" ? process.env.PI_RETURN_ON_DELIVERY_MODE : "wake"),
 		notify: config?.defaultDeliveryNotify ?? "summary",
 		triggerParentOnSummary: config?.triggerParentOnSummary ?? (process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === undefined ? true : process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1"),
 	};
 	if (input === undefined || input === null || input === false) return base;
 	if (input === true) return { ...base, mode: "fork" };
 	if (typeof input === "string") {
-		if (input !== "wake" && input !== "fork") throw new Error("delivery string must be 'wake' or 'fork'");
+		if (input !== "wake" && input !== "fork" && input !== "auto") throw new Error("delivery string must be 'wake', 'fork', or 'auto'");
 		return { ...base, mode: input };
 	}
-	if (!isObject(input)) throw new Error("delivery must be an object, boolean, or 'wake'/'fork'");
+	if (!isObject(input)) throw new Error("delivery must be an object, boolean, or 'wake'/'fork'/'auto'");
 	const mode = input.mode === undefined ? base.mode : input.mode;
-	if (mode !== "wake" && mode !== "fork") throw new Error("delivery.mode must be 'wake' or 'fork'");
+	if (mode !== "wake" && mode !== "fork" && mode !== "auto") throw new Error("delivery.mode must be 'wake', 'fork', or 'auto'");
 	const notify = input.notify === undefined ? base.notify : input.notify;
 	if (notify !== "ack-and-summary" && notify !== "summary" && notify !== "none") throw new Error("delivery.notify must be 'ack-and-summary', 'summary', or 'none'");
 	const triggerParentOnSummary = input.triggerParentOnSummary === undefined ? base.triggerParentOnSummary : Boolean(input.triggerParentOnSummary);
@@ -2403,7 +2431,7 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 		console.error(`[${EXTENSION_NAME}] Webhook failed for ${job.id}:`, error);
 	});
 	const delivery = job.delivery ?? normalizeDelivery(undefined);
-	if (delivery.mode === "fork") {
+	if (await shouldLaunchForkForDelivery(pi, job, delivery)) {
 		const launched = await launchReturnHandler(pi, job, reason, delivery);
 		if (launched) {
 			if (eventPath) await markFiredEventDelivered(eventPath, reason, "handler-launched", job);
@@ -3492,7 +3520,7 @@ export default function (pi: ExtensionAPI) {
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
-			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for legacy same-session wake or {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} to handle the event in a background fork/sibling Pi session." })),
+			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for same-session wake, {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} for a background fork/sibling Pi session, or {mode:'auto'} to wake the idle parent directly and fork only when the parent is busy or already handling background events." })),
 			parent: Type.Optional(Type.String({ enum: ["auto", "main", "current"], description: "Ownership/routing for watchers created inside fork handlers. auto (default) returns fork-created watchers to the inherited main dialog when available; main forces inherited main-dialog ownership; current keeps the watcher/callback owned by the creating fork/session." })),
 			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),

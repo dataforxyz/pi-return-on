@@ -96,7 +96,7 @@ Diagnostics:
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. If omitted, `returnOn.defaultTimeout` applies. Values above `returnOn.maxTimeout` are rejected. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
-| `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `returnOn.defaultDeliveryMode` or `PI_RETURN_ON_DELIVERY_MODE=fork` is set. Use `{mode:"fork"}` to launch a background fork/sibling Pi handler instead of waking the parent turn directly. |
+| `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `returnOn.defaultDeliveryMode` or `PI_RETURN_ON_DELIVERY_MODE` is set. Use `{mode:"auto"}` to wake an idle parent directly and fork only when the parent is busy/queued or already handling return_on background events; use `{mode:"fork"}` to always launch a background fork/sibling Pi handler. |
 | `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
 | `allowExec` | no | Required for `exec` leaves unless the interactive UI confirms. |
 | `maxFires` | no | How many times the watcher should fire before being retired. Defaults to `1` (one-shot). With `maxFires > 1` the watcher is edge-triggered: after each fire the condition must evaluate false at least once before it can fire again, so the minimum gap between fires is roughly the leaf's `every` interval (plus the global tick). The watcher is also retired by its `timeout`, whichever comes first. Timer-only conditions are rejected with `maxFires > 1` because a passed deadline stays passed and cannot re-arm. |
@@ -180,19 +180,19 @@ Lower the cap (for example `"maxTimeout": "10m"`) if you want tighter bounds; ra
 
 ## Default delivery policy
 
-Use settings to make fork handling the default for real workflows instead of requiring every tool call to repeat `delivery: {"mode":"fork"}`:
+Use settings to make smart or fork handling the default for real workflows instead of requiring every tool call to repeat `delivery`:
 
 ```json
 {
   "returnOn": {
-    "defaultDeliveryMode": "fork",
+    "defaultDeliveryMode": "auto",
     "defaultDeliveryNotify": "summary",
     "triggerParentOnSummary": true
   }
 }
 ```
 
-`defaultDeliveryMode` accepts `"wake"` or `"fork"`. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"` and defaults to `"summary"` for fork delivery when unset. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
+`defaultDeliveryMode` accepts `"wake"`, `"auto"`, or `"fork"`. In `"auto"` mode, return_on wakes the idle parent directly when there are no queued parent messages, no other active return_on watchers for this session, and no active return_on fork handlers for this session; otherwise it uses the fork handler path. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"` and defaults to `"summary"` for fork delivery when unset. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
 
 ## Background fork handlers
 
@@ -220,7 +220,7 @@ Useful delivery options:
 - `triggerParentOnSummary: true` — make the final summary trigger a parent turn; this is the default so fired waiters wake the parent after fork handling.
 - `piCommand` — override the `pi` executable path for testing or custom installs. `PI_RETURN_ON_PI_BIN` also works.
 
-Set `returnOn.defaultDeliveryMode` to `"fork"` or set `PI_RETURN_ON_DELIVERY_MODE=fork` before starting Pi to make fork handling the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
+Set `returnOn.defaultDeliveryMode` to `"auto"` or `"fork"` (or set `PI_RETURN_ON_DELIVERY_MODE=auto|fork`) before starting Pi to change the default for new watchers. Use `{ "delivery": { "mode": "wake" } }` to force legacy direct wake for a specific watcher.
 
 ## Orchestration recipes
 
