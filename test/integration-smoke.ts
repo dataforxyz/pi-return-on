@@ -1108,6 +1108,35 @@ async function waitForCheckIn(harness: Harness, jobId: string, expectedCount: nu
   throw new Error(`timed out waiting for ${expectedCount} check-ins of ${jobId}, saw ${checkInEntries(harness, jobId).length}`);
 }
 
+async function testCheckInStartupClearsPendingWake() {
+  const harness = createHarness("checkin-startup-clear-session");
+  await harness.emit("session_start");
+  const label = "smoke startup clear check-in";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "never-startup-clear-check-in.txt", exists: true, every: "100ms" },
+    timeout: "5s",
+    checkInEvery: "1s",
+    resume: "startup clear check-in resume",
+  });
+  await waitForCheckIn(harness, jobId, 1, 1_800);
+  await sleep(1_400);
+  if (checkInEntries(harness, jobId).length !== 1) throw new Error("pending check-in wake was queued more than once before startup cleanup");
+  const jobsPath = path.join(stateDir, "jobs.json");
+  const state = JSON.parse(await fs.readFile(jobsPath, "utf8"));
+  const currentJob = state.jobs.find((job: any) => job.id === jobId);
+  const otherJobId = `${jobId}_other`;
+  state.jobs.push({ ...currentJob, id: otherJobId, label: "other session pending check-in", sessionFile: path.join(cwd, "other-session.jsonl"), checkInWakePending: true });
+  await fs.writeFile(jobsPath, JSON.stringify(state, null, 2), "utf8");
+  await harness.emit("session_start");
+  const afterStartup = JSON.parse(await fs.readFile(jobsPath, "utf8"));
+  const otherJob = afterStartup.jobs.find((job: any) => job.id === otherJobId);
+  if (otherJob?.checkInWakePending !== true) throw new Error("startup cleanup cleared pending check-in for another session");
+  await waitForCheckIn(harness, jobId, 2, 2_000);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
 async function testCheckInSkipsBusyParent() {
   let pending = true;
   const harness = createHarness("checkin-busy-session", { hasPendingMessages: () => pending });
@@ -1795,6 +1824,7 @@ await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testCheckInEvery(harness);
+await testCheckInStartupClearsPendingWake();
 await testCheckInSkipsBusyParent();
 await testCheckInSkipsBeforeAgentStartTurn();
 await testCheckInSkipsActiveSignal();
