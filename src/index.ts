@@ -1027,6 +1027,7 @@ function canQueueParentTurn(): boolean {
 	const ctx = latestCtx;
 	if (!ctx) return false;
 	try {
+		if (ctx.signal && !ctx.signal.aborted) return false;
 		if (!ctx.isIdle()) return false;
 		if (ctx.hasPendingMessages()) return false;
 	} catch {

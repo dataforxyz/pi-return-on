@@ -97,7 +97,7 @@ async function withEnv(overrides: Record<string, string | undefined>, fn: () => 
   }
 }
 
-function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean } = {}) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean; signal?: () => AbortSignal | undefined } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
@@ -111,6 +111,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     cwd,
     hasUI: options.hasUI ?? true,
     isIdle: options.isIdle ?? (() => true),
+    get signal() { return options.signal?.(); },
     hasPendingMessages: options.hasPendingMessages ?? (() => false),
     sessionManager: { getSessionFile: () => sessionFile },
     ui: {
@@ -1125,6 +1126,26 @@ async function testCheckInSkipsBusyParent() {
   await harness.emit("session_shutdown");
 }
 
+async function testCheckInSkipsActiveSignal() {
+  const controller = new AbortController();
+  let signal: AbortSignal | undefined = controller.signal;
+  const harness = createHarness("checkin-active-signal-session", { signal: () => signal });
+  await harness.emit("session_start");
+  const label = "smoke active-signal check-in";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "never-active-signal-check-in.txt", exists: true, every: "100ms" },
+    timeout: "5s",
+    checkInEvery: "1s",
+    resume: "active-signal check-in resume",
+  });
+  await expectNoWake(harness, jobId, 1_700, "active agent signal should not queue periodic check-ins");
+  signal = undefined;
+  await waitForCheckIn(harness, jobId, 1, 2_000);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
 async function testCheckInSkipsActiveAgentTurn() {
   const harness = createHarness("checkin-active-turn-session");
   await harness.emit("session_start");
@@ -1751,6 +1772,7 @@ await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testCheckInEvery(harness);
 await testCheckInSkipsBusyParent();
+await testCheckInSkipsActiveSignal();
 await testCheckInSkipsActiveAgentTurn();
 await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
