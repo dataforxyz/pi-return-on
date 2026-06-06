@@ -261,6 +261,7 @@ async function testDirectWaitPolicy(harness: Harness) {
   if (!systemPrompt.includes("Direct wait policy for return_on") || !systemPrompt.includes("Do not block the conversation with direct waits")) {
     throw new Error(`direct wait guidance was not injected into the system prompt: ${systemPrompt}`);
   }
+  await harness.emit("agent_end");
 
   const blockedSleep = await harness.toolCall("bash", { command: "sleep 10" });
   if (!blockedSleep?.block || !String(blockedSleep.reason).includes("return_on")) {
@@ -1126,6 +1127,25 @@ async function testCheckInSkipsBusyParent() {
   await harness.emit("session_shutdown");
 }
 
+async function testCheckInSkipsBeforeAgentStartTurn() {
+  const harness = createHarness("checkin-before-start-session");
+  await harness.emit("session_start");
+  await harness.beforeAgentStart();
+  const label = "smoke before-start check-in";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "never-before-start-check-in.txt", exists: true, every: "100ms" },
+    timeout: "5s",
+    checkInEvery: "1s",
+    resume: "before-start check-in resume",
+  });
+  await expectNoWake(harness, jobId, 1_700, "before_agent_start turn should not queue periodic check-ins");
+  await harness.emit("agent_end");
+  await waitForCheckIn(harness, jobId, 1, 2_000);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
 async function testCheckInSkipsActiveSignal() {
   const controller = new AbortController();
   let signal: AbortSignal | undefined = controller.signal;
@@ -1772,6 +1792,7 @@ await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testCheckInEvery(harness);
 await testCheckInSkipsBusyParent();
+await testCheckInSkipsBeforeAgentStartTurn();
 await testCheckInSkipsActiveSignal();
 await testCheckInSkipsActiveAgentTurn();
 await testDefaultMaxTimeoutIsTwoHours(harness);
