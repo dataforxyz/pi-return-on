@@ -252,6 +252,7 @@ interface ReturnOnJob {
 	checkInEveryMs?: number;
 	lastCheckInAt?: number;
 	checkInCount?: number;
+	checkInWakePending?: boolean;
 }
 
 interface ReturnOnHandlerRun {
@@ -2562,11 +2563,12 @@ function formatCheckInMessage(job: ReturnOnJob, checkedInAt = Date.now()): strin
 }
 
 async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
-	if (job.status !== "active" || !job.checkInEveryMs) return false;
+	if (job.status !== "active" || !job.checkInEveryMs || job.checkInWakePending) return false;
 	if (!canQueueParentTurn()) return false;
 	const now = Date.now();
 	job.lastCheckInAt = now;
 	job.checkInCount = (job.checkInCount ?? 0) + 1;
+	job.checkInWakePending = true;
 	job.updatedAt = now;
 	await saveJobs();
 	await appendLifecycleAudit("job_check_in", { id: job.id, label: job.label, checkInCount: job.checkInCount, checkedInAt: now, timeoutAt: job.timeoutAt });
@@ -2575,16 +2577,32 @@ async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean>
 	} catch {
 		// Best-effort audit trail.
 	}
-	pi.sendMessage(
-		{
-			customType: EXTENSION_NAME,
-			content: formatCheckInMessage(job, now),
-			display: true,
-			details: { id: job.id, label: job.label, checkIn: true, checkedInAt: now, checkInCount: job.checkInCount },
-		},
-		{ triggerTurn: true },
-	);
+	try {
+		pi.sendMessage(
+			{
+				customType: EXTENSION_NAME,
+				content: formatCheckInMessage(job, now),
+				display: true,
+				details: { id: job.id, label: job.label, checkIn: true, checkedInAt: now, checkInCount: job.checkInCount },
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+	} catch (error) {
+		job.checkInWakePending = false;
+		await saveJobs();
+		throw error;
+	}
 	return true;
+}
+
+async function clearPendingCheckInWakes(): Promise<void> {
+	let changed = false;
+	for (const job of jobs) {
+		if (!job.checkInWakePending) continue;
+		job.checkInWakePending = false;
+		changed = true;
+	}
+	if (changed) await saveJobs();
 }
 
 function truncateInline(value: string, limit: number): string {
@@ -3431,6 +3449,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async () => {
 		agentTurnActive = false;
+		await clearPendingCheckInWakes();
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
