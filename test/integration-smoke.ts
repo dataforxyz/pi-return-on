@@ -1125,6 +1125,25 @@ async function testCheckInSkipsBusyParent() {
   await harness.emit("session_shutdown");
 }
 
+async function testCheckInSkipsActiveAgentTurn() {
+  const harness = createHarness("checkin-active-turn-session");
+  await harness.emit("session_start");
+  await harness.emit("agent_start");
+  const label = "smoke active-turn check-in";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "never-active-turn-check-in.txt", exists: true, every: "100ms" },
+    timeout: "5s",
+    checkInEvery: "1s",
+    resume: "active-turn check-in resume",
+  });
+  await expectNoWake(harness, jobId, 1_700, "active agent turn should not queue periodic check-ins");
+  await harness.emit("agent_end");
+  await waitForCheckIn(harness, jobId, 1, 2_000);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
 async function testCheckInEvery(harness: Harness) {
   const label = "smoke check-in";
   const resume = "check-in resume";
@@ -1732,6 +1751,7 @@ await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testCheckInEvery(harness);
 await testCheckInSkipsBusyParent();
+await testCheckInSkipsActiveAgentTurn();
 await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
 await testDefaultDeliverySettings(harness);

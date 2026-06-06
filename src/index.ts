@@ -385,6 +385,7 @@ interface DirectWaitAuditEntry extends DirectWaitAnalysis {
 let jobs: ReturnOnJob[] = [];
 let handlerRuns: ReturnOnHandlerRun[] = [];
 let currentSessionFile: string | undefined;
+let agentTurnActive = false;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
 let immediateTickTimer: ReturnType<typeof setTimeout> | undefined;
 let latestCtx: ExtensionContext | undefined;
@@ -1022,6 +1023,7 @@ function activeHandlersForCurrentSession(): ReturnOnHandlerRun[] {
 }
 
 function canQueueParentTurn(): boolean {
+	if (agentTurnActive) return false;
 	const ctx = latestCtx;
 	if (!ctx) return false;
 	try {
@@ -3421,6 +3423,14 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
 	});
 
+	pi.on("agent_start", async () => {
+		agentTurnActive = true;
+	});
+
+	pi.on("agent_end", async () => {
+		agentTurnActive = false;
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const input = event.input as { command?: unknown };
@@ -3473,6 +3483,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		agentTurnActive = false;
 		stopTicker();
 		stopFileWatchers();
 		stopIncomingWebhookServer();
