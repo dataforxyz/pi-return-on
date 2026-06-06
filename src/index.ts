@@ -3421,6 +3421,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("before_agent_start", async (event) => {
+		agentTurnActive = true;
 		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
 	});
 
