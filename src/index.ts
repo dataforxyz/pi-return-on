@@ -2595,10 +2595,10 @@ async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean>
 	return true;
 }
 
-async function clearPendingCheckInWakes(): Promise<void> {
+async function clearPendingCheckInWakes(sessionFile?: string): Promise<void> {
 	let changed = false;
 	for (const job of jobs) {
-		if (!job.checkInWakePending) continue;
+		if (!job.checkInWakePending || !jobVisibleForSession(job, sessionFile)) continue;
 		job.checkInWakePending = false;
 		changed = true;
 	}
@@ -3449,7 +3449,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async () => {
 		agentTurnActive = false;
-		await clearPendingCheckInWakes();
+		await clearPendingCheckInWakes(currentSessionFile);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -3485,6 +3485,7 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = ctx;
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
+		await clearPendingCheckInWakes(currentSessionFile);
 		await loadHandlers();
 		try {
 			await reconcileHandlerRunsOnStartup(pi, currentSessionFile, true);
