@@ -1201,6 +1201,9 @@ async function testCheckInEvery(harness: Harness) {
   if (!receipt.includes("Check-ins: every 1s")) throw new Error(`registration did not display check-in cadence: ${receipt}`);
 
   const checkIns = await waitForCheckIn(harness, jobId, 1, 2_800);
+  if (checkIns[0].options?.deliverAs !== "followUp" || checkIns[0].options?.triggerTurn !== true) {
+    throw new Error(`check-in wake was not queued as followUp: ${JSON.stringify(checkIns[0].options)}`);
+  }
   const checkInText = String(checkIns[0].message?.content ?? "");
   if (!checkInText.includes("return_on check-in") || !checkInText.includes("Still waiting") || !checkInText.includes(resume)) {
     throw new Error(`check-in wake content was incomplete: ${checkInText}`);
@@ -1210,6 +1213,7 @@ async function testCheckInEvery(harness: Harness) {
   const entry = await waitForWake(harness, { jobId, label, resume }, 4_000);
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("check-in watcher did not eventually timeout");
   if (checkInEntries(harness, jobId).length < 1) throw new Error("check-in entry disappeared after timeout");
+  await harness.emit("agent_end");
 
   let rejected: string | undefined;
   try {
