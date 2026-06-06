@@ -43,7 +43,7 @@ Visibility:
 - Active waits update the Pi status footer with a compact green status such as `⏰ 1 · Ctrl+Alt+W` or `⏰ 2 · Ctrl+Alt+W` instead of noisy partial job titles.
 - Press `Ctrl+Alt+W` (or run `/return-on-waiters`) to open a compact, color-coded modal scoped to waiters related to this chat by default. It shows one basic row per active waiter by default, with clear states (`● WAITING`, `✓ RETURNED`, `× CANCELLED`) plus how long ago it started, when it last checked/returned, how often active waiters check, and when the next check is due; use `↑`/`↓` or `j`/`k` to move between waiters, `Enter`/`d` to expand details for the selected waiter, `a` to cycle related/this-chat/all sessions, `c` to include returned/cancelled waiters, `s` to cycle sort (`status`, `updated`, `created`, `timeout`, `label`), `r` to reverse sort order, and `o` to open attached handler logs in a new terminal when available.
 - `/return-on-list` and `return_on_list` show each job's current wait summary and condition description.
-- The `return_on` registration result is a short WAITING receipt: it shows the job id/label, plain-language trigger bullets, check cadence, timeout, and the `Ctrl+Alt+W`/`/return-on-waiters` status shortcut.
+- The `return_on` registration result is a short WAITING receipt: it shows the job id/label, plain-language trigger bullets, check cadence, optional check-in cadence, timeout, and the `Ctrl+Alt+W`/`/return-on-waiters` status shortcut.
 - `/return-on-status <id>` and `return_on_status` include the condition tree, latest leaf check summaries, next-check timing, latches, timeout/delivery/handler metadata, incoming webhook paths/URLs, and the resume instruction.
 - `/return-on-fired-events` and `return_on_fired_events` show pending/delivered/failed fired capsules for restart-safe delivery debugging.
 - `/return-on-prune --dry-run` previews retention cleanup before deleting old state.
@@ -81,6 +81,7 @@ Diagnostics:
   "resume": "Continue now that the render output is ready.",
   "every": "2s",
   "timeout": "10m",
+  "checkInEvery": "5m",
   "webhook": "https://example.com/pi-return-on-hook",
   "delivery": { "mode": "fork", "notify": "summary" },
   "endTurn": true,
@@ -95,6 +96,7 @@ Diagnostics:
 | `resume` | yes | Instruction included in the wake message. |
 | `every` | no | Default polling interval inherited by file/process/port/url/exec leaves. |
 | `timeout` | no | Wake anyway after this duration. If omitted, `returnOn.defaultTimeout` applies. Values above `returnOn.maxTimeout` are rejected. |
+| `checkInEvery` | no | Periodic check-in wakeup while the watcher is still pending, e.g. `5m`, `10m`, `15m`, or `30m`. This does not fire/cancel the watcher; it wakes the parent with current status so long waits do not fail or freeze silently. Minimum is `1s`. |
 | `webhook` | no | Optional HTTP webhook notified when the watcher fires. URL string or `{url, method, headers, timeout}`. |
 | `delivery` | no | Delivery mode. Default is legacy `{mode:"wake"}` unless `returnOn.defaultDeliveryMode` or `PI_RETURN_ON_DELIVERY_MODE` is set. Use `{mode:"auto"}` to wake an idle parent directly and fork only when the parent is busy/queued or already handling return_on background events; use `{mode:"fork"}` to always launch a background fork/sibling Pi handler. |
 | `endTurn` | no | Defaults to `true`, which ends the current assistant turn after registration. Set `false` only when the agent can keep doing useful work without waiting for the condition. |
@@ -102,6 +104,22 @@ Diagnostics:
 | `maxFires` | no | How many times the watcher should fire before being retired. Defaults to `1` (one-shot). With `maxFires > 1` the watcher is edge-triggered: after each fire the condition must evaluate false at least once before it can fire again, so the minimum gap between fires is roughly the leaf's `every` interval (plus the global tick). The watcher is also retired by its `timeout`, whichever comes first. Timer-only conditions are rejected with `maxFires > 1` because a passed deadline stays passed and cannot re-arm. |
 
 Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `1h`, `1d`.
+
+### Periodic check-ins for long waits
+
+`timeout` is the hard ceiling for the whole wait; `every` controls how often pollable leaves are checked; `checkInEvery` controls how often Pi wakes the parent while the watcher is still pending. For example, a build may be checked every 30 seconds, allowed to run for 2 hours, and still wake the parent every 5 minutes with a status check-in:
+
+```json
+{
+  "label": "wait for long build",
+  "condition": { "type": "process", "pidFile": ".return-on/build.pid", "exited": true, "every": "30s" },
+  "timeout": "2h",
+  "checkInEvery": "5m",
+  "resume": "Inspect the build logs and continue when the process exits or times out."
+}
+```
+
+Check-in wakeups include the elapsed time, next check-in, timeout remaining, latest wait summary, and the eventual resume instruction. The watcher remains active after a check-in and will still fire normally when its condition is met or its timeout expires.
 
 ## Canonical condition shapes
 

@@ -41,6 +41,7 @@ const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const DEFAULT_RETURN_ON_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_RETURN_ON_MAX_TIMEOUT_MS = 2 * 60 * 60_000;
+const MIN_CHECK_IN_EVERY_MS = 1000;
 const MIN_EXEC_EVERY_MS = 2000;
 const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
@@ -68,6 +69,7 @@ const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"- Do not block the conversation with direct waits such as sleep commands of 10 seconds or longer, tail -f, watch, infinite polling loops, or foreground dev servers.",
 	"- For long-running work, start the command in the background, capture logs/pid files, then register a return_on watcher for the file, process, port, URL, webhook, or timer that means it is ready/done.",
 	"- Choose a timeout that covers the longest reasonable wait; the packaged default max is 2h, so do not assume older 10m caps unless project settings say otherwise.",
+	"- For long waits, set checkInEvery (for example '5m', '10m', '15m', or '30m') when the parent should be woken periodically while the watcher is still pending.",
 	"- After registering return_on, end the turn and let return_on wake the session instead of polling manually.",
 ].join("\n");
 
@@ -247,6 +249,9 @@ interface ReturnOnJob {
 	fireCount?: number;
 	lastFiredAt?: number;
 	rearmPending?: boolean;
+	checkInEveryMs?: number;
+	lastCheckInAt?: number;
+	checkInCount?: number;
 }
 
 interface ReturnOnHandlerRun {
@@ -475,6 +480,14 @@ function parseRequestedJobTimeout(input: unknown, config: ReturnOnConfig): numbe
 	if (timeoutMs === undefined || timeoutMs <= 0) throw new Error("return_on timeout must be a positive duration");
 	if (timeoutMs > config.maxTimeoutMs) throw new Error(`return_on timeout ${formatDuration(timeoutMs)} exceeds max ${formatDuration(config.maxTimeoutMs)}. Configure returnOn.maxTimeout in pi settings if a longer watcher is required.`);
 	return timeoutMs;
+}
+
+function parseCheckInEvery(input: unknown): number | undefined {
+	if (input === undefined || input === null || input === false || input === "") return undefined;
+	const checkInEveryMs = parseDuration(typeof input === "string" || typeof input === "number" ? input : undefined);
+	if (checkInEveryMs === undefined || checkInEveryMs <= 0) throw new Error("checkInEvery must be a positive duration");
+	if (checkInEveryMs < MIN_CHECK_IN_EVERY_MS) throw new Error(`checkInEvery must be at least ${formatDuration(MIN_CHECK_IN_EVERY_MS)}`);
+	return checkInEveryMs;
 }
 
 function parseAt(input: string | number | undefined, createdAt: number): number | undefined {
@@ -1906,9 +1919,16 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 					}
 					if (Object.keys(job.latches).length > 0) changed = true;
 				}
+				const dueCheckInAt = nextCheckInAt(job);
+				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) {
+					await sendCheckIn(pi, job);
+					changed = true;
+				}
 			} catch (error) {
 				job.leafState.root = { ...job.leafState.root, lastSummary: `evaluation error: ${error instanceof Error ? error.message : String(error)}` };
 				job.updatedAt = now;
+				const dueCheckInAt = nextCheckInAt(job);
+				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) await sendCheckIn(pi, job);
 				changed = true;
 			}
 		}
@@ -2507,6 +2527,57 @@ function formatFireMessage(job: ReturnOnJob, reason: string): string {
 	].join("\n");
 }
 
+function nextCheckInAt(job: ReturnOnJob): number | undefined {
+	if (!job.checkInEveryMs) return undefined;
+	return (job.lastCheckInAt ?? job.createdAt) + job.checkInEveryMs;
+}
+
+function formatCheckInMessage(job: ReturnOnJob, checkedInAt = Date.now()): string {
+	const elapsed = checkedInAt - job.createdAt;
+	const nextAt = nextCheckInAt(job);
+	const timeout = job.timeoutAt ? formatTimeoutSummary(job) : "none";
+	return [
+		`return_on check-in: ${job.label} (${job.id})`,
+		`Still waiting after: ${formatDuration(Math.max(0, elapsed))}`,
+		`Check-in: ${job.checkInCount ?? 0}${job.checkInEveryMs ? ` (every ${formatDuration(job.checkInEveryMs)})` : ""}`,
+		...(nextAt ? [`Next check-in: in ${formatDuration(Math.max(0, nextAt - checkedInAt))}`] : []),
+		`Timeout: ${timeout}`,
+		`CWD: ${job.cwd}`,
+		"",
+		`Waiting: ${formatJobWaitSummary(job)}`,
+		`Condition: ${describeCondition(job.condition)}`,
+		"",
+		"This is a periodic check-in, not the final return. The watcher remains active; inspect logs/state only if useful, then keep waiting unless action is needed.",
+		"",
+		"Resume instruction when the condition eventually fires or times out:",
+		job.resume,
+	].join("\n");
+}
+
+async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<void> {
+	if (job.status !== "active" || !job.checkInEveryMs) return;
+	const now = Date.now();
+	job.lastCheckInAt = now;
+	job.checkInCount = (job.checkInCount ?? 0) + 1;
+	job.updatedAt = now;
+	await saveJobs();
+	await appendLifecycleAudit("job_check_in", { id: job.id, label: job.label, checkInCount: job.checkInCount, checkedInAt: now, timeoutAt: job.timeoutAt });
+	try {
+		pi.appendEntry?.("return-on-check-in", { id: job.id, label: job.label, checkedInAt: now, checkInCount: job.checkInCount });
+	} catch {
+		// Best-effort audit trail.
+	}
+	pi.sendMessage(
+		{
+			customType: EXTENSION_NAME,
+			content: formatCheckInMessage(job, now),
+			display: true,
+			details: { id: job.id, label: job.label, checkIn: true, checkedInAt: now, checkInCount: job.checkInCount },
+		},
+		{ triggerTurn: true },
+	);
+}
+
 function truncateInline(value: string, limit: number): string {
 	const normalized = value.replace(/\s+/g, " ").trim();
 	return normalized.length > limit ? `${normalized.slice(0, Math.max(0, limit - 1))}…` : normalized;
@@ -2603,12 +2674,17 @@ function formatReceiptCheckCadence(job: ReturnOnJob): string | undefined {
 	return min === max ? `Checks: every ${formatDuration(min)}` : `Checks: every ${formatDuration(min)}–${formatDuration(max)}`;
 }
 
+function formatReceiptCheckInCadence(job: ReturnOnJob): string | undefined {
+	return job.checkInEveryMs ? `Check-ins: every ${formatDuration(job.checkInEveryMs)}` : undefined;
+}
+
 function formatRegisteredJobMessage(job: ReturnOnJob, timeoutMs: number, maxTimeoutMs: number, maxFires: number, endTurn: boolean, incomingWebhooks: string): string {
 	const lines = [
 		`✅ return_on is WAITING now`,
 		`Job: ${job.label} (${job.id})`,
 		...formatReceiptConditionLines(job),
 		formatReceiptCheckCadence(job),
+		formatReceiptCheckInCadence(job),
 		`Timeout: in ${formatDuration(timeoutMs)} (max ${formatDuration(maxTimeoutMs)})`,
 		maxFires > 1 ? `Repeats: up to ${maxFires} times after the condition resets` : undefined,
 		`View status: ${RETURN_ON_SHORTCUT_LABEL} or /return-on-waiters`,
@@ -2694,8 +2770,9 @@ function summarizeJob(job: ReturnOnJob): string {
 	const fired = lastFired ? ` fired=${nowIso(lastFired)}` : "";
 	const maxFires = Math.max(1, job.maxFires ?? 1);
 	const fires = maxFires > 1 ? ` fires=${job.fireCount ?? 0}/${maxFires}` : "";
+	const checkIn = job.checkInEveryMs ? ` checkIn=${formatDuration(job.checkInEveryMs)}${job.checkInCount ? ` count=${job.checkInCount}` : ""}` : "";
 	const cancelled = job.cancelledAt ? ` cancelled=${nowIso(job.cancelledAt)}` : "";
-	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${fires}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
+	return `${job.id} [${job.status}] ${job.label}${timeout}${delivery}${handler}${fired}${fires}${checkIn}${cancelled}\n  waiting: ${formatJobWaitSummary(job)}\n  condition: ${describeCondition(job.condition)}\n  cwd=${job.cwd}`;
 }
 
 function formatFiredEventLine(event: FiredEventState): string {
@@ -2721,6 +2798,7 @@ function formatJobDetails(job: ReturnOnJob): string {
 		...(job.timeoutAt ? [`Timeout: ${nowIso(job.timeoutAt)}`] : []),
 		...(job.firedAt ? [`Fired: ${nowIso(job.lastFiredAt ?? job.firedAt)}${job.maxFires && job.maxFires > 1 ? ` (${job.fireCount ?? 0}/${job.maxFires})` : ""}`] : []),
 		...(job.fireReason ? [`Fire reason: ${job.fireReason}`] : []),
+		...(job.checkInEveryMs ? [`Check-ins: every ${formatDuration(job.checkInEveryMs)}${job.checkInCount ? `; sent ${job.checkInCount}; last ${nowIso(job.lastCheckInAt ?? job.updatedAt)}` : ""}`] : []),
 		...(job.cancelledAt ? [`Cancelled: ${nowIso(job.cancelledAt)}`] : []),
 		...(job.delivery ? [`Delivery: ${job.delivery.mode} notify=${job.delivery.notify}`] : []),
 		...(job.handlerRunId ? [`Handler: ${job.handlerRunId}`] : []),
@@ -2810,7 +2888,9 @@ function formatJobAgeSummary(job: ReturnOnJob): string {
 	if (job.status === "active") {
 		const checkedAt = latestJobCheckAt(job);
 		const schedule = formatJobCheckSchedule(job, now);
-		return `${started} · ${checkedAt ? `last check ${formatAge(checkedAt, now)}` : "not checked yet"}${schedule ? ` · ${schedule}` : ""}`;
+		const checkInAt = nextCheckInAt(job);
+		const checkIn = checkInAt ? ` · check-in ${checkInAt <= now ? "due now" : `in ${formatDuration(checkInAt - now)}`}` : "";
+		return `${started} · ${checkedAt ? `last check ${formatAge(checkedAt, now)}` : "not checked yet"}${schedule ? ` · ${schedule}` : ""}${checkIn}`;
 	}
 	if (job.status === "fired") return `${started} · returned ${formatAge(job.lastFiredAt ?? job.firedAt ?? job.updatedAt, now)}`;
 	return `${started} · cancelled ${formatAge(job.cancelledAt ?? job.updatedAt, now)}`;
@@ -3507,6 +3587,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use return_on when waiting for time, files, logs, processes, ports, URLs, command checks, builds, renders, servers, or other external state instead of polling in the conversation.",
 			"Every return_on watcher has an effective timeout. If no timeout is provided, the configured default applies; explicit timeouts cannot exceed the configured maximum. The packaged default max is 2h; choose a realistic explicit timeout for long jobs instead of assuming an older 10m cap.",
+			"For long timeouts, set checkInEvery (for example '5m', '10m', '15m', or '30m') when the parent should be woken periodically while the watcher is still pending.",
 			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
@@ -3519,6 +3600,7 @@ export default function (pi: ExtensionAPI) {
 			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
+			checkInEvery: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional periodic check-in wakeup while the watcher is still pending, e.g. '5m', '10m', '30m', or milliseconds. This does not fire or cancel the watcher." })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
 			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for same-session wake, {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} for a background fork/sibling Pi session, or {mode:'auto'} to wake the idle parent directly and fork only when the parent is busy or already handling background events." })),
 			parent: Type.Optional(Type.String({ enum: ["auto", "main", "current"], description: "Ownership/routing for watchers created inside fork handlers. auto (default) returns fork-created watchers to the inherited main dialog when available; main forces inherited main-dialog ownership; current keeps the watcher/callback owned by the creating fork/session." })),
@@ -3544,6 +3626,7 @@ export default function (pi: ExtensionAPI) {
 
 			const returnOnConfig = await loadReturnOnConfig(ctx.cwd);
 			const timeoutMs = parseRequestedJobTimeout(params.timeout, returnOnConfig);
+			const checkInEveryMs = parseCheckInEvery(params.checkInEvery);
 			const webhook = normalizeWebhook(params.webhook);
 			const delivery = normalizeDelivery(params.delivery, returnOnConfig);
 			let maxFires = 1;
@@ -3583,6 +3666,7 @@ export default function (pi: ExtensionAPI) {
 				...(params.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
 				...(params.endTurn === false ? { endTurn: false } : {}),
 				...(maxFires > 1 ? { maxFires } : {}),
+				...(checkInEveryMs !== undefined ? { checkInEveryMs, lastCheckInAt: Date.now(), checkInCount: 0 } : {}),
 				fireCount: 0,
 				latches: {},
 				leafState: {},
@@ -3590,7 +3674,7 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
-			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires });
+			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires, checkInEveryMs });
 			try {
 				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
 			} catch {

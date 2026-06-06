@@ -203,6 +203,14 @@ function wakeEntries(harness: Harness, jobId: string) {
   return harness.messages.filter((entry) => entry.message?.details?.id === jobId);
 }
 
+function checkInEntries(harness: Harness, jobId: string) {
+  return wakeEntries(harness, jobId).filter((entry) => entry.message?.details?.checkIn === true);
+}
+
+function finalWakeEntries(harness: Harness, jobId: string) {
+  return wakeEntries(harness, jobId).filter((entry) => entry.message?.details?.checkIn !== true);
+}
+
 function assertWake(entry: any, expectation: WakeExpectation) {
   const content = String(entry.message?.content ?? "");
   if (entry.options?.triggerTurn !== true) throw new Error(`wake ${expectation.label} did not set triggerTurn=true`);
@@ -216,7 +224,7 @@ function assertWake(entry: any, expectation: WakeExpectation) {
 async function waitForWake(harness: Harness, expectation: WakeExpectation, timeoutMs: number) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const entries = wakeEntries(harness, expectation.jobId);
+    const entries = finalWakeEntries(harness, expectation.jobId);
     if (entries.length > 0) {
       if (entries.length !== 1) throw new Error(`expected exactly one wake for ${expectation.label}, saw ${entries.length}`);
       assertWake(entries[0], expectation);
@@ -230,14 +238,14 @@ async function waitForWake(harness: Harness, expectation: WakeExpectation, timeo
 async function waitForWakeCount(harness: Harness, expectation: WakeExpectation, expectedCount: number, timeoutMs: number) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const entries = wakeEntries(harness, expectation.jobId);
+    const entries = finalWakeEntries(harness, expectation.jobId);
     if (entries.length >= expectedCount) {
       for (const entry of entries) assertWake(entry, expectation);
       return entries;
     }
     await sleep(100);
   }
-  const entries = wakeEntries(harness, expectation.jobId);
+  const entries = finalWakeEntries(harness, expectation.jobId);
   throw new Error(`timed out waiting for ${expectedCount} wakes of ${expectation.label}, saw ${entries.length}`);
 }
 
@@ -1088,6 +1096,57 @@ async function testTimeoutWake(harness: Harness) {
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
 }
 
+async function waitForCheckIn(harness: Harness, jobId: string, expectedCount: number, timeoutMs: number) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const entries = checkInEntries(harness, jobId);
+    if (entries.length >= expectedCount) return entries;
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for ${expectedCount} check-ins of ${jobId}, saw ${checkInEntries(harness, jobId).length}`);
+}
+
+async function testCheckInEvery(harness: Harness) {
+  const label = "smoke check-in";
+  const resume = "check-in resume";
+  const result = await harness.callTool("return_on", {
+    label,
+    condition: { type: "file", path: "never-check-in.txt", exists: true, every: "100ms" },
+    timeout: "3500ms",
+    checkInEvery: "1s",
+    resume,
+  });
+  const jobId = result.details.job.id as string;
+  allJobIds.push(jobId);
+  const receipt = String(result.content?.[0]?.text ?? "");
+  if (!receipt.includes("Check-ins: every 1s")) throw new Error(`registration did not display check-in cadence: ${receipt}`);
+
+  const checkIns = await waitForCheckIn(harness, jobId, 1, 2_800);
+  const checkInText = String(checkIns[0].message?.content ?? "");
+  if (!checkInText.includes("return_on check-in") || !checkInText.includes("Still waiting") || !checkInText.includes(resume)) {
+    throw new Error(`check-in wake content was incomplete: ${checkInText}`);
+  }
+  if (finalWakeEntries(harness, jobId).length !== 0) throw new Error("check-in incorrectly fired the watcher");
+
+  const entry = await waitForWake(harness, { jobId, label, resume }, 4_000);
+  if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("check-in watcher did not eventually timeout");
+  if (checkInEntries(harness, jobId).length < 1) throw new Error("check-in entry disappeared after timeout");
+
+  let rejected: string | undefined;
+  try {
+    await harness.callTool("return_on", {
+      label: "bad check-in",
+      condition: { type: "timer", after: "1s" },
+      timeout: "2s",
+      checkInEvery: "500ms",
+      resume: "should reject",
+    });
+  } catch (error) {
+    rejected = String(error);
+  }
+  if (!rejected || !rejected.includes("checkInEvery must be at least 1s")) throw new Error(`short check-in interval was not rejected: ${rejected ?? "accepted"}`);
+}
+
 async function testDefaultMaxTimeoutIsTwoHours(harness: Harness) {
   let rejected: string | undefined;
   try {
@@ -1652,6 +1711,7 @@ await testConditionJsonString(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
+await testCheckInEvery(harness);
 await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
 await testDefaultDeliverySettings(harness);
