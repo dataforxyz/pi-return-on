@@ -1106,6 +1106,25 @@ async function waitForCheckIn(harness: Harness, jobId: string, expectedCount: nu
   throw new Error(`timed out waiting for ${expectedCount} check-ins of ${jobId}, saw ${checkInEntries(harness, jobId).length}`);
 }
 
+async function testCheckInSkipsBusyParent() {
+  let pending = true;
+  const harness = createHarness("checkin-busy-session", { hasPendingMessages: () => pending });
+  await harness.emit("session_start");
+  const label = "smoke busy check-in";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "never-busy-check-in.txt", exists: true, every: "100ms" },
+    timeout: "5s",
+    checkInEvery: "1s",
+    resume: "busy check-in resume",
+  });
+  await expectNoWake(harness, jobId, 1_700, "busy parent should not queue periodic check-ins");
+  pending = false;
+  await waitForCheckIn(harness, jobId, 1, 2_000);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
 async function testCheckInEvery(harness: Harness) {
   const label = "smoke check-in";
   const resume = "check-in resume";
@@ -1712,6 +1731,7 @@ await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
 await testCheckInEvery(harness);
+await testCheckInSkipsBusyParent();
 await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
 await testDefaultDeliverySettings(harness);

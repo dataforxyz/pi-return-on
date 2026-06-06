@@ -1021,7 +1021,7 @@ function activeHandlersForCurrentSession(): ReturnOnHandlerRun[] {
 	return handlerRuns.filter((run) => (run.status === "starting" || run.status === "running") && (!currentSessionFile || !run.parentSessionFile || run.parentSessionFile === currentSessionFile));
 }
 
-async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
+function canQueueParentTurn(): boolean {
 	const ctx = latestCtx;
 	if (!ctx) return false;
 	try {
@@ -1030,6 +1030,11 @@ async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Prom
 	} catch {
 		return false;
 	}
+	return true;
+}
+
+async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
+	if (!canQueueParentTurn()) return false;
 	const otherActiveJobs = activeJobsForCurrentSession().filter((candidate) => candidate.id !== job.id);
 	if (otherActiveJobs.length > 0) return false;
 	await loadHandlers();
@@ -1921,8 +1926,7 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 				}
 				const dueCheckInAt = nextCheckInAt(job);
 				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) {
-					await sendCheckIn(pi, job);
-					changed = true;
+					changed = (await sendCheckIn(pi, job)) || changed;
 				}
 			} catch (error) {
 				job.leafState.root = { ...job.leafState.root, lastSummary: `evaluation error: ${error instanceof Error ? error.message : String(error)}` };
@@ -2554,8 +2558,9 @@ function formatCheckInMessage(job: ReturnOnJob, checkedInAt = Date.now()): strin
 	].join("\n");
 }
 
-async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<void> {
-	if (job.status !== "active" || !job.checkInEveryMs) return;
+async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
+	if (job.status !== "active" || !job.checkInEveryMs) return false;
+	if (!canQueueParentTurn()) return false;
 	const now = Date.now();
 	job.lastCheckInAt = now;
 	job.checkInCount = (job.checkInCount ?? 0) + 1;
@@ -2576,6 +2581,7 @@ async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<void> {
 		},
 		{ triggerTurn: true },
 	);
+	return true;
 }
 
 function truncateInline(value: string, limit: number): string {
