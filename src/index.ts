@@ -389,8 +389,12 @@ let currentSessionFile: string | undefined;
 let agentTurnActive = false;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
 let immediateTickTimer: ReturnType<typeof setTimeout> | undefined;
+let jobsStateWatcher: fs.FSWatcher | undefined;
+let jobsStateReloadTimer: ReturnType<typeof setTimeout> | undefined;
 let latestCtx: ExtensionContext | undefined;
 let ticking = false;
+let savingJobs = false;
+let saveJobsQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
 let fileWatchers = new Map<string, fs.FSWatcher>();
 let incomingWebhookServer: http.Server | undefined;
@@ -680,27 +684,71 @@ function formatDirectWaitAudit(entries: DirectWaitAuditEntry[]): string {
 }
 
 async function loadJobs(): Promise<void> {
-	try {
-		const raw = await fsp.readFile(JOBS_FILE, "utf8");
-		const parsed = JSON.parse(raw) as JobsState;
-		jobs = Array.isArray(parsed.jobs) ? parsed.jobs : [];
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			console.error(`[${EXTENSION_NAME}] Failed to load jobs:`, error);
-		}
-		jobs = [];
-	}
+	jobs = await readJobsFile();
 }
 
 function atomicTempPath(target: string): string {
 	return `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
 }
 
-async function saveJobs(): Promise<void> {
-	await fsp.mkdir(STATE_DIR, { recursive: true });
-	const tmp = atomicTempPath(JOBS_FILE);
-	await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
-	await fsp.rename(tmp, JOBS_FILE);
+function isTerminalJob(job: ReturnOnJob): boolean {
+	return job.status === "fired" || job.status === "cancelled";
+}
+
+function jobMergeTime(job: ReturnOnJob): number {
+	const leafChecks = Object.values(job.leafState ?? {}).map((state) => state.lastCheckAt ?? 0);
+	const latchTimes = Object.values(job.latches ?? {}).map((latch) => latch.trueAt ?? 0);
+	return Math.max(job.updatedAt ?? 0, job.firedAt ?? 0, job.lastFiredAt ?? 0, job.cancelledAt ?? 0, ...leafChecks, ...latchTimes);
+}
+
+function chooseMergedJob(a: ReturnOnJob, b: ReturnOnJob): ReturnOnJob {
+	if (a.status !== b.status) {
+		if (isTerminalJob(a) && !isTerminalJob(b)) return a;
+		if (isTerminalJob(b) && !isTerminalJob(a)) return b;
+	}
+	return jobMergeTime(b) >= jobMergeTime(a) ? b : a;
+}
+
+async function readJobsFile(): Promise<ReturnOnJob[]> {
+	try {
+		const raw = await fsp.readFile(JOBS_FILE, "utf8");
+		const parsed = JSON.parse(raw) as JobsState;
+		return Array.isArray(parsed.jobs) ? parsed.jobs : [];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			console.error(`[${EXTENSION_NAME}] Failed to load jobs:`, error);
+		}
+		return [];
+	}
+}
+
+export function mergeJobsForSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[]): ReturnOnJob[] {
+	const merged = new Map<string, ReturnOnJob>();
+	for (const job of diskJobs) merged.set(job.id, job);
+	for (const job of memoryJobs) {
+		const existing = merged.get(job.id);
+		merged.set(job.id, existing ? chooseMergedJob(existing, job) : job);
+	}
+	return [...merged.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+async function saveJobs(options: { merge?: boolean } = {}): Promise<void> {
+	const memoryJobs = jobs;
+	const run = async () => {
+		await fsp.mkdir(STATE_DIR, { recursive: true });
+		savingJobs = true;
+		try {
+			jobs = options.merge === false ? memoryJobs : mergeJobsForSave(memoryJobs, await readJobsFile());
+			const tmp = atomicTempPath(JOBS_FILE);
+			await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
+			await fsp.rename(tmp, JOBS_FILE);
+		} finally {
+			savingJobs = false;
+		}
+	};
+	const result = saveJobsQueue.then(run, run);
+	saveJobsQueue = result.catch(() => undefined);
+	await result;
 }
 
 async function loadHandlers(): Promise<void> {
@@ -902,7 +950,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	});
 	if (!dryRun && jobsPruned > 0) {
 		jobs = keptJobs;
-		await saveJobs();
+		await saveJobs({ merge: false });
 	}
 
 	let firedEventsPruned = 0;
@@ -1071,6 +1119,49 @@ function startTicker(pi: ExtensionAPI): void {
 function stopTicker(): void {
 	if (tickTimer) clearInterval(tickTimer);
 	tickTimer = undefined;
+}
+
+function scheduleJobsStateReload(pi: ExtensionAPI, delayMs = 100): void {
+	if (jobsStateReloadTimer) clearTimeout(jobsStateReloadTimer);
+	jobsStateReloadTimer = setTimeout(() => {
+		jobsStateReloadTimer = undefined;
+		void reloadJobsStateFromDisk(pi);
+	}, delayMs);
+	jobsStateReloadTimer.unref?.();
+}
+
+async function reloadJobsStateFromDisk(pi: ExtensionAPI): Promise<void> {
+	if (savingJobs || ticking) {
+		scheduleJobsStateReload(pi, 250);
+		return;
+	}
+	await loadJobs();
+	ensureTicker(pi);
+}
+
+async function startJobsStateWatcher(pi: ExtensionAPI): Promise<void> {
+	if (jobsStateWatcher) return;
+	await fsp.mkdir(STATE_DIR, { recursive: true });
+	try {
+		jobsStateWatcher = fs.watch(STATE_DIR, (eventType, filename) => {
+			if (filename && filename !== path.basename(JOBS_FILE)) return;
+			if (eventType !== "rename" && eventType !== "change") return;
+			scheduleJobsStateReload(pi);
+		});
+		jobsStateWatcher.on("error", (error) => {
+			console.error(`[${EXTENSION_NAME}] Jobs state watcher failed:`, error);
+			stopJobsStateWatcher();
+		});
+	} catch (error) {
+		console.error(`[${EXTENSION_NAME}] Failed to start jobs state watcher:`, error);
+	}
+}
+
+function stopJobsStateWatcher(): void {
+	if (jobsStateReloadTimer) clearTimeout(jobsStateReloadTimer);
+	jobsStateReloadTimer = undefined;
+	jobsStateWatcher?.close();
+	jobsStateWatcher = undefined;
 }
 
 function requestImmediateTick(pi: ExtensionAPI): void {
@@ -3485,6 +3576,7 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = ctx;
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
+		await startJobsStateWatcher(pi);
 		await clearPendingCheckInWakes(currentSessionFile);
 		await loadHandlers();
 		try {
@@ -3507,6 +3599,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		agentTurnActive = false;
 		stopTicker();
+		stopJobsStateWatcher();
 		stopFileWatchers();
 		stopIncomingWebhookServer();
 		if (immediateTickTimer) clearTimeout(immediateTickTimer);

@@ -5,6 +5,7 @@ import {
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
 	collectIncomingWebhookTargets,
+	mergeJobsForSave,
 	normalizeCondition,
 } from "../src/index.ts";
 
@@ -22,6 +23,49 @@ function makeJob(condition: unknown): any {
 		leafState: {},
 	};
 }
+
+function makeMergeJob(id: string, status: "active" | "fired" | "cancelled", updatedAt: number): any {
+	return {
+		...makeJob({ type: "timer", after: "1m" }),
+		id,
+		status,
+		createdAt: updatedAt - 10,
+		updatedAt,
+		...(status === "fired" ? { firedAt: updatedAt } : {}),
+		...(status === "cancelled" ? { cancelledAt: updatedAt } : {}),
+	};
+}
+
+test("mergeJobsForSave preserves jobs added by another process", () => {
+	const disk = makeMergeJob("ro_disk", "active", 10);
+	const memory = makeMergeJob("ro_memory", "active", 20);
+	assert.deepEqual(mergeJobsForSave([memory], [disk]).map((job) => job.id), ["ro_disk", "ro_memory"]);
+});
+
+test("mergeJobsForSave does not resurrect terminal jobs from stale active memory", () => {
+	const staleActive = makeMergeJob("ro_same", "active", 10);
+	const diskFired = makeMergeJob("ro_same", "fired", 20);
+	const merged = mergeJobsForSave([staleActive], [diskFired]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].status, "fired");
+	assert.equal(merged[0].updatedAt, 20);
+});
+
+test("mergeJobsForSave keeps the newer active copy", () => {
+	const disk = makeMergeJob("ro_same", "active", 10);
+	const memory = { ...makeMergeJob("ro_same", "active", 30), label: "newer" };
+	const merged = mergeJobsForSave([memory], [disk]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].label, "newer");
+});
+
+test("mergeJobsForSave keeps in-memory leaf-state progress on timestamp ties", () => {
+	const disk = makeMergeJob("ro_same", "active", 10);
+	const memory = { ...makeMergeJob("ro_same", "active", 10), leafState: { root: { lastCheckAt: 20, lastValue: false } } };
+	const merged = mergeJobsForSave([memory], [disk]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].leafState.root.lastCheckAt, 20);
+});
 
 test("normalizeCondition: rejects non-object input", () => {
 	assert.throws(() => normalizeCondition(undefined), /must be an object/);
