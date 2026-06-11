@@ -2541,11 +2541,6 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	} catch (error) {
 		console.error(`[${EXTENSION_NAME}] Failed to write fired event for ${job.id}:`, error);
 	}
-	try {
-		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt, eventPath });
-	} catch {
-		// Best-effort audit trail.
-	}
 	void sendWebhook(job, reason).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Webhook failed for ${job.id}:`, error);
 	});
@@ -2556,6 +2551,11 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 			if (eventPath) await markFiredEventDelivered(eventPath, reason, "handler-launched", job);
 			return;
 		}
+	}
+	try {
+		pi.appendEntry?.("return-on-fired", { id: job.id, label: job.label, reason, firedAt: job.firedAt, eventPath });
+	} catch {
+		// Best-effort audit trail.
 	}
 	const message = formatFireMessage(job, reason);
 	pi.sendMessage(

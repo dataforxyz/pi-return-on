@@ -101,6 +101,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
+  const entries: any[] = [];
   const notifications: Array<{ message: string; level?: string }> = [];
   const statuses: Array<{ key: string; value?: string }> = [];
   const commands = new Map<string, any>();
@@ -133,7 +134,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
       commands.set(name, command);
     },
     registerMessageRenderer() {},
-    appendEntry() {},
+    appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
     on(event: string, handler: Function) {
       const handlers = events.get(event) ?? [];
       handlers.push(handler);
@@ -197,7 +198,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
     await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
-  return { beforeAgentStart, callTool, commands, ctx, emit, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
+  return { beforeAgentStart, callTool, commands, ctx, emit, entries, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
 }
 
 function wakeEntries(harness: Harness, jobId: string) {
@@ -404,6 +405,9 @@ async function testForkDelivery(harness: Harness) {
       const prompt = await fs.readFile(promptArg.slice(1), "utf8");
       if (!prompt.includes("intercom.send") || !prompt.includes("intercom.ask")) throw new Error("handler prompt missed intercom policy");
       if (!prompt.includes("delegated") || !prompt.includes("low confidence")) throw new Error("handler prompt missed delegated authority boundaries");
+      if (harness.entries.some((entry) => entry.type === "return-on-fired" && entry.data?.id === jobId)) {
+        throw new Error("fork delivery should not also append a parent return-on-fired wake entry");
+      }
       return;
     }
     await sleep(50);
