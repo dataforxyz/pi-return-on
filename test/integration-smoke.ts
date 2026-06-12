@@ -369,6 +369,38 @@ async function testRegisterWithoutEndingTurn(harness: Harness) {
   await waitForWake(harness, { jobId, label: "smoke continue registration", resume: "continue registration resume" }, 1_500);
 }
 
+async function testDuplicateWatcherRegistrationDedupes(harness: Harness) {
+  const label = "smoke duplicate watcher";
+  const condition = { type: "timer", after: "10m" };
+  const first = await harness.callTool("return_on", { label, condition, resume: "first resume", endTurn: false });
+  const second = await harness.callTool("return_on", { label, condition, resume: "second resume from sibling handler", parent: "main", endTurn: false });
+  const firstId = first.details.job.id;
+  const secondId = second.details.job.id;
+  allJobIds.push(firstId);
+  if (first.details.duplicate) throw new Error("first duplicate watcher registration was unexpectedly deduped");
+  if (!second.details.duplicate) throw new Error("second duplicate watcher registration was not marked duplicate");
+  if (secondId !== firstId) throw new Error(`duplicate watcher returned different id: ${firstId} vs ${secondId}`);
+  const text = String(second.content?.[0]?.text ?? "");
+  if (!text.includes("already waiting") || !text.includes("no duplicate watcher was registered")) throw new Error(`duplicate response was unclear: ${text}`);
+  const registeredEntries = harness.entries.filter((entry) => entry.type === "return-on-registered" && entry.data?.label === label);
+  const dedupedEntries = harness.entries.filter((entry) => entry.type === "return-on-deduped" && entry.data?.label === label);
+  if (registeredEntries.length !== 1) throw new Error(`expected one registered entry, saw ${registeredEntries.length}`);
+  if (dedupedEntries.length !== 1) throw new Error(`expected one deduped entry, saw ${dedupedEntries.length}`);
+  await harness.cancel(firstId);
+
+  const forkLabel = "smoke duplicate watcher from fork";
+  const parent = await harness.callTool("return_on", { label: forkLabel, condition, resume: "parent resume", endTurn: false });
+  const parentId = parent.details.job.id;
+  allJobIds.push(parentId);
+  const forkHarness = createHarness("dedupe-fork-session");
+  await withEnv({ PI_RETURN_ON_PARENT_SESSION_FILE: harness.sessionFile, PI_RETURN_ON_PARENT_SESSION_NAME: "main-session" }, async () => {
+    const fork = await forkHarness.callTool("return_on", { label: forkLabel, condition, resume: "fork handler follow-up resume", parent: "main", endTurn: false });
+    if (!fork.details.duplicate) throw new Error("fork-routed duplicate watcher registration was not marked duplicate");
+    if (fork.details.job.id !== parentId) throw new Error(`fork duplicate watcher returned different id: ${parentId} vs ${fork.details.job.id}`);
+  });
+  await harness.cancel(parentId);
+}
+
 async function testForkDelivery(harness: Harness) {
   const fakePi = path.join(cwd, "fake-pi.mjs");
   const fakePiArgs = path.join(cwd, "fake-pi-args.json");
@@ -1795,6 +1827,7 @@ await testDirectWaitPolicy(harness);
 await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
+await testDuplicateWatcherRegistrationDedupes(harness);
 await testForkDelivery(harness);
 await testAutoDeliveryWakesIdleParent(harness);
 const busyHarness = createHarness("busy-session", { isIdle: () => false });

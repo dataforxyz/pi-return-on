@@ -1067,6 +1067,38 @@ function activeJobsForCurrentSession(): ReturnOnJob[] {
 	return jobs.filter((job) => job.status === "active" && jobVisibleForSession(job, currentSessionFile));
 }
 
+function stableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.entries(value as Record<string, unknown>)
+			.filter(([, entryValue]) => entryValue !== undefined)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJson(entryValue)}`)
+			.join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+function sameDuplicateOwner(left: Pick<ReturnOnJob, "cwd" | "sessionFile" | "parentSessionId" | "parentSessionName" | "parentIntercomTarget">, right: Pick<ReturnOnJob, "cwd" | "sessionFile" | "parentSessionId" | "parentSessionName" | "parentIntercomTarget">): boolean {
+	if (left.cwd !== right.cwd) return false;
+	if (left.sessionFile && right.sessionFile && left.sessionFile === right.sessionFile) return true;
+	if (left.parentSessionId && right.parentSessionId && left.parentSessionId === right.parentSessionId) return true;
+	if (left.parentSessionName && right.parentSessionName && left.parentSessionName === right.parentSessionName) return true;
+	if (left.parentIntercomTarget && right.parentIntercomTarget && left.parentIntercomTarget === right.parentIntercomTarget) return true;
+	return !left.sessionFile && !right.sessionFile && !left.parentSessionId && !right.parentSessionId && !left.parentSessionName && !right.parentSessionName && !left.parentIntercomTarget && !right.parentIntercomTarget;
+}
+
+function findDuplicateActiveJob(job: ReturnOnJob, now = Date.now()): ReturnOnJob | undefined {
+	const conditionKey = stableJson(job.condition);
+	return jobs.find((candidate) =>
+		candidate.status === "active" &&
+		(!candidate.timeoutAt || candidate.timeoutAt > now) &&
+		candidate.label === job.label &&
+		sameDuplicateOwner(candidate, job) &&
+		stableJson(candidate.condition) === conditionKey,
+	);
+}
+
 function activeHandlersForCurrentSession(): ReturnOnHandlerRun[] {
 	return handlerRuns.filter((run) => (run.status === "starting" || run.status === "running") && (!currentSessionFile || !run.parentSessionFile || run.parentSessionFile === currentSessionFile));
 }
@@ -2796,6 +2828,21 @@ function formatReceiptCheckInCadence(job: ReturnOnJob): string | undefined {
 	return job.checkInEveryMs ? `Check-ins: every ${formatDuration(job.checkInEveryMs)}` : undefined;
 }
 
+function formatDuplicateJobMessage(job: ReturnOnJob, endTurn: boolean): string {
+	const remainingMs = job.timeoutAt ? Math.max(0, job.timeoutAt - Date.now()) : undefined;
+	const lines = [
+		`✅ return_on is already waiting`,
+		`Job: ${job.label} (${job.id})`,
+		...formatReceiptConditionLines(job),
+		formatReceiptCheckCadence(job),
+		formatReceiptCheckInCadence(job),
+		remainingMs !== undefined ? `Timeout: in ${formatDuration(remainingMs)}` : undefined,
+		`View status: ${RETURN_ON_SHORTCUT_LABEL} or /return-on-waiters`,
+		endTurn ? "This chat will resume when it returns; no duplicate watcher was registered." : "Continuing this turn; no duplicate watcher was registered.",
+	].filter((line): line is string => Boolean(line));
+	return lines.join("\n");
+}
+
 function formatRegisteredJobMessage(job: ReturnOnJob, timeoutMs: number, maxTimeoutMs: number, maxFires: number, endTurn: boolean, incomingWebhooks: string): string {
 	const lines = [
 		`✅ return_on is WAITING now`,
@@ -3803,6 +3850,22 @@ export default function (pi: ExtensionAPI) {
 				latches: {},
 				leafState: {},
 			};
+			const endTurn = params.endTurn !== false;
+			const duplicate = findDuplicateActiveJob(job);
+			if (duplicate) {
+				await appendLifecycleAudit("job_deduped", { id: duplicate.id, duplicateAttemptId: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, attemptedAt: job.createdAt });
+				try {
+					pi.appendEntry?.("return-on-deduped", { id: duplicate.id, attemptedId: job.id, label: duplicate.label, existingCreatedAt: duplicate.createdAt, attemptedAt: job.createdAt, condition: duplicate.condition });
+				} catch {
+					// Best-effort audit trail.
+				}
+				ensureTicker(pi);
+				return {
+					content: [{ type: "text", text: formatDuplicateJobMessage(duplicate, endTurn) }],
+					details: { job: duplicate, duplicate: true, attemptedJob: job, incomingWebhooks: incomingWebhookUrls(duplicate) },
+					terminate: endTurn,
+				};
+			}
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
@@ -3815,7 +3878,6 @@ export default function (pi: ExtensionAPI) {
 			ensureTicker(pi);
 			const incomingWebhooks = incomingWebhookUrls(job);
 			const webhookText = incomingWebhooks.length > 0 ? `Incoming webhook URL(s):\n${incomingWebhooks.map((hook) => `- ${hook.method} ${hook.url}`).join("\n")}` : "";
-			const endTurn = params.endTurn !== false;
 			return {
 				content: [{ type: "text", text: formatRegisteredJobMessage(job, timeoutMs, returnOnConfig.maxTimeoutMs, maxFires, endTurn, webhookText) }],
 				details: { job, incomingWebhooks },
