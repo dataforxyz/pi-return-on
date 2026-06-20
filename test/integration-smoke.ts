@@ -447,6 +447,65 @@ async function testForkDelivery(harness: Harness) {
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
 }
 
+async function testForkDeliverySkipsEmptyParentSession(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-empty-parent-session-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-empty-parent-session-args.json");
+  process.env.PI_RETURN_ON_FAKE_EMPTY_PARENT_ARGS = fakePiArgs;
+  await fs.writeFile(harness.sessionFile, "", "utf8");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(process.env.PI_RETURN_ON_FAKE_EMPTY_PARENT_ARGS, JSON.stringify(process.argv.slice(2)));\nconsole.log("empty parent fallback summary");\n`, { mode: 0o755 });
+  const label = "smoke empty parent session fork delivery";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume: "empty parent session resume",
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const summary = harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete");
+    if (summary) {
+      const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
+      if (args.includes("--fork")) throw new Error(`fork delivery should skip empty parent transcript: ${JSON.stringify(args)}`);
+      if (!String(summary.message?.content ?? "").includes("empty parent fallback summary")) throw new Error("empty parent session summary missed handler output");
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for empty parent session fork handler summary");
+}
+
+async function testDefaultPiCommandFallsBackToHomeBin(harness: Harness) {
+  const homeBin = path.join(os.homedir(), ".local", "bin");
+  const fakePi = path.join(homeBin, "pi");
+  const fakePiArgs = path.join(cwd, "fake-home-bin-pi-args.json");
+  await fs.mkdir(homeBin, { recursive: true });
+  await fs.writeFile(fakePi, `#!/bin/sh\nprintf '%s\n' "$@" > ${JSON.stringify(fakePiArgs)}\necho "home bin pi summary"\n`, { mode: 0o755 });
+  try {
+    await withEnv({ PATH: "", PI_RETURN_ON_PI_BIN: undefined }, async () => {
+      const label = "smoke home bin pi fallback";
+      const jobId = await harness.register({
+        label,
+        condition: { type: "timer", after: "100ms" },
+        resume: "home bin pi fallback resume",
+        delivery: { mode: "fork" },
+      });
+      const start = Date.now();
+      while (Date.now() - start < 2_500) {
+        const summary = harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete");
+        if (summary) {
+          if (!String(summary.message?.content ?? "").includes("home bin pi summary")) throw new Error("home bin pi fallback missed handler output");
+          await fs.readFile(fakePiArgs, "utf8");
+          return;
+        }
+        await sleep(50);
+      }
+      throw new Error("timed out waiting for home bin pi fallback handler summary");
+    });
+  } finally {
+    await fs.rm(fakePi, { force: true });
+  }
+}
+
 async function testAutoDeliveryWakesIdleParent(harness: Harness) {
   const fakePi = path.join(cwd, "fake-auto-idle-pi.mjs");
   const fakePiMarker = path.join(cwd, "fake-auto-idle-launched");
@@ -1829,6 +1888,8 @@ await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testDuplicateWatcherRegistrationDedupes(harness);
 await testForkDelivery(harness);
+await testForkDeliverySkipsEmptyParentSession(harness);
+await testDefaultPiCommandFallsBackToHomeBin(harness);
 await testAutoDeliveryWakesIdleParent(harness);
 const busyHarness = createHarness("busy-session", { isIdle: () => false });
 await busyHarness.emit("session_start");

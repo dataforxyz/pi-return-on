@@ -2284,19 +2284,52 @@ function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 	].join("\n");
 }
 
+function shouldForkParentSession(job: ReturnOnJob): boolean {
+	if (job.endTurn === false || !job.sessionFile) return false;
+	try {
+		const stat = fs.statSync(job.sessionFile);
+		if (stat.isFile() && stat.size === 0) return false;
+	} catch {
+		// In normal Pi sessions the file exists, but tests and some runtimes create it
+		// lazily. Preserve historical behavior unless we can prove it is unusable.
+	}
+	return true;
+}
+
 function buildHandlerArgs(job: ReturnOnJob, run: ReturnOnHandlerRun): string[] {
 	const args = ["-p", "--session-dir", run.sessionDir, "--append-system-prompt", buildHandlerSystemPrompt(run)];
 	// If registration did not end the parent turn, the parent session file may still be
 	// actively changing when the watcher fires. Forking that live transcript can make
 	// the handler follow the parent turn instead of handling only the return event.
-	// Use a fresh capsule-only handler in that case.
-	if (job.endTurn !== false && job.sessionFile) args.push("--fork", job.sessionFile);
+	// Use a fresh capsule-only handler in that case. Also avoid forking definitely
+	// empty session files; Pi rejects those before the handler can process the event.
+	if (shouldForkParentSession(job)) args.push("--fork", job.sessionFile!);
 	args.push(`@${run.promptPath}`);
 	return args;
 }
 
+function isExecutableFile(filePath: string): boolean {
+	try {
+		fs.accessSync(filePath, fs.constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function resolveDefaultPiCommand(): string {
+	const pathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+	for (const entry of pathEntries) {
+		const candidate = path.join(entry, "pi");
+		if (isExecutableFile(candidate)) return candidate;
+	}
+	const homePi = path.join(os.homedir(), ".local", "bin", "pi");
+	if (isExecutableFile(homePi)) return homePi;
+	return "pi";
+}
+
 function getHandlerCommand(delivery: DeliveryConfig): string {
-	return delivery.piCommand || process.env.PI_RETURN_ON_PI_BIN || "pi";
+	return delivery.piCommand || process.env.PI_RETURN_ON_PI_BIN || resolveDefaultPiCommand();
 }
 
 async function readOptionalText(filePath: string): Promise<string> {
