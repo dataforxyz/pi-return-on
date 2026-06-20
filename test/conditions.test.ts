@@ -7,6 +7,7 @@ import {
 	collectIncomingWebhookTargets,
 	mergeJobsForSave,
 	normalizeCondition,
+	normalizeReturnOnToolParams,
 } from "../src/index.ts";
 
 function makeJob(condition: unknown): any {
@@ -112,6 +113,12 @@ test("normalizeCondition: timer requires after/at/duration", () => {
 	assert.equal(c.after, "3s");
 });
 
+test("normalizeCondition: exec command argv arrays become shell-safe command strings", () => {
+	const c = normalizeCondition({ exec: { command: ["bash", "/tmp/watch pr.sh"] } }) as any;
+	assert.equal(c.type, "exec");
+	assert.equal(c.command, "bash '/tmp/watch pr.sh'");
+});
+
 test("normalizeCondition: file requires non-empty path", () => {
 	assert.throws(() => normalizeCondition({ type: "file" }), /file condition requires path/);
 });
@@ -124,6 +131,34 @@ test("normalizeCondition: webhook path must start with /", () => {
 
 test("normalizeCondition: unknown type throws", () => {
 	assert.throws(() => normalizeCondition({ type: "nope" }), /unsupported condition type/);
+});
+
+test("normalizeReturnOnToolParams recovers misplaced job options from condition", () => {
+	const params = normalizeReturnOnToolParams({
+		label: "pr watcher",
+		condition: {
+			exec: { command: "exit 0" },
+			resume: "wake on PR outcome",
+			timeout: "1h",
+			checkInEvery: "10m",
+			allowExec: true,
+		},
+	});
+	assert.equal(params.resume, "wake on PR outcome");
+	assert.equal(params.timeout, "1h");
+	assert.equal(params.checkInEvery, "10m");
+	assert.equal(params.allowExec, true);
+	assert.deepEqual(params.condition, { exec: { command: "exit 0" } });
+	const condition = normalizeCondition(params.condition) as any;
+	assert.equal(condition.type, "exec");
+	assert.equal(condition.command, "exit 0");
+});
+
+test("normalizeReturnOnToolParams gives clear missing-resume guidance", () => {
+	assert.throws(
+		() => normalizeReturnOnToolParams({ condition: { type: "timer", after: "1s" } }),
+		/return_on requires a top-level resume string/,
+	);
 });
 
 test("collectConditionLeafTargets: flattens nested groups with keys", () => {

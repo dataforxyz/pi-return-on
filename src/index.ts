@@ -1273,6 +1273,29 @@ function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaul
 	};
 }
 
+function shellQuoteArg(value: string): string {
+	if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export function normalizeReturnOnToolParams(params: Record<string, any>): Record<string, any> {
+	const normalized = { ...params };
+	if (isObject(normalized.condition)) {
+		const condition = { ...(normalized.condition as Record<string, any>) };
+		for (const field of ["resume", "timeout", "checkInEvery", "allowExec", "webhook", "delivery", "parent", "endTurn", "maxFires"] as const) {
+			if (condition[field] !== undefined) {
+				if (normalized[field] === undefined) normalized[field] = condition[field];
+				delete condition[field];
+			}
+		}
+		normalized.condition = condition;
+	}
+	if (typeof normalized.resume !== "string" || !normalized.resume.trim()) {
+		throw new Error("return_on requires a top-level resume string. If you put resume inside condition, move it to return_on({ condition, resume: ... }) or use the supported compatibility path with condition.resume.");
+	}
+	return normalized;
+}
+
 export function normalizeCondition(input: unknown): Condition {
 	if (typeof input === "string") {
 		const trimmed = input.trim();
@@ -1353,8 +1376,11 @@ export function normalizeCondition(input: unknown): Condition {
 			const { cmd, ...rest } = conditionInput;
 			conditionInput = { ...rest, command: cmd };
 		}
+		if (Array.isArray(conditionInput.command) && conditionInput.command.every((part) => typeof part === "string")) {
+			conditionInput = { ...conditionInput, command: conditionInput.command.map(shellQuoteArg).join(" ") };
+		}
 		if (typeof conditionInput.command !== "string" && typeof conditionInput.code !== "string") {
-			throw new Error("exec condition requires command or code (or cmd as a compatibility alias for command)");
+			throw new Error("exec condition requires command or code (or cmd as a compatibility alias for command; command may also be an argv string array)");
 		}
 		for (const field of ["runner", "shell"] as const) {
 			const runner = conditionInput[field];
@@ -3776,7 +3802,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			label: Type.Optional(Type.String({ description: "Short human-readable name for this watcher" })),
 			condition: Type.Any({ description: "Condition tree. Groups: {op:'and'|'or'|'not', children:[...]}, {any:[...]}, {all:[...]}, {not:{...}}. Leaves: timer/file/process/port/url/webhook/exec." }),
-			resume: Type.String({ description: "Instruction to inject when the watcher fires" }),
+			resume: Type.Optional(Type.String({ description: "Instruction to inject when the watcher fires" })),
 			every: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Default polling interval inherited by file/process/port/url/exec leaves, e.g. '2s' or milliseconds" })),
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
 			checkInEvery: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional periodic check-in wakeup while the watcher is still pending, e.g. '5m', '10m', '30m', or milliseconds. This does not fire or cancel the watcher." })),
@@ -3791,10 +3817,11 @@ export default function (pi: ExtensionAPI) {
 			latestCtx = ctx;
 			currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 			await loadJobs();
-			const condition = normalizeCondition(params.condition);
+			const request = normalizeReturnOnToolParams(params as Record<string, any>);
+			const condition = normalizeCondition(request.condition);
 			prepareIncomingWebhooks(condition);
 			const hasExec = conditionHasExec(condition);
-			let allowExec = params.allowExec === true;
+			let allowExec = request.allowExec === true;
 			if (hasExec && !allowExec) {
 				if (!ctx.hasUI) {
 					throw new Error("return_on condition contains exec leaves. Set allowExec=true only after user approval.");
@@ -3804,21 +3831,21 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const returnOnConfig = await loadReturnOnConfig(ctx.cwd);
-			const timeoutMs = parseRequestedJobTimeout(params.timeout, returnOnConfig);
-			const checkInEveryMs = parseCheckInEvery(params.checkInEvery);
-			const webhook = normalizeWebhook(params.webhook);
-			const delivery = normalizeDelivery(params.delivery, returnOnConfig);
+			const timeoutMs = parseRequestedJobTimeout(request.timeout, returnOnConfig);
+			const checkInEveryMs = parseCheckInEvery(request.checkInEvery);
+			const webhook = normalizeWebhook(request.webhook);
+			const delivery = normalizeDelivery(request.delivery, returnOnConfig);
 			let maxFires = 1;
-			if (params.maxFires !== undefined) {
-				if (typeof params.maxFires !== "number" || !Number.isFinite(params.maxFires) || !Number.isInteger(params.maxFires) || params.maxFires < 1) {
+			if (request.maxFires !== undefined) {
+				if (typeof request.maxFires !== "number" || !Number.isFinite(request.maxFires) || !Number.isInteger(request.maxFires) || request.maxFires < 1) {
 					throw new Error("maxFires must be a positive integer");
 				}
-				maxFires = params.maxFires;
+				maxFires = request.maxFires;
 			}
 			if (maxFires > 1 && conditionIsTimerOnly(condition)) {
 				throw new Error("maxFires > 1 requires a re-armable condition. A timer-only condition cannot fire more than once because a passed deadline stays passed. Combine the timer with a file/process/port/url/exec/webhook leaf, or use multiple separate watchers.");
 			}
-			const parentRouting = normalizeParentRouting(params.parent);
+			const parentRouting = normalizeParentRouting(request.parent);
 			const inheritedParentSession = shouldUseInheritedParent(parentRouting) && hasInheritedParentEnv();
 			const registrationSessionFile = getParentSessionFile(ctx, parentRouting);
 			const registrationSessionId = getParentSessionId(ctx, parentRouting);
@@ -3826,7 +3853,7 @@ export default function (pi: ExtensionAPI) {
 			const registrationIntercomTarget = resolveParentIntercomTarget(pi, ctx, parentRouting);
 			const job: ReturnOnJob = {
 				id: makeId(),
-				label: params.label?.trim() || "return_on watcher",
+				label: request.label?.trim() || "return_on watcher",
 				cwd: ctx.cwd,
 				...(registrationSessionFile ? { sessionFile: registrationSessionFile } : {}),
 				...(registrationSessionId ? { parentSessionId: registrationSessionId } : {}),
@@ -3837,20 +3864,20 @@ export default function (pi: ExtensionAPI) {
 				updatedAt: Date.now(),
 				status: "active",
 				condition,
-				resume: params.resume,
+				resume: request.resume,
 				timeoutAt: Date.now() + timeoutMs,
 				allowExec,
-				...(params.every !== undefined ? { every: params.every } : {}),
+				...(request.every !== undefined ? { every: request.every } : {}),
 				...(webhook ? { webhook } : {}),
-				...(params.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
-				...(params.endTurn === false ? { endTurn: false } : {}),
+				...(request.delivery !== undefined || delivery.mode !== "wake" ? { delivery } : {}),
+				...(request.endTurn === false ? { endTurn: false } : {}),
 				...(maxFires > 1 ? { maxFires } : {}),
 				...(checkInEveryMs !== undefined ? { checkInEveryMs, lastCheckInAt: Date.now(), checkInCount: 0 } : {}),
 				fireCount: 0,
 				latches: {},
 				leafState: {},
 			};
-			const endTurn = params.endTurn !== false;
+			const endTurn = request.endTurn !== false;
 			const duplicate = findDuplicateActiveJob(job);
 			if (duplicate) {
 				await appendLifecycleAudit("job_deduped", { id: duplicate.id, duplicateAttemptId: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, attemptedAt: job.createdAt });

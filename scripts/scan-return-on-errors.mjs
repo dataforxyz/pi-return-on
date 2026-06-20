@@ -159,7 +159,18 @@ function classifyResolved(text, args) {
 	if (text.startsWith("exec condition requires command or code") && hasExecCmdAlias(args?.condition)) {
 		return "supported_by_current_exec_cmd_alias";
 	}
+	if (text.startsWith("exec condition requires command or code") && hasExecCommandArray(args?.condition)) {
+		return "supported_by_current_exec_command_array_compat";
+	}
+	if (text.includes("resume: must have required properties resume") && hasMisplacedReturnOnParams(args?.condition)) {
+		return "supported_by_current_misplaced_job_param_compat";
+	}
 	return undefined;
+}
+
+function hasMisplacedReturnOnParams(condition) {
+	condition = parseConditionMaybe(condition);
+	return isPlainObject(condition) && typeof condition.resume === "string";
 }
 
 function hasExecCmdAlias(condition) {
@@ -171,6 +182,18 @@ function hasExecCmdAlias(condition) {
 	if (Array.isArray(condition.children)) return condition.children.some(hasExecCmdAlias);
 	if (condition.type === "exec" && typeof condition.cmd === "string" && condition.command === undefined) return true;
 	if (isPlainObject(condition.exec) && typeof condition.exec.cmd === "string" && condition.exec.command === undefined) return true;
+	return false;
+}
+
+function hasExecCommandArray(condition) {
+	condition = parseConditionMaybe(condition);
+	if (!condition || typeof condition !== "object" || Array.isArray(condition)) return false;
+	if (Array.isArray(condition.any)) return condition.any.some(hasExecCommandArray);
+	if (Array.isArray(condition.all)) return condition.all.some(hasExecCommandArray);
+	if (condition.not !== undefined) return hasExecCommandArray(condition.not);
+	if (Array.isArray(condition.children)) return condition.children.some(hasExecCommandArray);
+	if (condition.type === "exec" && Array.isArray(condition.command) && condition.command.every((part) => typeof part === "string")) return true;
+	if (isPlainObject(condition.exec) && Array.isArray(condition.exec.command) && condition.exec.command.every((part) => typeof part === "string")) return true;
 	return false;
 }
 
