@@ -24,6 +24,7 @@
     "test": "npm run typecheck && npm run test:direct-wait-tools && npm run test:unit && npm run test:scan-direct-waits && npm run smoke",
     "audit:direct-waits": "node scripts/scan-direct-waits.mjs",
     "scan-lifecycle": "node scripts/scan-return-on-lifecycle.mjs",
+    "scan-fork-handlers": "node scripts/scan-fork-handlers.mjs",
     "repair-lifecycle": "node scripts/repair-return-on-lifecycle.mjs",
     "check:lifecycle": "node scripts/check-return-on-lifecycle.mjs"
   },
