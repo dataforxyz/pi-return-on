@@ -135,8 +135,24 @@ function addIssue(issues, key, severity, title, sample) {
   issues.set(key, issue);
 }
 
+function stripHereDocBodies(text) {
+  const lines = String(text ?? "").split(/\n/);
+  const kept = [];
+  let terminator;
+  for (const line of lines) {
+    if (terminator) {
+      if (line.trim() === terminator) terminator = undefined;
+      continue;
+    }
+    kept.push(line);
+    const match = line.match(/<<[-]?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/);
+    if (match) terminator = match[1];
+  }
+  return kept.join("\n");
+}
+
 function classifyDirectWait(command) {
-  const text = String(command ?? "");
+  const text = stripHereDocBodies(command);
   const sleep = text.match(/(?:^|[;&|\s])sleep\s+(\d+(?:\.\d+)?)([smhd]?)/);
   if (sleep) {
     const value = Number(sleep[1]);
