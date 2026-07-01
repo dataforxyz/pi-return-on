@@ -5,7 +5,18 @@ import {
 	parseDuration,
 	parsePositiveDurationSetting,
 	parseShellSleepDurationMs,
+	resolveReturnOnStateDir,
 } from "../src/index.ts";
+
+test("resolveReturnOnStateDir defaults to home-local state", () => {
+	assert.equal(resolveReturnOnStateDir({}, "/tmp/home"), "/tmp/home/.local/state/pi-return-on");
+});
+
+test("resolveReturnOnStateDir honors shared and source-specific env overrides", () => {
+	assert.equal(resolveReturnOnStateDir({ PI_BACKGROUND_STATE_DIR: "~/state-root" }, "/tmp/home"), "/tmp/home/state-root/pi-return-on");
+	assert.equal(resolveReturnOnStateDir({ PI_FORKS_STATE_ROOT: "/tmp/forks-root" }, "/tmp/home"), "/tmp/forks-root/pi-return-on");
+	assert.equal(resolveReturnOnStateDir({ PI_BACKGROUND_STATE_DIR: "/tmp/root", PI_RETURN_ON_STATE_DIR: "~/return-on-only" }, "/tmp/home"), "/tmp/home/return-on-only");
+});
 
 test("parseDuration: nullish/empty returns fallback", () => {
 	assert.equal(parseDuration(undefined), undefined);

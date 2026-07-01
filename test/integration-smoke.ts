@@ -447,6 +447,131 @@ async function testForkDelivery(harness: Harness) {
   throw new Error(`timed out waiting for fork delivery handler messages: ${harness.messages.map((m) => m.message?.content).join("\n---\n")}`);
 }
 
+async function testForkDeliverySetsBackgroundForkEnv(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-background-env-pi.mjs");
+  const fakePiCapture = path.join(cwd, "fake-background-env-capture.json");
+  process.env.PI_RETURN_ON_FAKE_BACKGROUND_ENV_CAPTURE = fakePiCapture;
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(process.env.PI_RETURN_ON_FAKE_BACKGROUND_ENV_CAPTURE, JSON.stringify({ args: process.argv.slice(2), env: { PI_BACKGROUND_FORK_DEPTH: process.env.PI_BACKGROUND_FORK_DEPTH, PI_BACKGROUND_MAX_FORK_DEPTH: process.env.PI_BACKGROUND_MAX_FORK_DEPTH, PI_BACKGROUND_HANDLER_ID: process.env.PI_BACKGROUND_HANDLER_ID, PI_BACKGROUND_EVENT_ID: process.env.PI_BACKGROUND_EVENT_ID, PI_BACKGROUND_WORK_KEY: process.env.PI_BACKGROUND_WORK_KEY, PI_BACKGROUND_PARENT_SESSION_FILE: process.env.PI_BACKGROUND_PARENT_SESSION_FILE } }));\nconsole.log("background env summary");\n`, { mode: 0o755 });
+  const label = "smoke background fork env";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume: "background fork env resume",
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const summary = harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete");
+    if (summary) {
+      const capture = JSON.parse(await fs.readFile(fakePiCapture, "utf8"));
+      if (capture.env.PI_BACKGROUND_FORK_DEPTH !== "1") throw new Error(`expected fork depth 1, got ${capture.env.PI_BACKGROUND_FORK_DEPTH}`);
+      if (capture.env.PI_BACKGROUND_MAX_FORK_DEPTH !== "1") throw new Error(`expected max fork depth 1, got ${capture.env.PI_BACKGROUND_MAX_FORK_DEPTH}`);
+      if (!String(capture.env.PI_BACKGROUND_HANDLER_ID ?? "").startsWith("roh_")) throw new Error(`missing handler id env: ${JSON.stringify(capture.env)}`);
+      if (capture.env.PI_BACKGROUND_EVENT_ID !== `return_on:${jobId}:1`) throw new Error(`event id env should be source-namespaced job fire id: ${JSON.stringify(capture.env)}`);
+      if (!String(capture.env.PI_BACKGROUND_WORK_KEY ?? "").includes(jobId)) throw new Error(`work key env should include job id: ${JSON.stringify(capture.env)}`);
+      if (capture.env.PI_BACKGROUND_PARENT_SESSION_FILE !== harness.sessionFile) throw new Error(`parent session env mismatch: ${JSON.stringify(capture.env)}`);
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for background fork env handler summary");
+}
+
+async function testForkDepthBlocksNestedForkDelivery(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-depth-blocked-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-depth-blocked-args.json");
+  process.env.PI_RETURN_ON_FAKE_DEPTH_BLOCKED_ARGS = fakePiArgs;
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(process.env.PI_RETURN_ON_FAKE_DEPTH_BLOCKED_ARGS, JSON.stringify(process.argv.slice(2)));\nconsole.log("should not launch nested fork");\n`, { mode: 0o755 });
+  await withEnv({ PI_BACKGROUND_FORK_DEPTH: "1", PI_BACKGROUND_MAX_FORK_DEPTH: "1" }, async () => {
+    const label = "smoke nested fork depth blocked";
+    const resume = "nested fork depth blocked resume";
+    const jobId = await harness.register({
+      label,
+      condition: { type: "timer", after: "100ms" },
+      resume,
+      delivery: { mode: "fork", piCommand: fakePi },
+    });
+    const start = Date.now();
+    while (Date.now() - start < 2_500) {
+      const wake = finalWakeEntries(harness, jobId)[0];
+      if (wake) {
+        try {
+          await fs.stat(fakePiArgs);
+          throw new Error("nested fork depth block still launched fake pi");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        assertWake(wake, { jobId, label, resume });
+        return;
+      }
+      await sleep(50);
+    }
+    throw new Error("timed out waiting for depth-blocked wake");
+  });
+}
+
+async function testMultipleDistinctForkHandlersAllowed(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-multiple-distinct-forks-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-multiple-distinct-forks-args.jsonl");
+  process.env.PI_RETURN_ON_FAKE_MULTI_FORK_ARGS = fakePiArgs;
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.appendFileSync(process.env.PI_RETURN_ON_FAKE_MULTI_FORK_ARGS, JSON.stringify(process.argv.slice(2)) + "\\n");\nconsole.log("multi distinct fork summary");\n`, { mode: 0o755 });
+
+  const firstJobId = await harness.register({
+    label: "smoke multi distinct fork one",
+    condition: { type: "timer", after: "100ms" },
+    resume: "multi distinct fork one resume",
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+  const secondJobId = await harness.register({
+    label: "smoke multi distinct fork two",
+    condition: { type: "timer", after: "100ms" },
+    resume: "multi distinct fork two resume",
+    delivery: { mode: "fork", piCommand: fakePi },
+  });
+
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const summaries = [firstJobId, secondJobId].map((jobId) => harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete"));
+    if (summaries.every(Boolean)) {
+      const lines = (await fs.readFile(fakePiArgs, "utf8")).trim().split("\n").filter(Boolean);
+      if (lines.length !== 2) throw new Error(`expected two distinct fork handler launches, saw ${lines.length}: ${lines.join(" | ")}`);
+      for (const line of lines) {
+        const args = JSON.parse(line);
+        if (!args.includes("--fork")) throw new Error(`distinct fork handler should keep default parent transcript fork: ${line}`);
+      }
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for multiple distinct fork handler summaries");
+}
+
+async function testForkDeliveryCapsuleContextSkipsParentFork(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-capsule-context-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-capsule-context-args.json");
+  process.env.PI_RETURN_ON_FAKE_CAPSULE_ARGS = fakePiArgs;
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(process.env.PI_RETURN_ON_FAKE_CAPSULE_ARGS, JSON.stringify(process.argv.slice(2)));\nconsole.log("capsule context summary");\n`, { mode: 0o755 });
+  const label = "smoke capsule context fork delivery";
+  const jobId = await harness.register({
+    label,
+    condition: { type: "timer", after: "100ms" },
+    resume: "capsule context resume",
+    delivery: { mode: "fork", handlerContext: "capsule", piCommand: fakePi },
+  });
+  const start = Date.now();
+  while (Date.now() - start < 2_500) {
+    const summary = harness.messages.find((entry) => entry.message?.customType === "return-on-handler" && entry.message?.details?.id === jobId && entry.message?.details?.status === "complete");
+    if (summary) {
+      const args = JSON.parse(await fs.readFile(fakePiArgs, "utf8"));
+      if (args.includes("--fork")) throw new Error(`capsule handler context should not fork the parent transcript: ${JSON.stringify(args)}`);
+      if (!String(summary.message?.content ?? "").includes("capsule context summary")) throw new Error("capsule context summary missed handler output");
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for capsule context fork handler summary");
+}
+
 async function testForkDeliverySkipsEmptyParentSession(harness: Harness) {
   const fakePi = path.join(cwd, "fake-empty-parent-session-pi.mjs");
   const fakePiArgs = path.join(cwd, "fake-empty-parent-session-args.json");
@@ -1779,6 +1904,90 @@ async function testHandlerStartupReconciliation() {
   await session.emit("session_shutdown");
 }
 
+async function testDuplicateActiveForkHandlerSuppressed() {
+  const jobId = "duplicate_active_handler_job";
+  const runId = "duplicate_active_handler_run";
+  const label = "duplicate active handler label";
+  const resume = "duplicate active handler resume";
+  const session = createHarness("duplicate-active-handler");
+  const now = Date.now();
+  const fakePi = path.join(cwd, "fake-duplicate-active-handler-pi.mjs");
+  const fakePiArgs = path.join(cwd, "fake-duplicate-active-handler-args.json");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(fakePiArgs)}, JSON.stringify(process.argv.slice(2)));\nconsole.log("duplicate active handler should not spawn");\n`, { mode: 0o755 });
+  const job = {
+    id: jobId,
+    label,
+    cwd,
+    sessionFile: session.sessionFile,
+    createdAt: now,
+    updatedAt: now,
+    status: "fired",
+    condition: { type: "timer", after: "1ms" },
+    resume,
+    firedAt: now,
+    delivery: { mode: "fork", notify: "summary", triggerParentOnSummary: true, handlerContext: "fork", piCommand: fakePi },
+    latches: {},
+    leafState: {},
+  };
+  const dir = path.join(stateDir, "handlers", runId);
+  const run = {
+    id: runId,
+    jobId,
+    label,
+    cwd,
+    parentSessionFile: session.sessionFile,
+    status: "running",
+    pid: process.pid,
+    startedAt: now - 1_000,
+    dir,
+    eventPath: path.join(dir, "event.json"),
+    promptPath: path.join(dir, "prompt.md"),
+    stdoutPath: path.join(dir, "stdout.log"),
+    stderrPath: path.join(dir, "stderr.log"),
+    sessionDir: path.join(dir, "sessions"),
+    notify: "summary",
+    triggerParentOnSummary: true,
+    handlerContext: "fork",
+  };
+  await fs.mkdir(path.join(stateDir, "fired"), { recursive: true });
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [job] }, null, 2), "utf8");
+  await fs.writeFile(path.join(stateDir, "handlers.json"), JSON.stringify({ version: 1, handlers: [run] }, null, 2), "utf8");
+  const firedPath = path.join(stateDir, "fired", `${jobId}.json`);
+  await fs.writeFile(firedPath, JSON.stringify({
+    version: 1,
+    event: "return_on.fired",
+    id: jobId,
+    jobId,
+    label,
+    reason: "duplicate active handler test",
+    createdAt: now,
+    firedAt: now,
+    cwd,
+    sessionFile: session.sessionFile,
+    resume,
+    job,
+    deliveryStatus: "pending",
+  }, null, 2), "utf8");
+
+  await session.emit("session_start");
+  try {
+    await fs.stat(fakePiArgs);
+    throw new Error("duplicate active handler spawned another handler process");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const delivered = JSON.parse(await fs.readFile(firedPath, "utf8"));
+  if (delivered.deliveryStatus !== "attached-to-handler" || delivered.handlerRunId !== runId) {
+    throw new Error(`duplicate active handler did not mark event delivered through existing handler: ${JSON.stringify(delivered)}`);
+  }
+  const savedHandlers = JSON.parse(await fs.readFile(path.join(stateDir, "handlers.json"), "utf8"));
+  if (savedHandlers.handlers.filter((candidate: any) => candidate.jobId === jobId).length !== 1) {
+    throw new Error(`duplicate active handler ledger contains extra runs: ${JSON.stringify(savedHandlers)}`);
+  }
+  await session.emit("session_shutdown");
+}
+
 async function testFailedFiredEventRetries() {
   const jobId = "pending_retry_job";
   const label = "pending retry label";
@@ -1888,6 +2097,10 @@ await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
 await testDuplicateWatcherRegistrationDedupes(harness);
 await testForkDelivery(harness);
+await testForkDeliverySetsBackgroundForkEnv(harness);
+await testForkDepthBlocksNestedForkDelivery(harness);
+await testMultipleDistinctForkHandlersAllowed(harness);
+await testForkDeliveryCapsuleContextSkipsParentFork(harness);
 await testForkDeliverySkipsEmptyParentSession(harness);
 await testDefaultPiCommandFallsBackToHomeBin(harness);
 await testAutoDeliveryWakesIdleParent(harness);
@@ -1936,6 +2149,7 @@ await testListToolAndCommands();
 await testRestartResume();
 await testPendingFiredEventDelivery();
 await testHandlerStartupReconciliation();
+await testDuplicateActiveForkHandlerSuppressed();
 await testFailedFiredEventRetries();
 await testSessionIsolation();
 await testStatusCancelSessionIsolation();

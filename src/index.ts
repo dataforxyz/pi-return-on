@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import * as net from "node:net";
 import * as http from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
@@ -15,13 +15,25 @@ import { compactReturnOnHandlerMessages } from "./context-compaction.ts";
 import { formatDuration, parseDuration, parsePositiveDurationSetting, parseShellSleepDurationMs } from "./time-utils.ts";
 export { formatDuration, parseDuration, parsePositiveDurationSetting, parseShellSleepDurationMs } from "./time-utils.ts";
 
+function expandStateHome(input: string, homeDir = os.homedir()): string {
+	return input === "~" || input.startsWith("~/") ? path.join(homeDir, input.slice(2)) : input;
+}
+
+export function resolveReturnOnStateDir(env: NodeJS.ProcessEnv = process.env, homeDir = os.homedir()): string {
+	const configured = env.PI_RETURN_ON_STATE_DIR?.trim();
+	if (configured) return path.resolve(expandStateHome(configured, homeDir));
+	const sharedRoot = env.PI_FORKS_STATE_ROOT?.trim() || env.PI_BACKGROUND_STATE_DIR?.trim();
+	if (sharedRoot) return path.join(path.resolve(expandStateHome(sharedRoot, homeDir)), "pi-return-on");
+	return path.join(homeDir, ".local", "state", "pi-return-on");
+}
+
 const EXTENSION_NAME = "return-on";
 const HANDLER_MESSAGE_TYPE = "return-on-handler";
 const RETURN_ON_SHORTCUT = Key.ctrlAlt("w");
 const RETURN_ON_SHORTCUT_ALIASES = [RETURN_ON_SHORTCUT, Key.altCtrl("w")];
 const RETURN_ON_SHORTCUT_LABEL = "Ctrl+Alt+W";
 const RETURN_ON_MODAL_BODY_LINES = 28;
-const STATE_DIR = path.join(os.homedir(), ".local", "state", "pi-return-on");
+const STATE_DIR = resolveReturnOnStateDir();
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
 const FIRED_DIR = path.join(STATE_DIR, "fired");
 const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
@@ -169,11 +181,13 @@ interface WebhookConfig {
 
 type DeliveryMode = "wake" | "fork" | "auto";
 type HandlerNotifyMode = "ack-and-summary" | "summary" | "none";
+type HandlerContextMode = "fork" | "capsule";
 
 interface DeliveryConfig {
 	mode: DeliveryMode;
 	notify: HandlerNotifyMode;
 	triggerParentOnSummary: boolean;
+	handlerContext: HandlerContextMode;
 	piCommand?: string;
 }
 
@@ -209,6 +223,8 @@ interface ReturnOnSettings {
 	deliveryMode?: DeliveryMode;
 	defaultDeliveryNotify?: HandlerNotifyMode;
 	triggerParentOnSummary?: boolean | string | number;
+	defaultHandlerContext?: HandlerContextMode;
+	handlerContext?: HandlerContextMode;
 }
 
 interface ReturnOnConfig {
@@ -217,6 +233,7 @@ interface ReturnOnConfig {
 	defaultDeliveryMode: DeliveryMode;
 	defaultDeliveryNotify: HandlerNotifyMode;
 	triggerParentOnSummary: boolean;
+	defaultHandlerContext: HandlerContextMode;
 }
 
 interface ReturnOnJob {
@@ -278,6 +295,7 @@ interface ReturnOnHandlerRun {
 	sessionDir: string;
 	notify?: HandlerNotifyMode;
 	triggerParentOnSummary?: boolean;
+	handlerContext?: HandlerContextMode;
 	summary?: string;
 	error?: string;
 	finishSource?: "close" | "reconciled";
@@ -293,7 +311,7 @@ interface HandlersState {
 	handlers: ReturnOnHandlerRun[];
 }
 
-type FiredEventDeliveryStatus = "pending" | "wake-sent" | "handler-launched" | "skipped-cancelled" | "failed";
+type FiredEventDeliveryStatus = "pending" | "wake-sent" | "handler-launched" | "attached-to-handler" | "queued" | "skipped-cancelled" | "failed";
 
 interface FiredEventState {
 	version: 1;
@@ -314,6 +332,37 @@ interface FiredEventState {
 	handlerRunId?: string;
 	error?: string;
 }
+
+type ReturnOnLaunchResult = "launched" | "attached-to-handler" | "queued" | false;
+interface LaunchReturnHandlerOptions {
+	handlerId?: string;
+	skipBackgroundRoute?: boolean;
+}
+type BackgroundRouterDecision = "fork" | "wake_main" | "display" | "queue";
+type BackgroundEventsModule = {
+	BackgroundEventsStore: new (...args: never[]) => {
+		routeEvent: (envelope: Record<string, unknown>, options?: Record<string, unknown>) => { disposition: string; handlerId?: string; queueId?: string };
+		runReconcilerPass: (options: Record<string, unknown>) => { leaseAcquired: boolean; launchBundles?: Array<{ handlerId: string; source: string; events: Array<{ payloadPath: string }> }> };
+		markHandlerRunning: (handlerId: string, input?: Record<string, unknown>) => void;
+		failHandlerLaunch: (handlerId: string, options?: Record<string, unknown>) => unknown;
+		completeHandler: (handlerId: string, input?: Record<string, unknown>) => string | undefined;
+		chargeAutoForkForLineage?: (input: Record<string, unknown>) => { allowed: boolean; reason?: string };
+		upsertLineageBudget: (input: Record<string, unknown>) => void;
+		canAutoFork: (input: { forkDepth?: number; maxForkDepth?: number; lineageId?: string; forkable?: boolean }) => { allowed: boolean; reason?: string };
+		chargeLineageFollowup: (input: { lineageId: string; forkable?: boolean; now?: number }) => { allowed: boolean; reason?: string };
+		close: () => void;
+	};
+	runOptionalRouterDecision?: (input: {
+		config?: Record<string, unknown>;
+		fallback: BackgroundRouterDecision;
+		railsAllowed?: BackgroundRouterDecision[];
+		ambiguous?: boolean;
+		decide?: (input: { fallback: BackgroundRouterDecision; railsAllowed?: BackgroundRouterDecision[] }) => unknown;
+	}) => Promise<{ decision: BackgroundRouterDecision; reason: string }>;
+	namespacedEventId: (source: "return_on", durableId: string) => string;
+};
+let backgroundEventsImport: Promise<BackgroundEventsModule | undefined> | undefined;
+const BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
 
 interface PruneOptions {
 	retentionMs?: number;
@@ -446,6 +495,12 @@ function parseNotifySetting(value: unknown, fallback: HandlerNotifyMode, name: s
 	throw new Error(`${name} must be 'ack-and-summary', 'summary', or 'none'`);
 }
 
+function parseHandlerContextSetting(value: unknown, fallback: HandlerContextMode, name: string): HandlerContextMode {
+	if (value === undefined || value === null || value === "") return fallback;
+	if (value === "fork" || value === "capsule") return value;
+	throw new Error(`${name} must be 'fork' or 'capsule'`);
+}
+
 function parseBooleanSetting(value: unknown, fallback: boolean, name: string): boolean {
 	if (value === undefined || value === null || value === "") return fallback;
 	if (typeof value === "boolean") return value;
@@ -478,7 +533,8 @@ async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	const defaultDeliveryMode = parseDeliveryModeSetting(process.env.PI_RETURN_ON_DELIVERY_MODE ?? settings.defaultDeliveryMode ?? settings.deliveryMode, "wake", "returnOn.defaultDeliveryMode");
 	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "summary", "returnOn.defaultDeliveryNotify");
 	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, true, "returnOn.triggerParentOnSummary");
-	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary };
+	const defaultHandlerContext = parseHandlerContextSetting(process.env.PI_RETURN_ON_HANDLER_CONTEXT ?? settings.defaultHandlerContext ?? settings.handlerContext, "fork", "returnOn.defaultHandlerContext");
+	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary, defaultHandlerContext };
 }
 
 function parseRequestedJobTimeout(input: unknown, config: ReturnOnConfig): number {
@@ -1000,6 +1056,122 @@ function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
 	return !eventSession || !currentSessionFile || eventSession === currentSessionFile;
 }
 
+async function loadBackgroundEventsModule(): Promise<BackgroundEventsModule | undefined> {
+	backgroundEventsImport ??= import(BACKGROUND_EVENTS_MODULE)
+		.then((module) => module as BackgroundEventsModule)
+		.catch(() => undefined);
+	return backgroundEventsImport;
+}
+
+async function fileSnapshot(filePath: string): Promise<{ sha256: string; bytes: number }> {
+	const data = await fsp.readFile(filePath);
+	return { sha256: createHash("sha256").update(data).digest("hex"), bytes: data.byteLength };
+}
+
+function backgroundParentNamespace(job: ReturnOnJob, run: ReturnOnHandlerRun): string {
+	return run.parentSessionId ?? job.parentSessionId ?? job.sessionFile ?? currentSessionFile ?? `return_on:${job.id}`;
+}
+
+async function routeReturnOnBackgroundEvent(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun): Promise<{ disposition: string; handlerId?: string; queueId?: string } | undefined> {
+	const module = await loadBackgroundEventsModule();
+	if (!module) return undefined;
+	const snapshot = await fileSnapshot(run.eventPath);
+	const parentNamespace = backgroundParentNamespace(job, run);
+	const fireCount = job.fireCount ?? 1;
+	const eventId = module.namespacedEventId("return_on", `${job.id}:${fireCount}`);
+	const workKey = `return_on:${parentNamespace}:job:${job.id}`;
+	const store = new module.BackgroundEventsStore();
+	try {
+		return store.routeEvent({
+			version: 1,
+			source: "return_on",
+			eventId,
+			workKey,
+			parentNamespace,
+			parent: {
+				sessionId: parentNamespace,
+				...(job.sessionFile ? { sessionFile: job.sessionFile } : {}),
+				...(run.parentSessionName ? { sessionName: run.parentSessionName } : {}),
+				...(run.parentIntercomTarget ? { intercomTarget: run.parentIntercomTarget } : {}),
+				cwd: job.cwd,
+			},
+			createdAt: job.lastFiredAt ?? job.firedAt ?? Date.now(),
+			priority: reason === "timeout" ? "high" : "normal",
+			payloadPath: run.eventPath,
+			payloadSha256: snapshot.sha256,
+			payloadBytes: snapshot.bytes,
+			needsDecision: false,
+			eventType: reason,
+			origin: {
+				forkDepth: currentBackgroundForkDepth(),
+				handlerId: process.env.PI_BACKGROUND_HANDLER_ID,
+				rootEventId: process.env.PI_BACKGROUND_EVENT_ID,
+				rootWorkKey: process.env.PI_BACKGROUND_WORK_KEY,
+				lineageId: process.env.PI_BACKGROUND_LINEAGE_ID,
+			},
+		}, { handlerId: run.id });
+	} finally {
+		store.close();
+	}
+}
+
+async function markBackgroundHandlerRunning(run: ReturnOnHandlerRun): Promise<void> {
+	const module = await loadBackgroundEventsModule();
+	if (!module) return;
+	const store = new module.BackgroundEventsStore();
+	try {
+		store.markHandlerRunning(run.id, { pid: run.pid, supervisorPid: process.pid, processGroupId: run.pid });
+	} finally {
+		store.close();
+	}
+}
+
+async function failBackgroundHandlerLaunch(handlerId: string, error: unknown): Promise<void> {
+	const module = await loadBackgroundEventsModule();
+	if (!module) return;
+	const store = new module.BackgroundEventsStore();
+	try {
+		store.failHandlerLaunch(handlerId, { error: error instanceof Error ? error.message : String(error), requeue: true });
+	} finally {
+		store.close();
+	}
+}
+
+async function completeBackgroundHandler(run: ReturnOnHandlerRun): Promise<void> {
+	const module = await loadBackgroundEventsModule();
+	if (!module) return;
+	const store = new module.BackgroundEventsStore();
+	try {
+		store.completeHandler(run.id, { status: run.status === "complete" ? "complete" : "failed", summaryPath: run.stdoutPath });
+	} finally {
+		store.close();
+	}
+}
+
+async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
+	const module = await loadBackgroundEventsModule();
+	if (!module) return 0;
+	const store = new module.BackgroundEventsStore();
+	try {
+		const pass = store.runReconcilerPass({ leaseName: "return_on", ownerId: `return_on:${process.pid}`, leaseTtlMs: 30_000, dequeueLimit: 4 });
+		let launched = 0;
+		for (const bundle of pass.launchBundles ?? []) {
+			if (bundle.source !== "return_on") continue;
+			const firstEvent = bundle.events[0];
+			if (!firstEvent) continue;
+			const fired = JSON.parse(await fsp.readFile(firstEvent.payloadPath, "utf8")) as Partial<FiredEventState>;
+			const job = fired.job;
+			if (!job) continue;
+			const delivery = job.delivery ?? normalizeDelivery(undefined);
+			const result = await launchReturnHandler(pi, job, fired.reason ?? "background queue drain", delivery, { handlerId: bundle.handlerId, skipBackgroundRoute: true });
+			if (result === "launched") launched += 1;
+		}
+		return launched;
+	} finally {
+		store.close();
+	}
+}
+
 async function markFiredEventDelivered(eventPath: string, reason: string, status: FiredEventDeliveryStatus, job: ReturnOnJob, error?: unknown): Promise<void> {
 	const now = Date.now();
 	await writeFiredEvent(job, reason, {
@@ -1042,7 +1214,8 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 			if (await shouldLaunchForkForDelivery(pi, job, delivery)) {
 				const launched = await launchReturnHandler(pi, job, event.reason, delivery);
 				if (launched) {
-					await markFiredEventDelivered(eventPath, event.reason, "handler-launched", job);
+					const status: FiredEventDeliveryStatus = launched === "launched" ? "handler-launched" : launched;
+					await markFiredEventDelivered(eventPath, event.reason, status, job);
 					continue;
 				}
 			}
@@ -1128,10 +1301,91 @@ async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Prom
 	return true;
 }
 
+function currentBackgroundForkDepth(env: NodeJS.ProcessEnv = process.env): number {
+	const parsed = Number(env.PI_BACKGROUND_FORK_DEPTH ?? "0");
+	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function maxBackgroundForkDepth(env: NodeJS.ProcessEnv = process.env): number {
+	const parsed = Number(env.PI_BACKGROUND_MAX_FORK_DEPTH ?? "1");
+	return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 1;
+}
+
+function backgroundForkDepthExceeded(env: NodeJS.ProcessEnv = process.env): boolean {
+	return currentBackgroundForkDepth(env) >= maxBackgroundForkDepth(env);
+}
+
+async function chargeBackgroundLineageAutoForkFromEnv(): Promise<{ allowed: boolean; reason?: string }> {
+	const lineageId = process.env.PI_BACKGROUND_LINEAGE_ID?.trim();
+	if (!lineageId) return { allowed: true };
+	const module = await loadBackgroundEventsModule();
+	if (!module) return { allowed: true };
+	const store = new module.BackgroundEventsStore();
+	try {
+		const input = {
+			lineageId,
+			rootEventId: process.env.PI_BACKGROUND_EVENT_ID,
+			rootWorkKey: process.env.PI_BACKGROUND_WORK_KEY,
+			originHandlerId: process.env.PI_BACKGROUND_HANDLER_ID,
+			forkDepth: currentBackgroundForkDepth(),
+			maxForkDepth: maxBackgroundForkDepth(),
+			forkable: true,
+		};
+		if (store.chargeAutoForkForLineage) return store.chargeAutoForkForLineage(input);
+		store.upsertLineageBudget(input);
+		const gate = store.canAutoFork({ lineageId, forkDepth: input.forkDepth, maxForkDepth: input.maxForkDepth, forkable: true });
+		if (!gate.allowed) return gate;
+		return store.chargeLineageFollowup({ lineageId, forkable: true });
+	} finally {
+		store.close();
+	}
+}
+
+async function chargeBackgroundLineageFollowupFromEnv(): Promise<{ allowed: boolean; reason?: string }> {
+	const lineageId = process.env.PI_BACKGROUND_LINEAGE_ID?.trim();
+	if (!lineageId) return { allowed: true };
+	const module = await loadBackgroundEventsModule();
+	if (!module) return { allowed: true };
+	const store = new module.BackgroundEventsStore();
+	try {
+		store.upsertLineageBudget({
+			lineageId,
+			rootEventId: process.env.PI_BACKGROUND_EVENT_ID,
+			rootWorkKey: process.env.PI_BACKGROUND_WORK_KEY,
+			originHandlerId: process.env.PI_BACKGROUND_HANDLER_ID,
+		});
+		return store.chargeLineageFollowup({ lineageId, forkable: false });
+	} finally {
+		store.close();
+	}
+}
+
+async function routeForkDeliveryWithOptionalRouter(job: ReturnOnJob, delivery: DeliveryConfig): Promise<{ decision: BackgroundRouterDecision; reason: string }> {
+	const module = await loadBackgroundEventsModule();
+	const advisoryDecision = process.env.PI_BACKGROUND_ROUTER_DECISION?.trim();
+	if (!module?.runOptionalRouterDecision || !advisoryDecision) return { decision: "fork", reason: "disabled" };
+	return module.runOptionalRouterDecision({
+		fallback: "fork",
+		railsAllowed: ["fork", "wake_main", "display"],
+		ambiguous: delivery.mode === "auto" || job.delivery?.mode === "auto",
+		decide: () => advisoryDecision,
+	});
+}
+
 async function shouldLaunchForkForDelivery(pi: ExtensionAPI, job: ReturnOnJob, delivery: DeliveryConfig): Promise<boolean> {
-	if (delivery.mode === "fork") return true;
-	if (delivery.mode === "auto") return !(await canAutoWakeParentDirect(pi, job));
-	return false;
+	if (backgroundForkDepthExceeded()) return false;
+	if (delivery.mode === "auto" && await canAutoWakeParentDirect(pi, job)) return false;
+	if (delivery.mode !== "fork" && delivery.mode !== "auto") return false;
+	const lineageGate = await chargeBackgroundLineageAutoForkFromEnv().catch((error) => {
+		console.error("[return-on] Failed to charge background lineage for fork delivery", error);
+		return { allowed: false, reason: "lineage-charge-failed" };
+	});
+	if (!lineageGate.allowed) return false;
+	const routerDecision = await routeForkDeliveryWithOptionalRouter(job, delivery).catch((error) => {
+		console.error("[return-on] Failed to run fork delivery router", error);
+		return { decision: "fork" as const, reason: "router-error" };
+	});
+	return routerDecision.decision === "fork";
 }
 
 function updateStatus(ctx = latestCtx): void {
@@ -1246,11 +1500,13 @@ function normalizeWebhook(input: unknown): WebhookConfig | undefined {
 	return config;
 }
 
-function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary">): DeliveryConfig {
+function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaultDeliveryMode" | "defaultDeliveryNotify" | "triggerParentOnSummary" | "defaultHandlerContext">): DeliveryConfig {
+	const envHandlerContext = process.env.PI_RETURN_ON_HANDLER_CONTEXT;
 	const base: DeliveryConfig = {
 		mode: config?.defaultDeliveryMode ?? (process.env.PI_RETURN_ON_DELIVERY_MODE === "fork" || process.env.PI_RETURN_ON_DELIVERY_MODE === "auto" ? process.env.PI_RETURN_ON_DELIVERY_MODE : "wake"),
 		notify: config?.defaultDeliveryNotify ?? "summary",
 		triggerParentOnSummary: config?.triggerParentOnSummary ?? (process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === undefined ? true : process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY === "1"),
+		handlerContext: config?.defaultHandlerContext ?? (envHandlerContext === "capsule" ? "capsule" : "fork"),
 	};
 	if (input === undefined || input === null || input === false) return base;
 	if (input === true) return { ...base, mode: "fork" };
@@ -1264,11 +1520,14 @@ function normalizeDelivery(input: unknown, config?: Pick<ReturnOnConfig, "defaul
 	const notify = input.notify === undefined ? base.notify : input.notify;
 	if (notify !== "ack-and-summary" && notify !== "summary" && notify !== "none") throw new Error("delivery.notify must be 'ack-and-summary', 'summary', or 'none'");
 	const triggerParentOnSummary = input.triggerParentOnSummary === undefined ? base.triggerParentOnSummary : Boolean(input.triggerParentOnSummary);
+	const handlerContext = input.handlerContext === undefined ? base.handlerContext : input.handlerContext;
+	if (handlerContext !== "fork" && handlerContext !== "capsule") throw new Error("delivery.handlerContext must be 'fork' or 'capsule'");
 	const piCommand = input.piCommand === undefined ? undefined : String(input.piCommand).trim();
 	return {
 		mode,
 		notify,
 		triggerParentOnSummary,
+		handlerContext,
 		...(piCommand ? { piCommand } : {}),
 	};
 }
@@ -2305,7 +2564,7 @@ function buildHandlerArgs(job: ReturnOnJob, run: ReturnOnHandlerRun): string[] {
 	// the handler follow the parent turn instead of handling only the return event.
 	// Use a fresh capsule-only handler in that case. Also avoid forking definitely
 	// empty session files; Pi rejects those before the handler can process the event.
-	if (shouldForkParentSession(job)) args.push("--fork", job.sessionFile!);
+	if ((run.handlerContext ?? "fork") === "fork" && shouldForkParentSession(job)) args.push("--fork", job.sessionFile!);
 	args.push(`@${run.promptPath}`);
 	return args;
 }
@@ -2433,6 +2692,9 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	const { stderr } = await fillHandlerOutput(run, job);
 	run.status = code === 0 ? "complete" : "failed";
 	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
+	await completeBackgroundHandler(run).catch((error) => {
+		console.error(`[${EXTENSION_NAME}] Failed to complete background event handler ${run.id}:`, error);
+	});
 	await saveHandlers();
 	await appendLifecycleAudit("handler_finished", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, exitCode: code, signal, endedAt: run.endedAt, error: run.error });
 	try {
@@ -2516,11 +2778,18 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 	return reconciled;
 }
 
-async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig): Promise<boolean> {
+async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: string, delivery: DeliveryConfig, options: LaunchReturnHandlerOptions = {}): Promise<ReturnOnLaunchResult> {
 	await loadHandlers();
 	await reconcileHandlerRunsOnStartup(pi, undefined, false);
 	await loadHandlers();
-	const id = makeHandlerId(job);
+	const existingActive = handlerRuns.find((run) => run.jobId === job.id && (run.status === "starting" || run.status === "running"));
+	if (!options.handlerId && existingActive) {
+		job.handlerRunId = existingActive.id;
+		await saveJobs();
+		await appendLifecycleAudit("handler_launch_suppressed_duplicate", { id: existingActive.id, jobId: job.id, label: job.label, reason });
+		return "attached-to-handler";
+	}
+	const id = options.handlerId ?? makeHandlerId(job);
 	const parentSessionId = job.parentSessionId ?? getParentSessionId(undefined, job.parentRouting ?? "auto");
 	const parentSessionName = job.parentSessionName ?? getParentSessionName(pi, job.parentRouting ?? "auto");
 	const parentIntercomTarget = job.parentIntercomTarget ?? resolveParentIntercomTarget(pi, undefined, job.parentRouting ?? "auto");
@@ -2537,16 +2806,28 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 		startedAt: Date.now(),
 		notify: delivery.notify,
 		triggerParentOnSummary: delivery.triggerParentOnSummary,
+		handlerContext: delivery.handlerContext,
 	};
 	const eventJson = JSON.stringify(buildReturnEventPayload(job, reason, run), null, 2);
 	await fsp.mkdir(run.sessionDir, { recursive: true });
 	await fsp.writeFile(run.eventPath, `${eventJson}\n`, "utf8");
 	await fsp.writeFile(run.promptPath, buildHandlerPrompt(job, reason, run, eventJson), "utf8");
+	const routed = options.skipBackgroundRoute ? undefined : await routeReturnOnBackgroundEvent(job, reason, run).catch(async (error) => {
+		await appendLifecycleAudit("background_event_route_failed", { id: run.id, jobId: run.jobId, label: run.label, error: error instanceof Error ? error.message : String(error) });
+		console.error(`[${EXTENSION_NAME}] Failed to route background event for handler ${run.id}:`, error);
+		return undefined;
+	});
+	if (routed && routed.disposition !== "handler-starting") {
+		if (routed.handlerId) job.handlerRunId = routed.handlerId;
+		await saveJobs();
+		await appendLifecycleAudit("background_event_routed_without_launch", { id: run.id, routedHandlerId: routed.handlerId, queueId: routed.queueId, jobId: run.jobId, label: run.label, disposition: routed.disposition });
+		return routed.disposition === "queued" ? "queued" : "attached-to-handler";
+	}
 	handlerRuns.push(run);
 	job.handlerRunId = run.id;
 	await saveHandlers();
 	await saveJobs();
-	await appendLifecycleAudit("handler_queued", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, startedAt: run.startedAt, notify: run.notify });
+	await appendLifecycleAudit("handler_queued", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, startedAt: run.startedAt, notify: run.notify, backgroundEventDisposition: routed?.disposition });
 
 	const command = getHandlerCommand(delivery);
 	const args = buildHandlerArgs(job, run);
@@ -2559,8 +2840,15 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 			stderrPath: run.stderrPath,
 			env: buildForkHandlerEnv("return_on", run.id, {
 				...process.env,
-				...(job.sessionFile ? { [RETURN_ON_PARENT_SESSION_FILE_ENV]: job.sessionFile } : {}),
-				...(parentSessionId ? { [RETURN_ON_PARENT_SESSION_ID_ENV]: parentSessionId } : {}),
+				PI_BACKGROUND_FORK_DEPTH: String(currentBackgroundForkDepth() + 1),
+				PI_BACKGROUND_MAX_FORK_DEPTH: String(maxBackgroundForkDepth()),
+				PI_BACKGROUND_HANDLER_ID: run.id,
+				PI_BACKGROUND_EVENT_ID: `return_on:${job.id}:${job.fireCount ?? 1}`,
+				PI_BACKGROUND_WORK_KEY: `return_on:${parentSessionId ?? job.sessionFile ?? "unknown"}:job:${job.id}`,
+				PI_BACKGROUND_LINEAGE_ID: process.env.PI_BACKGROUND_LINEAGE_ID || `return_on:${parentSessionId ?? job.sessionFile ?? "unknown"}:job:${job.id}`,
+				...(job.sessionFile ? { PI_BACKGROUND_PARENT_SESSION_FILE: job.sessionFile, [RETURN_ON_PARENT_SESSION_FILE_ENV]: job.sessionFile } : {}),
+				...(parentSessionId ? { PI_BACKGROUND_PARENT_SESSION_ID: parentSessionId, [RETURN_ON_PARENT_SESSION_ID_ENV]: parentSessionId } : {}),
+				...(parentIntercomTarget ? { PI_BACKGROUND_PARENT_INTERCOM_TARGET: parentIntercomTarget } : {}),
 				...(parentSessionName ? { [RETURN_ON_PARENT_SESSION_NAME_ENV]: parentSessionName } : {}),
 				...(parentIntercomTarget ? { [RETURN_ON_PARENT_INTERCOM_TARGET_ENV]: parentIntercomTarget } : {}),
 			}),
@@ -2574,6 +2862,9 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 			run.status = "failed";
 			run.endedAt = Date.now();
 			run.error = launch.error instanceof Error ? launch.error.message : String(launch.error);
+			await failBackgroundHandlerLaunch(run.id, launch.error).catch((error) => {
+				console.error(`[${EXTENSION_NAME}] Failed to compensate background event launch failure ${run.id}:`, error);
+			});
 			await saveHandlers();
 			await appendLifecycleAudit("handler_launch_failed", { id: run.id, jobId: run.jobId, label: run.label, error: run.error, endedAt: run.endedAt });
 			console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, launch.error);
@@ -2582,6 +2873,9 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 
 		run.pid = launch.pid;
 		run.status = "running";
+		await markBackgroundHandlerRunning(run).catch((error) => {
+			console.error(`[${EXTENSION_NAME}] Failed to mark background event handler running ${run.id}:`, error);
+		});
 		await saveHandlers();
 		await appendLifecycleAudit("handler_running", { id: run.id, jobId: run.jobId, label: run.label, pid: run.pid, startedAt: run.startedAt });
 		if (delivery.notify === "ack-and-summary") {
@@ -2595,11 +2889,14 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 				{ triggerTurn: false },
 			);
 		}
-		return true;
+		return "launched";
 	} catch (error) {
 		run.status = "failed";
 		run.endedAt = Date.now();
 		run.error = error instanceof Error ? error.message : String(error);
+		await failBackgroundHandlerLaunch(run.id, error).catch((compensateError) => {
+			console.error(`[${EXTENSION_NAME}] Failed to compensate background event launch exception ${run.id}:`, compensateError);
+		});
 		await saveHandlers();
 		await appendLifecycleAudit("handler_launch_failed", { id: run.id, jobId: run.jobId, label: run.label, error: run.error, endedAt: run.endedAt });
 		console.error(`[${EXTENSION_NAME}] Failed to launch handler ${run.id}:`, error);
@@ -2641,7 +2938,8 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 	if (await shouldLaunchForkForDelivery(pi, job, delivery)) {
 		const launched = await launchReturnHandler(pi, job, reason, delivery);
 		if (launched) {
-			if (eventPath) await markFiredEventDelivered(eventPath, reason, "handler-launched", job);
+			const status: FiredEventDeliveryStatus = launched === "launched" ? "handler-launched" : launched;
+			if (eventPath) await markFiredEventDelivered(eventPath, reason, status, job);
 			return;
 		}
 	}
@@ -3698,6 +3996,11 @@ export default function (pi: ExtensionAPI) {
 			console.error(`[${EXTENSION_NAME}] Failed to prune retained state:`, error);
 		}
 		await deliverPendingFiredEvents(pi);
+		try {
+			await drainReturnOnBackgroundQueue(pi);
+		} catch (error) {
+			console.error(`[${EXTENSION_NAME}] Failed to drain background event queue:`, error);
+		}
 		ensureTicker(pi);
 		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
 			ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
@@ -3842,7 +4145,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Max time before waking anyway, e.g. '2m' or milliseconds. If omitted, the configured returnOn.defaultTimeout applies; values above returnOn.maxTimeout are rejected." })),
 			checkInEvery: Type.Optional(Type.Union([Type.String(), Type.Number()], { description: "Optional periodic check-in wakeup while the watcher is still pending, e.g. '5m', '10m', '30m', or milliseconds. This does not fire or cancel the watcher." })),
 			webhook: Type.Optional(Type.Any({ description: "Optional HTTP webhook notified when the watcher fires. Use a URL string or {url, method, headers, timeout}." })),
-			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for same-session wake, {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, piCommand?:string} for a background fork/sibling Pi session, or {mode:'auto'} to wake the idle parent directly and fork only when the parent is busy or already handling background events." })),
+			delivery: Type.Optional(Type.Any({ description: "Optional delivery. Use {mode:'wake'} for same-session wake, {mode:'fork', notify:'ack-and-summary'|'summary'|'none', triggerParentOnSummary?:boolean, handlerContext?:'fork'|'capsule', piCommand?:string} for a background fork/sibling Pi session, or {mode:'auto'} to wake the idle parent directly and fork only when the parent is busy or already handling background events." })),
 			parent: Type.Optional(Type.String({ enum: ["auto", "main", "current"], description: "Ownership/routing for watchers created inside fork handlers. auto (default) returns fork-created watchers to the inherited main dialog when available; main forces inherited main-dialog ownership; current keeps the watcher/callback owned by the creating fork/session." })),
 			endTurn: Type.Optional(Type.Boolean({ description: "Whether registering this watcher should end the current assistant turn. Defaults to true. Set false only when the current turn can continue useful work without waiting for the condition." })),
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
@@ -3928,6 +4231,11 @@ export default function (pi: ExtensionAPI) {
 					terminate: endTurn,
 				};
 			}
+			const lineageFollowupGate = await chargeBackgroundLineageFollowupFromEnv().catch((error) => {
+				console.error("[return-on] Failed to charge background lineage followup registration", error);
+				return { allowed: false, reason: "lineage-charge-failed" };
+			});
+			if (!lineageFollowupGate.allowed) throw new Error(`return_on background lineage budget exhausted: ${lineageFollowupGate.reason ?? "lineage-followup-budget"}`);
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
