@@ -452,6 +452,8 @@ let jobsStateWatcher: fs.FSWatcher | undefined;
 let jobsStateReloadTimer: ReturnType<typeof setTimeout> | undefined;
 let latestCtx: ExtensionContext | undefined;
 let ticking = false;
+let backgroundQueueDrainActive = false;
+let backgroundQueueDrainPending = false;
 let savingJobs = false;
 let saveJobsQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
@@ -1181,7 +1183,7 @@ async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
 	if (!module) return 0;
 	const store = new module.BackgroundEventsStore();
 	try {
-		const pass = store.runReconcilerPass({ leaseName: "return_on", ownerId: `return_on:${process.pid}`, leaseTtlMs: 30_000, dequeueLimit: 4 });
+		const pass = store.runReconcilerPass({ leaseName: "return_on", ownerId: `return_on:${process.pid}`, leaseTtlMs: 30_000, dequeueLimit: 4, source: "return_on" });
 		let launched = 0;
 		for (const bundle of pass.launchBundles ?? []) {
 			if (bundle.source !== "return_on") continue;
@@ -1197,6 +1199,24 @@ async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
 		return launched;
 	} finally {
 		store.close();
+	}
+}
+
+async function kickReturnOnBackgroundQueueDrain(pi: ExtensionAPI, reason: string): Promise<void> {
+	if (backgroundQueueDrainActive) {
+		backgroundQueueDrainPending = true;
+		return;
+	}
+	backgroundQueueDrainActive = true;
+	try {
+		do {
+			backgroundQueueDrainPending = false;
+			await drainReturnOnBackgroundQueue(pi);
+		} while (backgroundQueueDrainPending);
+	} catch (error) {
+		console.error(`[${EXTENSION_NAME}] Failed to drain background queue after ${reason}:`, error);
+	} finally {
+		backgroundQueueDrainActive = false;
 	}
 }
 
@@ -2730,6 +2750,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	await completeBackgroundHandler(run).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Failed to complete background event handler ${run.id}:`, error);
 	});
+	await kickReturnOnBackgroundQueueDrain(pi, `handler ${run.id} finished`);
 	await saveHandlers();
 	await appendLifecycleAudit("handler_finished", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, exitCode: code, signal, endedAt: run.endedAt, error: run.error });
 	try {
@@ -2809,7 +2830,10 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 			}
 		}
 	}
-	if (changed) await saveHandlers();
+	if (changed) {
+		await saveHandlers();
+		await kickReturnOnBackgroundQueueDrain(pi, "handler reconciliation");
+	}
 	return reconciled;
 }
 
