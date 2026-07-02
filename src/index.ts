@@ -830,10 +830,17 @@ async function loadHandlers(): Promise<void> {
 	}
 }
 
+function retainedHandlerRuns(): ReturnOnHandlerRun[] {
+	const active = handlerRuns.filter((run) => run.status === "starting" || run.status === "running");
+	const activeIds = new Set(active.map((run) => run.id));
+	const terminal = handlerRuns.filter((run) => !activeIds.has(run.id)).slice(-200);
+	return [...terminal, ...active];
+}
+
 async function saveHandlers(): Promise<void> {
 	await fsp.mkdir(STATE_DIR, { recursive: true });
 	const tmp = atomicTempPath(HANDLERS_FILE);
-	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: handlerRuns.slice(-200) } satisfies HandlersState, null, 2), "utf8");
+	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: retainedHandlerRuns() } satisfies HandlersState, null, 2), "utf8");
 	await fsp.rename(tmp, HANDLERS_FILE);
 }
 
@@ -1100,7 +1107,7 @@ async function routeReturnOnBackgroundEvent(job: ReturnOnJob, reason: string, ru
 	const parentNamespace = backgroundParentNamespace(job, run);
 	const fireCount = job.fireCount ?? 1;
 	const eventId = module.namespacedEventId("return_on", `${job.id}:${fireCount}`);
-	const workKey = `return_on:${parentNamespace}:job:${job.id}`;
+	const workKey = `return_on:${parentNamespace}:job:${job.id}:fire:${fireCount}`;
 	const store = new module.BackgroundEventsStore();
 	try {
 		return store.routeEvent({
@@ -1404,16 +1411,16 @@ async function shouldLaunchForkForDelivery(pi: ExtensionAPI, job: ReturnOnJob, d
 	if (backgroundForkDepthExceeded()) return false;
 	if (delivery.mode === "auto" && await canAutoWakeParentDirect(pi, job)) return false;
 	if (delivery.mode !== "fork" && delivery.mode !== "auto") return false;
-	const lineageGate = await chargeBackgroundLineageAutoForkFromEnv().catch((error) => {
-		console.error("[return-on] Failed to charge background lineage for fork delivery", error);
-		return { allowed: false, reason: "lineage-charge-failed" };
-	});
-	if (!lineageGate.allowed) return false;
 	const routerDecision = await routeForkDeliveryWithOptionalRouter(job, delivery).catch((error) => {
 		console.error("[return-on] Failed to run fork delivery router", error);
 		return { decision: "fork" as const, reason: "router-error" };
 	});
-	return routerDecision.decision === "fork";
+	if (routerDecision.decision !== "fork") return false;
+	const lineageGate = await chargeBackgroundLineageAutoForkFromEnv().catch((error) => {
+		console.error("[return-on] Failed to charge background lineage for fork delivery", error);
+		return { allowed: false, reason: "lineage-charge-failed" };
+	});
+	return lineageGate.allowed;
 }
 
 function updateStatus(ctx = latestCtx): void {
@@ -2872,7 +2879,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 				PI_BACKGROUND_MAX_FORK_DEPTH: String(maxBackgroundForkDepth()),
 				PI_BACKGROUND_HANDLER_ID: run.id,
 				PI_BACKGROUND_EVENT_ID: `return_on:${job.id}:${job.fireCount ?? 1}`,
-				PI_BACKGROUND_WORK_KEY: `return_on:${parentSessionId ?? job.sessionFile ?? "unknown"}:job:${job.id}`,
+				PI_BACKGROUND_WORK_KEY: `return_on:${parentSessionId ?? job.sessionFile ?? "unknown"}:job:${job.id}:fire:${job.fireCount ?? 1}`,
 				PI_BACKGROUND_LINEAGE_ID: process.env.PI_BACKGROUND_LINEAGE_ID || `return_on:${parentSessionId ?? job.sessionFile ?? "unknown"}:job:${job.id}`,
 				...(job.sessionFile ? { PI_BACKGROUND_PARENT_SESSION_FILE: job.sessionFile, [RETURN_ON_PARENT_SESSION_FILE_ENV]: job.sessionFile } : {}),
 				...(parentSessionId ? { PI_BACKGROUND_PARENT_SESSION_ID: parentSessionId, [RETURN_ON_PARENT_SESSION_ID_ENV]: parentSessionId } : {}),
