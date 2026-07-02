@@ -456,6 +456,7 @@ let backgroundQueueDrainActive = false;
 let backgroundQueueDrainPending = false;
 let backgroundQueueDrainTimer: ReturnType<typeof setTimeout> | undefined;
 const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
+const STARTING_HANDLER_WITH_SESSION_STALE_MS = 2 * 60 * 60 * 1000;
 let savingJobs = false;
 let saveJobsQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
@@ -1178,6 +1179,25 @@ async function completeBackgroundHandler(run: ReturnOnHandlerRun): Promise<void>
 	} finally {
 		store.close();
 	}
+}
+
+function latestHandlerSessionActivity(run: ReturnOnHandlerRun): number | undefined {
+	try {
+		let latest: number | undefined;
+		for (const entry of fs.readdirSync(run.sessionDir, { withFileTypes: true })) {
+			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+			const stat = fs.statSync(path.join(run.sessionDir, entry.name));
+			latest = Math.max(latest ?? 0, stat.mtimeMs);
+		}
+		return latest;
+	} catch {
+		return undefined;
+	}
+}
+
+function shouldKeepStartingHandlerWithoutPid(run: ReturnOnHandlerRun, now: number): boolean {
+	const latestActivity = latestHandlerSessionActivity(run);
+	return latestActivity !== undefined && now - latestActivity < STARTING_HANDLER_WITH_SESSION_STALE_MS;
 }
 
 async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
@@ -2802,6 +2822,7 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		if (run.status !== "starting" && run.status !== "running") continue;
 		if (!handlerVisibleForSession(run, sessionFile)) continue;
 		if (run.status === "running" && isProcessAlive(run.pid)) continue;
+		if (run.status === "starting" && !run.pid && shouldKeepStartingHandlerWithoutPid(run, Date.now())) continue;
 		const storedJob = jobs.find((candidate) => candidate.id === run.jobId);
 		const job = storedJob ?? { id: run.jobId, label: run.label };
 		const { stderr } = await fillHandlerOutput(run, job);
@@ -2955,10 +2976,10 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 
 		run.pid = launch.pid;
 		run.status = "running";
+		await saveHandlers();
 		await markBackgroundHandlerRunning(run).catch((error) => {
 			console.error(`[${EXTENSION_NAME}] Failed to mark background event handler running ${run.id}:`, error);
 		});
-		await saveHandlers();
 		await appendLifecycleAudit("handler_running", { id: run.id, jobId: run.jobId, label: run.label, pid: run.pid, startedAt: run.startedAt });
 		if (delivery.notify === "ack-and-summary") {
 			pi.sendMessage(
