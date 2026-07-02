@@ -2782,7 +2782,8 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	run.finishSource = "close";
 	const { stderr } = await fillHandlerOutput(run, job);
 	run.status = code === 0 ? "complete" : "failed";
-	if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
+	if (code === 0) delete run.error;
+	else run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
 	await completeBackgroundHandler(run).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Failed to complete background event handler ${run.id}:`, error);
 	});
