@@ -1210,6 +1210,7 @@ async function markFiredEventDelivered(eventPath: string, reason: string, status
 
 async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 	const pending = await readPendingFiredEvents();
+	let autoWakeQueuedThisPass = false;
 	for (const { path: eventPath, event } of pending) {
 		if (!firedEventMatchesCurrentSession(event)) continue;
 		const job = jobs.find((candidate) => candidate.id === event.jobId) ?? event.job;
@@ -1232,7 +1233,10 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 		if (changed) await saveJobs();
 		try {
 			const delivery = job.delivery ?? normalizeDelivery(undefined);
-			if (await shouldLaunchForkForDelivery(pi, job, delivery)) {
+			// If this delivery pass already queued an auto wake to the parent, do not
+			// immediately fork later same-pass auto events merely because our own wake
+			// made the parent look pending/busy. Queue them to the parent transcript too.
+			if (!(delivery.mode === "auto" && autoWakeQueuedThisPass) && await shouldLaunchForkForDelivery(pi, job, delivery)) {
 				const launched = await launchReturnHandler(pi, job, event.reason, delivery);
 				if (launched) {
 					const status: FiredEventDeliveryStatus = launched === "launched" ? "handler-launched" : launched;
@@ -1249,6 +1253,7 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 				},
 				{ triggerTurn: true },
 			);
+			if (delivery.mode === "auto") autoWakeQueuedThisPass = true;
 			await markFiredEventDelivered(eventPath, event.reason, "wake-sent", job);
 		} catch (error) {
 			await markFiredEventDelivered(eventPath, event.reason, "failed", job, error);
