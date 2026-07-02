@@ -1311,10 +1311,12 @@ function canQueueParentTurn(): boolean {
 	return true;
 }
 
-async function canAutoWakeParentDirect(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
+async function canAutoWakeParentDirect(pi: ExtensionAPI, _job: ReturnOnJob): Promise<boolean> {
 	if (!canQueueParentTurn()) return false;
-	const otherActiveJobs = activeJobsForCurrentSession().filter((candidate) => candidate.id !== job.id);
-	if (otherActiveJobs.length > 0) return false;
+	// Active watchers are not active background handling; they are just future
+	// timers/process watches. Do not fork a fired event merely because sibling
+	// watchers still exist. In auto mode, an idle parent should receive the event
+	// directly unless it is already running another handler.
 	await loadHandlers();
 	await reconcileHandlerRunsOnStartup(pi, currentSessionFile, false);
 	await loadHandlers();

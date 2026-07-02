@@ -210,7 +210,7 @@ Use settings to make smart or fork handling the default for real workflows inste
 }
 ```
 
-`defaultDeliveryMode` accepts `"wake"`, `"auto"`, or `"fork"`. In `"auto"` mode, return_on wakes the idle parent directly when there are no queued parent messages, no other active return_on watchers for this session, and no active return_on fork handlers for this session; otherwise it uses the fork handler path. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"` and defaults to `"summary"` for fork delivery when unset. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
+`defaultDeliveryMode` accepts `"wake"`, `"auto"`, or `"fork"`. In `"auto"` mode, return_on wakes the idle parent directly when there are no queued parent messages and no active return_on fork handlers for this session; otherwise it uses the fork handler path. Other active return_on watchers do not by themselves force a fork: watchers are future conditions, not active background handling. `defaultDeliveryNotify` accepts `"ack-and-summary"`, `"summary"`, or `"none"` and defaults to `"summary"` for fork delivery when unset. Environment variables `PI_RETURN_ON_DELIVERY_MODE`, `PI_RETURN_ON_DELIVERY_NOTIFY`, and `PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY` override settings for local experiments.
 
 ## Background fork handlers
 

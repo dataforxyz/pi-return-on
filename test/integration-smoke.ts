@@ -648,6 +648,33 @@ async function testAutoDeliveryWakesIdleParent(harness: Harness) {
   if (markerExists) throw new Error("auto delivery forked even though the parent was idle");
 }
 
+async function testAutoDeliveryWakesIdleParentWithSiblingWatcher(harness: Harness) {
+  const fakePi = path.join(cwd, "fake-auto-sibling-idle-pi.mjs");
+  const fakePiMarker = path.join(cwd, "fake-auto-sibling-idle-launched");
+  await fs.writeFile(fakePi, `#!/usr/bin/env node\nimport fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(fakePiMarker)}, "launched");\n`, { mode: 0o755 });
+  const siblingId = await harness.register({
+    label: "smoke auto sibling long watcher",
+    condition: { type: "timer", after: "30s" },
+    resume: "sibling long watcher resume",
+    delivery: { mode: "auto", piCommand: fakePi },
+  });
+  try {
+    const label = "smoke auto sibling idle delivery";
+    const resume = "auto sibling idle resume";
+    const jobId = await harness.register({
+      label,
+      condition: { type: "timer", after: "100ms" },
+      resume,
+      delivery: { mode: "auto", piCommand: fakePi },
+    });
+    await waitForWake(harness, { jobId, label, resume }, 2_500);
+    const markerExists = await fs.access(fakePiMarker).then(() => true, () => false);
+    if (markerExists) throw new Error("auto delivery forked solely because another watcher was active");
+  } finally {
+    await harness.cancel(siblingId).catch(() => undefined);
+  }
+}
+
 async function testAutoDeliveryForksBusyParent(harness: Harness) {
   const fakePi = path.join(cwd, "fake-auto-busy-pi.mjs");
   await fs.writeFile(fakePi, `#!/usr/bin/env node\nconsole.log("auto busy fork summary");\n`, { mode: 0o755 });
@@ -2104,6 +2131,7 @@ await testForkDeliveryCapsuleContextSkipsParentFork(harness);
 await testForkDeliverySkipsEmptyParentSession(harness);
 await testDefaultPiCommandFallsBackToHomeBin(harness);
 await testAutoDeliveryWakesIdleParent(harness);
+await testAutoDeliveryWakesIdleParentWithSiblingWatcher(harness);
 const busyHarness = createHarness("busy-session", { isIdle: () => false });
 await busyHarness.emit("session_start");
 await testAutoDeliveryForksBusyParent(busyHarness);
