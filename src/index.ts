@@ -454,6 +454,8 @@ let latestCtx: ExtensionContext | undefined;
 let ticking = false;
 let backgroundQueueDrainActive = false;
 let backgroundQueueDrainPending = false;
+let backgroundQueueDrainTimer: ReturnType<typeof setTimeout> | undefined;
+const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
 let savingJobs = false;
 let saveJobsQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
@@ -1202,22 +1204,36 @@ async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
 	}
 }
 
-async function kickReturnOnBackgroundQueueDrain(pi: ExtensionAPI, reason: string): Promise<void> {
+function kickReturnOnBackgroundQueueDrain(pi: ExtensionAPI, reason: string): void {
+	if (backgroundQueueDrainTimer) {
+		backgroundQueueDrainPending = true;
+		return;
+	}
+	backgroundQueueDrainTimer = setTimeout(() => {
+		void drainReturnOnBackgroundQueueLoop(pi, reason);
+	}, 0);
+	backgroundQueueDrainTimer.unref?.();
+}
+
+async function drainReturnOnBackgroundQueueLoop(pi: ExtensionAPI, reason: string): Promise<void> {
+	backgroundQueueDrainTimer = undefined;
 	if (backgroundQueueDrainActive) {
 		backgroundQueueDrainPending = true;
 		return;
 	}
 	backgroundQueueDrainActive = true;
 	try {
-		do {
+		for (let pass = 0; pass < MAX_BACKGROUND_QUEUE_DRAIN_PASSES; pass += 1) {
 			backgroundQueueDrainPending = false;
-			await drainReturnOnBackgroundQueue(pi);
-		} while (backgroundQueueDrainPending);
+			const launched = await drainReturnOnBackgroundQueue(pi);
+			if (!backgroundQueueDrainPending && launched === 0) break;
+		}
 	} catch (error) {
 		console.error(`[${EXTENSION_NAME}] Failed to drain background queue after ${reason}:`, error);
 	} finally {
 		backgroundQueueDrainActive = false;
 	}
+	if (backgroundQueueDrainPending) kickReturnOnBackgroundQueueDrain(pi, "coalesced drain");
 }
 
 async function markFiredEventDelivered(eventPath: string, reason: string, status: FiredEventDeliveryStatus, job: ReturnOnJob, error?: unknown): Promise<void> {
@@ -2750,8 +2766,8 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 	await completeBackgroundHandler(run).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Failed to complete background event handler ${run.id}:`, error);
 	});
-	await kickReturnOnBackgroundQueueDrain(pi, `handler ${run.id} finished`);
 	await saveHandlers();
+	kickReturnOnBackgroundQueueDrain(pi, `handler ${run.id} finished`);
 	await appendLifecycleAudit("handler_finished", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, exitCode: code, signal, endedAt: run.endedAt, error: run.error });
 	try {
 		pi.appendEntry?.("return-on-handler-finished", { id: run.id, jobId: run.jobId, status: run.status, exitCode: code, signal, endedAt: run.endedAt });
@@ -2781,6 +2797,7 @@ async function markHandlerFinished(pi: ExtensionAPI, job: ReturnOnJob, runId: st
 async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: string | undefined, notifyReconciled = true): Promise<number> {
 	let changed = false;
 	let reconciled = 0;
+	const reconciledRuns: ReturnOnHandlerRun[] = [];
 	for (const run of handlerRuns) {
 		if (run.status !== "starting" && run.status !== "running") continue;
 		if (!handlerVisibleForSession(run, sessionFile)) continue;
@@ -2803,6 +2820,7 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 		}
 		changed = true;
 		reconciled += 1;
+		reconciledRuns.push(run);
 		await appendLifecycleAudit("handler_reconciled", { id: run.id, jobId: run.jobId, label: run.label, status: run.status, pid: run.pid, endedAt: run.endedAt, error: run.error });
 		try {
 			pi.appendEntry?.("return-on-handler-reconciled", { id: run.id, jobId: run.jobId, status: run.status, pid: run.pid, endedAt: run.endedAt });
@@ -2832,7 +2850,12 @@ async function reconcileHandlerRunsOnStartup(pi: ExtensionAPI, sessionFile: stri
 	}
 	if (changed) {
 		await saveHandlers();
-		await kickReturnOnBackgroundQueueDrain(pi, "handler reconciliation");
+		for (const run of reconciledRuns) {
+			await completeBackgroundHandler(run).catch((error) => {
+				console.error(`[${EXTENSION_NAME}] Failed to complete reconciled background event handler ${run.id}:`, error);
+			});
+		}
+		kickReturnOnBackgroundQueueDrain(pi, "handler reconciliation");
 	}
 	return reconciled;
 }
