@@ -2422,7 +2422,10 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 			}
 			try {
 				const previousLeafState = JSON.stringify(job.leafState);
-				const result = await evaluateCondition(job, job.condition);
+				// While re-arming, evaluate without latching so a leaf that is still true
+				// cannot re-latch and permanently mask the false edge we are waiting for.
+				// Otherwise the watcher would deadlock in rearmPending and never re-fire.
+				const result = await evaluateCondition(job, job.condition, "root", !job.rearmPending);
 				if (JSON.stringify(job.leafState) !== previousLeafState) changed = true;
 				if (result.value) {
 					if (job.rearmPending) {

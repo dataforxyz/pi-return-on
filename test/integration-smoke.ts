@@ -1210,6 +1210,33 @@ async function testMaxFiresEdgeTriggered(harness: Harness) {
   if (entries.length !== 1) throw new Error(`edge-triggered watcher produced ${entries.length} wakes, expected 1`);
 }
 
+async function testMaxFiresRearmWhenConditionLingers(harness: Harness) {
+  // Regression: if the condition is still true for a tick after firing, the leaf
+  // must not permanently latch and mask the later false edge. Otherwise the
+  // watcher deadlocks in rearmPending and never fires again.
+  const label = "smoke maxFires linger";
+  const resume = "linger resume";
+  const file = path.join(cwd, "linger-fire.flag");
+  try { await fs.unlink(file); } catch {}
+  const jobId = await harness.register({
+    label,
+    condition: { type: "file", path: "linger-fire.flag", exists: true, every: "100ms" },
+    resume,
+    maxFires: 3,
+  });
+  // Create the file and leave it present across several ticks after the first fire.
+  await fs.writeFile(file, "present", "utf8");
+  await waitForWakeCount(harness, { jobId, label, resume }, 1, 4_000);
+  // Keep it present well beyond one tick so the rearm window sees it still true.
+  await sleep(2_500);
+  // Now produce a genuine false->true edge and expect a second fire.
+  await fs.unlink(file).catch(() => {});
+  await sleep(1_500);
+  await fs.writeFile(file, "present-again", "utf8");
+  await waitForWakeCount(harness, { jobId, label, resume }, 2, 4_000);
+  await fs.unlink(file).catch(() => {});
+}
+
 async function testNotConditionAfterDelete(harness: Harness) {
   const label = "smoke not after delete";
   const resume = "not resume";
@@ -2152,6 +2179,7 @@ await testPortOpen(harness);
 await testUrlReady(harness);
 await testFileExistsFalse(harness);
 await testMaxFiresMulti(harness);
+await testMaxFiresRearmWhenConditionLingers(harness);
 await testMaxFiresEdgeTriggered(harness);
 await testMaxFiresTimerOnlyRejected(harness);
 await testNotConditionAfterDelete(harness);
