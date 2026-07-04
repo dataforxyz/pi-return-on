@@ -13,6 +13,7 @@ import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi,
 import { Type } from "typebox";
 import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
 import { compactReturnOnHandlerMessages } from "./context-compaction.ts";
+import { installedPiForksFile, isPiForksExtensionEnabledFromSettings } from "./pi-forks-detection.ts";
 import { formatDuration, parseDuration, parsePositiveDurationSetting, parseShellSleepDurationMs } from "./time-utils.ts";
 export { formatDuration, parseDuration, parsePositiveDurationSetting, parseShellSleepDurationMs } from "./time-utils.ts";
 
@@ -364,14 +365,13 @@ type BackgroundEventsModule = {
 };
 let backgroundEventsImport: Promise<BackgroundEventsModule | undefined> | undefined;
 let backgroundEventsImportSpecifier: string | undefined;
-const DEFAULT_BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
+let piForksExtensionDetected = false;
+const DEFAULT_BACKGROUND_EVENTS_MODULE = ["pi-forks", "background-events"].join("/");
 
 function installedPiForksBackgroundEventsModule(): string | undefined {
-	const agentDir = process.env.PI_CODING_AGENT_DIR?.trim()
-		? path.resolve(process.env.PI_CODING_AGENT_DIR.trim())
-		: path.join(os.homedir(), ".pi", "agent");
-	const filePath = path.join(agentDir, "git", "github.com", "dataforxyz", "pi-forks", "src", "background-events.ts");
-	return fs.existsSync(filePath) ? pathToFileURL(filePath).href : undefined;
+	if (!isPiForksExtensionEnabledFromSettings({ cwd: latestCtx?.cwd ?? process.cwd() })) return undefined;
+	const filePath = installedPiForksFile(path.join("src", "background-events.ts"));
+	return filePath ? pathToFileURL(filePath).href : undefined;
 }
 
 interface PruneOptions {
@@ -1078,7 +1078,18 @@ function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
 	return !eventSession || !currentSessionFile || eventSession === currentSessionFile;
 }
 
+function piForksExtensionEnabled(pi?: ExtensionAPI): boolean {
+	try {
+		if (pi?.getCommands?.().some((command) => command.name === "forks" || command.name === "forks-inspect")) piForksExtensionDetected = true;
+		if (pi?.getAllTools?.().some((tool) => tool.name === "forks")) piForksExtensionDetected = true;
+	} catch {
+		// Fall back to settings detection below.
+	}
+	return piForksExtensionDetected || isPiForksExtensionEnabledFromSettings({ cwd: latestCtx?.cwd ?? process.cwd() });
+}
+
 async function loadBackgroundEventsModule(): Promise<BackgroundEventsModule | undefined> {
+	if (!piForksExtensionEnabled()) return undefined;
 	const specifier = process.env.PI_BACKGROUND_EVENTS_MODULE?.trim() || DEFAULT_BACKGROUND_EVENTS_MODULE;
 	const fallbacks = [specifier, installedPiForksBackgroundEventsModule()].filter(Boolean) as string[];
 	const cacheKey = fallbacks.join("\n");
@@ -1105,7 +1116,8 @@ function backgroundParentNamespace(job: ReturnOnJob, run: ReturnOnHandlerRun): s
 	return run.parentSessionId ?? job.parentSessionId ?? job.sessionFile ?? currentSessionFile ?? `return_on:${job.id}`;
 }
 
-async function routeReturnOnBackgroundEvent(job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun): Promise<{ disposition: string; handlerId?: string; queueId?: string } | undefined> {
+async function routeReturnOnBackgroundEvent(pi: ExtensionAPI, job: ReturnOnJob, reason: string, run: ReturnOnHandlerRun): Promise<{ disposition: string; handlerId?: string; queueId?: string } | undefined> {
+	if (!piForksExtensionEnabled(pi)) return undefined;
 	const module = await loadBackgroundEventsModule();
 	if (!module) return undefined;
 	const snapshot = await fileSnapshot(run.eventPath);
@@ -1201,6 +1213,7 @@ function shouldKeepStartingHandlerWithoutPid(run: ReturnOnHandlerRun, now: numbe
 }
 
 async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
+	if (!piForksExtensionEnabled(pi)) return 0;
 	const module = await loadBackgroundEventsModule();
 	if (!module) return 0;
 	const store = new module.BackgroundEventsStore();
@@ -2586,11 +2599,11 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 		? `Parent intercom target, if pi-intercom is available: ${run.parentIntercomTarget}`
 		: "No parent intercom target was resolved; rely on your final summary.";
 	return [
-		"You are a background return_on handler running in a forked sibling Pi session.",
+		"You are a background return_on handler running in a sibling Pi session.",
 		"The parent chat should stay undistracted. Handle the fired event capsule as independently as safely possible.",
 		"",
 		"Operating rules:",
-		"- Treat the forked parent transcript as context only, not live transcript work to continue.",
+		"- Treat any inherited parent transcript as context only, not live transcript work to continue; if no transcript was forked, use the event capsule and repository state.",
 		"- You are delegated to handle this return event directly when safe; do not defer routine work back to the parent.",
 		"- You may answer or act when the needed response is derivable from the event, inherited context, repo state, or prior user instructions.",
 		"- Escalate to the parent only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
@@ -2622,9 +2635,9 @@ function buildHandlerPrompt(job: ReturnOnJob, reason: string, run: ReturnOnHandl
 
 function buildHandlerSystemPrompt(run: ReturnOnHandlerRun): string {
 	return [
-		"You are a background return_on handler in a forked sibling Pi process.",
+		"You are a background return_on handler in a sibling Pi process.",
 		"Your only task is to handle the return_on event capsule supplied in the latest user message.",
-		"Do not continue unrelated parent work. Treat the forked parent transcript as context only.",
+		"Do not continue unrelated parent work. Treat any inherited parent transcript as context only; if no transcript was forked, use the event capsule and repository state.",
 		"You have delegated authority to handle routine work when safe; escalate only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with current parent work, or low confidence.",
 		"Do not wait for this handler's own pid/status; seeing yourself as running is expected.",
 		"Do not run long foreground validations, CI watchers, servers, or sleeps; background long commands and hand continued waiting back to the inherited parent with return_on.",
@@ -2916,7 +2929,7 @@ async function launchReturnHandler(pi: ExtensionAPI, job: ReturnOnJob, reason: s
 	await fsp.mkdir(run.sessionDir, { recursive: true });
 	await fsp.writeFile(run.eventPath, `${eventJson}\n`, "utf8");
 	await fsp.writeFile(run.promptPath, buildHandlerPrompt(job, reason, run, eventJson), "utf8");
-	const routed = options.skipBackgroundRoute ? undefined : await routeReturnOnBackgroundEvent(job, reason, run).catch(async (error) => {
+	const routed = options.skipBackgroundRoute ? undefined : await routeReturnOnBackgroundEvent(pi, job, reason, run).catch(async (error) => {
 		await appendLifecycleAudit("background_event_route_failed", { id: run.id, jobId: run.jobId, label: run.label, error: error instanceof Error ? error.message : String(error) });
 		console.error(`[${EXTENSION_NAME}] Failed to route background event for handler ${run.id}:`, error);
 		return undefined;
@@ -4084,6 +4097,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		piForksExtensionEnabled(pi);
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		await loadJobs();
 		await startJobsStateWatcher(pi);
