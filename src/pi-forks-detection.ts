@@ -82,16 +82,22 @@ function packageLoadsPiForksExtension(entry: unknown): boolean {
 	return true;
 }
 
-function settingsPackages(settings: Record<string, unknown> | undefined): unknown[] {
-	return Array.isArray(settings?.packages) ? settings.packages : [];
-}
-
-function settingsExtensionsIncludePiForks(settings: Record<string, unknown> | undefined): boolean {
-	const extensions = stringList(settings?.extensions) ?? [];
+function settingsExtensionsIncludePiForks(extensions: string[]): boolean {
 	return extensions.some((entry) => {
 		if (entry.startsWith("!") || entry.startsWith("-")) return false;
 		return isPiForksPackageSource(entry);
 	});
+}
+
+// Pi merges global and project settings per-key with `deepMergeSettings`, where
+// array-valued keys (`packages`, `extensions`) are replaced wholesale by the
+// project value when the project defines them, rather than concatenated. Mirror
+// that here so a project settings file that omits pi-forks disables the global
+// entry (and vice versa) instead of accumulating entries across both files.
+function effectiveArraySetting(global: unknown, project: unknown): unknown[] {
+	if (Array.isArray(project)) return project;
+	if (Array.isArray(global)) return global;
+	return [];
 }
 
 export function isPiForksExtensionEnabledFromSettings(options: { cwd?: string; env?: NodeJS.ProcessEnv; homeDir?: string } = {}): boolean {
@@ -100,22 +106,22 @@ export function isPiForksExtensionEnabledFromSettings(options: { cwd?: string; e
 	if (override !== undefined) return override;
 	const homeDir = options.homeDir ?? os.homedir();
 	const cwd = options.cwd ?? process.cwd();
-	const settingsFiles = [
-		path.join(resolvePiAgentDir(env, homeDir), "settings.json"),
-		findProjectSettingsPath(cwd),
-	].filter(Boolean) as string[];
+	const globalSettings = readJsonObject(path.join(resolvePiAgentDir(env, homeDir), "settings.json"));
+	const projectSettingsPath = findProjectSettingsPath(cwd);
+	const projectSettings = projectSettingsPath ? readJsonObject(projectSettingsPath) : undefined;
+
+	const packages = effectiveArraySetting(globalSettings?.packages, projectSettings?.packages);
+	const extensions = effectiveArraySetting(globalSettings?.extensions, projectSettings?.extensions)
+		.filter((entry): entry is string => typeof entry === "string");
+
+	if (settingsExtensionsIncludePiForks(extensions)) return true;
+
 	let piForksPackageEntry: unknown;
 	let piForksPackageSeen = false;
-	let piForksLocalExtension = false;
-	for (const settingsFile of settingsFiles) {
-		const settings = readJsonObject(settingsFile);
-		if (!settings) continue;
-		if (settingsExtensionsIncludePiForks(settings)) piForksLocalExtension = true;
-		for (const entry of settingsPackages(settings)) {
-			if (packageIdentity(entry) !== "pi-forks") continue;
-			piForksPackageSeen = true;
-			piForksPackageEntry = entry;
-		}
+	for (const entry of packages) {
+		if (packageIdentity(entry) !== "pi-forks") continue;
+		piForksPackageSeen = true;
+		piForksPackageEntry = entry;
 	}
-	return piForksLocalExtension || (piForksPackageSeen && packageLoadsPiForksExtension(piForksPackageEntry));
+	return piForksPackageSeen && packageLoadsPiForksExtension(piForksPackageEntry);
 }
