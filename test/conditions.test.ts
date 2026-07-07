@@ -5,6 +5,7 @@ import {
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
 	collectIncomingWebhookTargets,
+	mergeJobsForPrunedSave,
 	mergeJobsForSave,
 	normalizeCondition,
 	normalizeReturnOnToolParams,
@@ -66,6 +67,22 @@ test("mergeJobsForSave keeps in-memory leaf-state progress on timestamp ties", (
 	const merged = mergeJobsForSave([memory], [disk]);
 	assert.equal(merged.length, 1);
 	assert.equal(merged[0].leafState.root.lastCheckAt, 20);
+});
+
+test("mergeJobsForPrunedSave preserves active jobs added by another process while pruning stale terminal jobs", () => {
+	const cutoff = 100;
+	const staleTerminal = makeMergeJob("ro_old", "fired", 50);
+	const concurrentActive = makeMergeJob("ro_new_active", "active", 120);
+	const memoryKept = makeMergeJob("ro_memory_active", "active", 110);
+	const merged = mergeJobsForPrunedSave([memoryKept], [staleTerminal, concurrentActive], cutoff);
+	assert.deepEqual(merged.map((job) => job.id), ["ro_memory_active", "ro_new_active"]);
+	assert.equal(merged.some((job) => job.id === "ro_old"), false);
+});
+
+test("mergeJobsForPrunedSave keeps protected terminal fired events", () => {
+	const protectedTerminal = makeMergeJob("ro_protected", "fired", 50);
+	const merged = mergeJobsForPrunedSave([], [protectedTerminal], 100, ["ro_protected"]);
+	assert.deepEqual(merged.map((job) => job.id), ["ro_protected"]);
 });
 
 test("normalizeCondition: rejects non-object input", () => {

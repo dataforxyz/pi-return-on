@@ -803,13 +803,30 @@ export function mergeJobsForSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJo
 	return [...merged.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 }
 
-async function saveJobs(options: { merge?: boolean } = {}): Promise<void> {
+function shouldPruneTerminalJob(job: ReturnOnJob, cutoff: number, protectedJobIds: ReadonlySet<string>): boolean {
+	if (job.status === "active") return false;
+	if (protectedJobIds.has(job.id)) return false;
+	const terminalAt = terminalJobTime(job);
+	return terminalAt !== undefined && terminalAt < cutoff;
+}
+
+export function mergeJobsForPrunedSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], cutoff: number, protectedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
+	const protectedJobIds = new Set(protectedJobIdsInput);
+	return mergeJobsForSave(memoryJobs, diskJobs).filter((job) => !shouldPruneTerminalJob(job, cutoff, protectedJobIds));
+}
+
+async function saveJobs(options: { merge?: boolean; pruneTerminalBefore?: number; protectedJobIds?: ReadonlySet<string> } = {}): Promise<void> {
 	const memoryJobs = jobs;
 	const run = async () => {
 		await fsp.mkdir(STATE_DIR, { recursive: true });
 		savingJobs = true;
 		try {
-			jobs = options.merge === false ? memoryJobs : mergeJobsForSave(memoryJobs, await readJobsFile());
+			const diskJobs = await readJobsFile();
+			jobs = options.merge === false ? memoryJobs : mergeJobsForSave(memoryJobs, diskJobs);
+			if (options.pruneTerminalBefore !== undefined) {
+				const protectedJobIds = options.protectedJobIds ?? new Set<string>();
+				jobs = jobs.filter((job) => !shouldPruneTerminalJob(job, options.pruneTerminalBefore!, protectedJobIds));
+			}
 			const tmp = atomicTempPath(JOBS_FILE);
 			await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
 			await fsp.rename(tmp, JOBS_FILE);
@@ -1019,16 +1036,19 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 
 	let jobsPruned = 0;
 	const keptJobs = jobs.filter((job) => {
-		if (job.status === "active") return true;
-		if (protectedJobIds.has(job.id)) return true;
-		const terminalAt = terminalJobTime(job);
-		const prune = terminalAt !== undefined && terminalAt < cutoff;
+		const prune = shouldPruneTerminalJob(job, cutoff, protectedJobIds);
 		if (prune) jobsPruned += 1;
 		return !prune;
 	});
 	if (!dryRun && jobsPruned > 0) {
 		jobs = keptJobs;
-		await saveJobs({ merge: false });
+		// Prune must still merge against the latest on-disk jobs. Multiple Pi
+		// sessions share jobs.json; writing a stale in-memory snapshot here can
+		// otherwise delete an active watcher that another session registered a
+		// moment earlier, leaving only a job_registered audit entry and no fired,
+		// timeout, or cancelled terminal state.
+		await saveJobs({ pruneTerminalBefore: cutoff, protectedJobIds });
+		await appendLifecycleAudit("jobs_pruned", { jobsPruned, cutoff, protectedJobCount: protectedJobIds.size });
 	}
 
 	let firedEventsPruned = 0;
@@ -4360,7 +4380,7 @@ export default function (pi: ExtensionAPI) {
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
 			await saveJobs();
-			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, deliveryMode: job.delivery?.mode ?? "wake", maxFires, checkInEveryMs });
+			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, timeoutMs, deliveryMode: job.delivery?.mode ?? "wake", maxFires, checkInEveryMs, condition: job.condition, resume: job.resume, every: job.every });
 			try {
 				pi.appendEntry?.("return-on-registered", { id: job.id, label: job.label, createdAt: job.createdAt, condition: job.condition });
 			} catch {
