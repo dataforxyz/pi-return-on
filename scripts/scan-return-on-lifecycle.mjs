@@ -85,6 +85,36 @@ function newestLeafCheckAt(job) {
   return times.length ? Math.max(...times) : undefined;
 }
 
+function parseDurationMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/i);
+  if (!match) return undefined;
+  const number = Number(match[1]);
+  if (!Number.isFinite(number)) return undefined;
+  const unit = (match[2] ?? "ms").toLowerCase();
+  const factors = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  return number * factors[unit];
+}
+
+function timerDueAt(condition, createdAt) {
+  if (!condition || condition.type !== "timer") return undefined;
+  if (condition.at !== undefined) {
+    if (typeof condition.at === "number" && Number.isFinite(condition.at)) return condition.at;
+    const parsed = Date.parse(String(condition.at));
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  const after = condition.after ?? condition.duration;
+  const duration = parseDurationMs(after);
+  return duration === undefined ? undefined : (createdAt ?? 0) + duration;
+}
+
+function activeJobNotYetDue(job, now) {
+  if (job.status !== "active") return false;
+  const dueAt = timerDueAt(job.condition, job.createdAt);
+  return dueAt !== undefined && dueAt > now;
+}
+
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
   try {
@@ -127,7 +157,7 @@ for (const job of jobs) {
 const timedOut = jobs.filter((job) => job.status === "fired" && job.fireReason === "timeout");
 const active = jobs.filter((job) => job.status === "active");
 const activeExpired = active.filter((job) => typeof job.timeoutAt === "number" && job.timeoutAt <= now);
-const activeStale = active.filter((job) => ageMs(newestLeafCheckAt(job) ?? job.updatedAt ?? job.createdAt, now) >= staleMs);
+const activeStale = active.filter((job) => !activeJobNotYetDue(job, now) && ageMs(newestLeafCheckAt(job) ?? job.updatedAt ?? job.createdAt, now) >= staleMs);
 const activeNeverChecked = active.filter((job) => newestLeafCheckAt(job) === undefined);
 
 const byHandlerStatus = {};
@@ -151,6 +181,25 @@ for (const handler of handlers) {
   handlersByJob.set(handler.jobId, list);
 }
 const firedJobs = jobs.filter((job) => job.status === "fired");
+const firedEventJobIds = new Set(firedEvents.map((event) => event.jobId ?? event.id));
+const terminalAuditActions = new Set(["job_fired", "job_cancelled"]);
+const auditActionsByJob = new Map();
+for (const entry of lifecycleAudit) {
+  const id = entry.id ?? entry.jobId;
+  if (!id) continue;
+  const actions = auditActionsByJob.get(id) ?? new Set();
+  actions.add(entry.action);
+  auditActionsByJob.set(id, actions);
+}
+const registeredMissingFromState = lifecycleAudit
+  .filter((entry) => entry.action === "job_registered")
+  .filter((entry) => {
+    const id = entry.id;
+    if (!id) return false;
+    if (jobIds.has(id) || firedEventJobIds.has(id) || handlersByJob.has(id)) return false;
+    const actions = auditActionsByJob.get(id) ?? new Set();
+    return ![...terminalAuditActions].some((action) => actions.has(action));
+  });
 const firedWithoutObservedDelivery = firedJobs.filter((job) => !firedEvents.some((event) => event.jobId === job.id) && !handlersByJob.has(job.id));
 const firedWithOnlyFailedHandlers = firedJobs.filter((job) => {
   const list = handlersByJob.get(job.id) ?? [];
@@ -184,6 +233,16 @@ function truncate(value, max = 240) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+function registeredSample(entry) {
+  return {
+    id: entry.id,
+    label: entry.label,
+    age: formatMs(ageMs(entry.createdAt ?? entry.timestamp, now)),
+    timeoutAge: typeof entry.timeoutAt === "number" ? formatMs(now - entry.timeoutAt) : undefined,
+    sessionFile: entry.sessionFile,
+  };
+}
+
 function handlerSample(handler) {
   return {
     id: handler.id,
@@ -214,6 +273,7 @@ const report = {
     activeExpired: activeExpired.length,
     activeStale: activeStale.length,
     activeNeverChecked: activeNeverChecked.length,
+    registeredMissingFromState: registeredMissingFromState.length,
     firedWithoutObservedDelivery: firedWithoutObservedDelivery.length,
     firedWithOnlyFailedHandlers: firedWithOnlyFailedHandlers.length,
     fireLatencyMs: { count: latencies.length, p50: quantile(0.5), p90: quantile(0.9), max: quantile(1) },
@@ -243,6 +303,7 @@ const report = {
     handlerFailed: sample(handlerFailed, handlerSample),
     handlerStale: sample(handlerStale, handlerSample),
     handlerDeadPid: sample(handlerDeadPid, handlerSample),
+    registeredMissingFromState: sample(registeredMissingFromState, registeredSample),
     firedWithoutObservedDelivery: sample(firedWithoutObservedDelivery, jobSample),
     firedWithOnlyFailedHandlers: sample(firedWithOnlyFailedHandlers, jobSample),
   },
@@ -254,6 +315,7 @@ if (jsonOut) {
   console.log(`return_on lifecycle scan (${report.scannedAt})`);
   console.log(`jobs: ${jobs.length} ${JSON.stringify(byJobStatus)}; fired=${firedJobs.length}; timedOut=${timedOut.length} (${(report.jobs.timedOutRate * 100).toFixed(1)}%)`);
   console.log(`active: expired=${activeExpired.length}, stale=${activeStale.length}, neverChecked=${activeNeverChecked.length} (stale>${formatMs(staleMs)})`);
+  console.log(`registered missing from state: ${registeredMissingFromState.length}`);
   console.log(`handlers: ${handlers.length} ${JSON.stringify(byHandlerStatus)}; failed=${handlerFailed.length}, staleInFlight=${handlerStale.length}, deadPidInFlight=${handlerDeadPid.length}, completeNoSummary=${completeNoSummary.length}`);
   console.log(`fired events: ${firedEvents.length} ${JSON.stringify(byFiredEventStatus)}; undelivered=${firedEventUndelivered.length}`);
   console.log(`lifecycle audit: ${lifecycleAudit.length} ${JSON.stringify(byAuditAction)}`);

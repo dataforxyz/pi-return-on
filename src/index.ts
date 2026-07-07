@@ -459,6 +459,7 @@ const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
 const STARTING_HANDLER_WITH_SESSION_STALE_MS = 2 * 60 * 60 * 1000;
 let savingJobs = false;
 let saveJobsQueue: Promise<void> = Promise.resolve();
+let saveHandlersQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
 let fileWatchers = new Map<string, fs.FSWatcher>();
 let incomingWebhookServer: http.Server | undefined;
@@ -774,8 +775,8 @@ function jobMergeTime(job: ReturnOnJob): number {
 
 function chooseMergedJob(a: ReturnOnJob, b: ReturnOnJob): ReturnOnJob {
 	if (a.status !== b.status) {
-		if (isTerminalJob(a) && !isTerminalJob(b)) return a;
-		if (isTerminalJob(b) && !isTerminalJob(a)) return b;
+		if (isTerminalJob(a) && !isTerminalJob(b)) return jobMergeTime(a) >= jobMergeTime(b) ? a : b;
+		if (isTerminalJob(b) && !isTerminalJob(a)) return jobMergeTime(b) >= jobMergeTime(a) ? b : a;
 	}
 	return jobMergeTime(b) >= jobMergeTime(a) ? b : a;
 }
@@ -839,31 +840,78 @@ async function saveJobs(options: { merge?: boolean; pruneTerminalBefore?: number
 	await result;
 }
 
-async function loadHandlers(): Promise<void> {
+async function readHandlersFile(): Promise<ReturnOnHandlerRun[]> {
 	try {
 		const raw = await fsp.readFile(HANDLERS_FILE, "utf8");
 		const parsed = JSON.parse(raw) as HandlersState;
-		handlerRuns = Array.isArray(parsed.handlers) ? parsed.handlers : [];
+		return Array.isArray(parsed.handlers) ? parsed.handlers : [];
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			console.error(`[${EXTENSION_NAME}] Failed to load handler runs:`, error);
 		}
-		handlerRuns = [];
+		return [];
 	}
 }
 
-function retainedHandlerRuns(): ReturnOnHandlerRun[] {
-	const active = handlerRuns.filter((run) => run.status === "starting" || run.status === "running");
+async function loadHandlers(): Promise<void> {
+	handlerRuns = await readHandlersFile();
+}
+
+function isActiveHandlerRun(run: ReturnOnHandlerRun): boolean {
+	return run.status === "starting" || run.status === "running";
+}
+
+function handlerMergeTime(run: ReturnOnHandlerRun): number {
+	return Math.max(run.endedAt ?? 0, run.startedAt ?? 0);
+}
+
+function chooseMergedHandlerRun(a: ReturnOnHandlerRun, b: ReturnOnHandlerRun): ReturnOnHandlerRun {
+	if (isActiveHandlerRun(a) !== isActiveHandlerRun(b)) {
+		if (!isActiveHandlerRun(a)) return a;
+		if (!isActiveHandlerRun(b)) return b;
+	}
+	return handlerMergeTime(b) >= handlerMergeTime(a) ? b : a;
+}
+
+export function mergeHandlersForSave(memoryHandlers: ReturnOnHandlerRun[], diskHandlers: ReturnOnHandlerRun[]): ReturnOnHandlerRun[] {
+	const merged = new Map<string, ReturnOnHandlerRun>();
+	for (const run of diskHandlers) merged.set(run.id, run);
+	for (const run of memoryHandlers) {
+		const existing = merged.get(run.id);
+		merged.set(run.id, existing ? chooseMergedHandlerRun(existing, run) : run);
+	}
+	return [...merged.values()].sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+}
+
+function retainedHandlerRuns(runs: ReturnOnHandlerRun[] = handlerRuns): ReturnOnHandlerRun[] {
+	const active = runs.filter(isActiveHandlerRun);
 	const activeIds = new Set(active.map((run) => run.id));
-	const terminal = handlerRuns.filter((run) => !activeIds.has(run.id)).slice(-200);
+	const terminal = runs.filter((run) => !activeIds.has(run.id)).slice(-200);
 	return [...terminal, ...active];
 }
 
-async function saveHandlers(): Promise<void> {
-	await fsp.mkdir(STATE_DIR, { recursive: true });
-	const tmp = atomicTempPath(HANDLERS_FILE);
-	await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: retainedHandlerRuns() } satisfies HandlersState, null, 2), "utf8");
-	await fsp.rename(tmp, HANDLERS_FILE);
+function shouldPruneTerminalHandler(run: ReturnOnHandlerRun, cutoff: number): boolean {
+	if (isActiveHandlerRun(run)) return false;
+	const endedAt = run.endedAt ?? run.startedAt;
+	return endedAt < cutoff;
+}
+
+async function saveHandlers(options: { merge?: boolean; pruneTerminalBefore?: number } = {}): Promise<void> {
+	const memoryHandlers = handlerRuns;
+	const run = async () => {
+		await fsp.mkdir(STATE_DIR, { recursive: true });
+		const diskHandlers = await readHandlersFile();
+		handlerRuns = options.merge === false ? memoryHandlers : mergeHandlersForSave(memoryHandlers, diskHandlers);
+		if (options.pruneTerminalBefore !== undefined) {
+			handlerRuns = handlerRuns.filter((handler) => !shouldPruneTerminalHandler(handler, options.pruneTerminalBefore!));
+		}
+		const tmp = atomicTempPath(HANDLERS_FILE);
+		await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: retainedHandlerRuns() } satisfies HandlersState, null, 2), "utf8");
+		await fsp.rename(tmp, HANDLERS_FILE);
+	};
+	const result = saveHandlersQueue.then(run, run);
+	saveHandlersQueue = result.catch(() => undefined);
+	await result;
 }
 
 async function appendLifecycleAudit(action: string, fields: Record<string, unknown> = {}): Promise<void> {
@@ -1063,9 +1111,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	let handlersPruned = 0;
 	let handlerDirsPruned = 0;
 	const keptHandlers = handlerRuns.filter((run) => {
-		if (run.status === "starting" || run.status === "running") return true;
-		const endedAt = run.endedAt ?? run.startedAt;
-		const prune = endedAt < cutoff;
+		const prune = shouldPruneTerminalHandler(run, cutoff);
 		if (prune) handlersPruned += 1;
 		return !prune;
 	});
@@ -1084,7 +1130,8 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 			}
 		}
 		handlerRuns = keptHandlers;
-		await saveHandlers();
+		await saveHandlers({ pruneTerminalBefore: cutoff });
+		await appendLifecycleAudit("handlers_pruned", { handlersPruned, handlerDirsPruned, cutoff });
 	} else if (dryRun) {
 		handlerDirsPruned = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id) && isPathInside(HANDLERS_DIR, run.dir)).length;
 	}

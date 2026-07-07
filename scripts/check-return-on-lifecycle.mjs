@@ -10,6 +10,7 @@ const thresholds = {
   staleInFlight: numberFromEnv("RETURN_ON_MAX_STALE_HANDLERS", 0),
   failedHandlers: numberFromEnv("RETURN_ON_MAX_FAILED_HANDLERS", 0),
   undeliveredEvents: numberFromEnv("RETURN_ON_MAX_UNDELIVERED_EVENTS", 0),
+  registeredMissingFromState: numberFromEnv("RETURN_ON_MAX_REGISTERED_MISSING_FROM_STATE", 0),
   firedWithoutObservedDelivery: numberFromEnv("RETURN_ON_MAX_FIRED_WITHOUT_DELIVERY", 0),
   firedWithOnlyFailedHandlers: numberFromEnv("RETURN_ON_MAX_FIRED_ONLY_FAILED_HANDLERS", 0),
 };
@@ -17,7 +18,7 @@ const thresholds = {
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
   if (arg === "--help" || arg === "-h") {
-    console.log(`Usage: check-return-on-lifecycle [scanner args...]\n\nRuns scan-return-on-lifecycle and fails if lifecycle health exceeds thresholds.\nThreshold env vars/defaults:\n- RETURN_ON_MAX_EXPIRED_ACTIVE=${thresholds.activeExpired}\n- RETURN_ON_MAX_STALE_ACTIVE=${thresholds.activeStale}\n- RETURN_ON_MAX_DEAD_HANDLER_PIDS=${thresholds.deadPidInFlight}\n- RETURN_ON_MAX_STALE_HANDLERS=${thresholds.staleInFlight}\n- RETURN_ON_MAX_FAILED_HANDLERS=${thresholds.failedHandlers}\n- RETURN_ON_MAX_UNDELIVERED_EVENTS=${thresholds.undeliveredEvents}\n- RETURN_ON_MAX_FIRED_WITHOUT_DELIVERY=${thresholds.firedWithoutObservedDelivery}\n- RETURN_ON_MAX_FIRED_ONLY_FAILED_HANDLERS=${thresholds.firedWithOnlyFailedHandlers}\n\nPass normal scanner args such as --days 7 or a stateDir path after this command.`);
+    console.log(`Usage: check-return-on-lifecycle [scanner args...]\n\nRuns scan-return-on-lifecycle and fails if lifecycle health exceeds thresholds.\nThreshold env vars/defaults:\n- RETURN_ON_MAX_EXPIRED_ACTIVE=${thresholds.activeExpired}\n- RETURN_ON_MAX_STALE_ACTIVE=${thresholds.activeStale}\n- RETURN_ON_MAX_DEAD_HANDLER_PIDS=${thresholds.deadPidInFlight}\n- RETURN_ON_MAX_STALE_HANDLERS=${thresholds.staleInFlight}\n- RETURN_ON_MAX_FAILED_HANDLERS=${thresholds.failedHandlers}\n- RETURN_ON_MAX_UNDELIVERED_EVENTS=${thresholds.undeliveredEvents}\n- RETURN_ON_MAX_REGISTERED_MISSING_FROM_STATE=${thresholds.registeredMissingFromState}\n- RETURN_ON_MAX_FIRED_WITHOUT_DELIVERY=${thresholds.firedWithoutObservedDelivery}\n- RETURN_ON_MAX_FIRED_ONLY_FAILED_HANDLERS=${thresholds.firedWithOnlyFailedHandlers}\n\nPass normal scanner args such as --days 7 or a stateDir path after this command.`);
     process.exit(0);
   }
   scanArgs.push(arg);
@@ -40,6 +41,7 @@ const checks = [
   ["stale in-flight handlers", report.handlers.staleInFlight, thresholds.staleInFlight],
   ["failed handlers", report.handlers.failed, thresholds.failedHandlers],
   ["undelivered fired events", report.firedEvents.undelivered, thresholds.undeliveredEvents],
+  ["registered jobs missing from state", report.jobs.registeredMissingFromState, thresholds.registeredMissingFromState],
   ["fired jobs without observed delivery", report.jobs.firedWithoutObservedDelivery, thresholds.firedWithoutObservedDelivery],
   ["fired jobs with only failed handlers", report.jobs.firedWithOnlyFailedHandlers, thresholds.firedWithOnlyFailedHandlers],
 ];
@@ -49,7 +51,7 @@ if (failures.length) {
   for (const [name, actual, max] of failures) console.error(`- ${name}: ${actual} > ${max}`);
   console.error("\nSamples:");
   const samples = report.samples ?? {};
-  for (const key of ["activeExpired", "activeStale", "handlerDeadPid", "handlerStale", "handlerFailed", "firedWithoutObservedDelivery", "firedWithOnlyFailedHandlers"]) {
+  for (const key of ["activeExpired", "activeStale", "handlerDeadPid", "handlerStale", "handlerFailed", "registeredMissingFromState", "firedWithoutObservedDelivery", "firedWithOnlyFailedHandlers"]) {
     if (samples[key]?.length) console.error(`${key}: ${JSON.stringify(samples[key].slice(0, 3), null, 2)}`);
   }
   process.exit(1);

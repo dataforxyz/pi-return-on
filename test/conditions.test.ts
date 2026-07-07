@@ -5,6 +5,7 @@ import {
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
 	collectIncomingWebhookTargets,
+	mergeHandlersForSave,
 	mergeJobsForPrunedSave,
 	mergeJobsForSave,
 	normalizeCondition,
@@ -38,6 +39,24 @@ function makeMergeJob(id: string, status: "active" | "fired" | "cancelled", upda
 	};
 }
 
+function makeHandler(id: string, status: "starting" | "running" | "complete" | "failed", startedAt: number): any {
+	return {
+		id,
+		jobId: `job_${id}`,
+		label: id,
+		cwd: "/work",
+		status,
+		startedAt,
+		...(status === "complete" || status === "failed" ? { endedAt: startedAt + 10 } : {}),
+		dir: `/state/${id}`,
+		eventPath: `/state/${id}/event.json`,
+		promptPath: `/state/${id}/prompt.md`,
+		stdoutPath: `/state/${id}/stdout.log`,
+		stderrPath: `/state/${id}/stderr.log`,
+		sessionDir: `/state/${id}/sessions`,
+	};
+}
+
 test("mergeJobsForSave preserves jobs added by another process", () => {
 	const disk = makeMergeJob("ro_disk", "active", 10);
 	const memory = makeMergeJob("ro_memory", "active", 20);
@@ -51,6 +70,15 @@ test("mergeJobsForSave does not resurrect terminal jobs from stale active memory
 	assert.equal(merged.length, 1);
 	assert.equal(merged[0].status, "fired");
 	assert.equal(merged[0].updatedAt, 20);
+});
+
+test("mergeJobsForSave preserves newer re-armed active job over stale terminal copy", () => {
+	const staleTerminal = makeMergeJob("ro_same", "fired", 20);
+	const rearmedActive = { ...makeMergeJob("ro_same", "active", 30), maxFires: 2, fireCount: 1, lastFiredAt: 30, rearmPending: true };
+	const merged = mergeJobsForSave([rearmedActive], [staleTerminal]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].status, "active");
+	assert.equal(merged[0].fireCount, 1);
 });
 
 test("mergeJobsForSave keeps the newer active copy", () => {
@@ -83,6 +111,20 @@ test("mergeJobsForPrunedSave keeps protected terminal fired events", () => {
 	const protectedTerminal = makeMergeJob("ro_protected", "fired", 50);
 	const merged = mergeJobsForPrunedSave([], [protectedTerminal], 100, ["ro_protected"]);
 	assert.deepEqual(merged.map((job) => job.id), ["ro_protected"]);
+});
+
+test("mergeHandlersForSave preserves handler runs added by another process", () => {
+	const disk = makeHandler("roh_disk", "running", 10);
+	const memory = makeHandler("roh_memory", "starting", 20);
+	assert.deepEqual(mergeHandlersForSave([memory], [disk]).map((run) => run.id), ["roh_disk", "roh_memory"]);
+});
+
+test("mergeHandlersForSave keeps terminal handler over stale active memory", () => {
+	const memory = makeHandler("roh_same", "running", 10);
+	const disk = makeHandler("roh_same", "complete", 20);
+	const merged = mergeHandlersForSave([memory], [disk]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].status, "complete");
 });
 
 test("normalizeCondition: rejects non-object input", () => {
