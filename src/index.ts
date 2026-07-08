@@ -51,6 +51,8 @@ const DEFAULT_PORT_EVERY_MS = 2000;
 const DEFAULT_URL_EVERY_MS = 5000;
 const DEFAULT_PORT_TIMEOUT_MS = 1000;
 const DEFAULT_URL_TIMEOUT_MS = 5000;
+const MAX_URL_TIMEOUT_MS = 30_000;
+const MAX_URL_BODY_BYTES = 64 * 1024;
 const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1";
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const DEFAULT_RETURN_ON_TIMEOUT_MS = 10 * 60_000;
@@ -1920,11 +1922,13 @@ export function normalizeCondition(input: unknown): Condition {
 	}
 	if (conditionInput.type === "url") {
 		if (typeof conditionInput.url !== "string" || !conditionInput.url.trim()) throw new Error("url condition requires url");
+		let parsed: URL;
 		try {
-			new URL(conditionInput.url);
+			parsed = new URL(conditionInput.url);
 		} catch {
 			throw new Error(`url condition has invalid url '${String(conditionInput.url)}'`);
 		}
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("url condition url must use http or https");
 		return conditionInput as UrlCondition;
 	}
 	if (conditionInput.type === "webhook") {
@@ -2379,7 +2383,7 @@ async function evaluateUrl(job: ReturnOnJob, condition: UrlCondition, key: strin
 	}
 	state.lastCheckAt = now;
 
-	const timeoutMs = parseDuration(condition.timeout, DEFAULT_URL_TIMEOUT_MS) ?? DEFAULT_URL_TIMEOUT_MS;
+	const timeoutMs = Math.min(parseDuration(condition.timeout, DEFAULT_URL_TIMEOUT_MS) ?? DEFAULT_URL_TIMEOUT_MS, MAX_URL_TIMEOUT_MS);
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	timer.unref?.();
@@ -2387,7 +2391,7 @@ async function evaluateUrl(job: ReturnOnJob, condition: UrlCondition, key: strin
 		const response = await fetch(condition.url, { method: condition.method ?? "GET", signal: controller.signal });
 		let body = "";
 		const needsBody = condition.bodyContains !== undefined || condition.bodyMatches !== undefined;
-		if (needsBody) body = truncateText(await response.text());
+		if (needsBody) body = await readResponseTextLimited(response);
 		const checks: Array<{ ok: boolean; label: string }> = [];
 		if (condition.status !== undefined) {
 			const statuses = Array.isArray(condition.status) ? condition.status : [condition.status];
@@ -2412,6 +2416,34 @@ async function evaluateUrl(job: ReturnOnJob, condition: UrlCondition, key: strin
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+export async function readResponseTextLimited(response: Response, limitBytes = MAX_URL_BODY_BYTES): Promise<string> {
+	if (!response.body) return truncateText(await response.text(), limitBytes);
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	let truncated = false;
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			total += value.byteLength;
+			if (total > limitBytes) {
+				const allowed = Math.max(0, value.byteLength - (total - limitBytes));
+				if (allowed > 0) chunks.push(value.slice(0, allowed));
+				truncated = true;
+				await reader.cancel().catch(() => undefined);
+				break;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const body = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+	return truncated ? `${body}\n[truncated ${Math.max(0, total - limitBytes)} bytes]` : body;
 }
 
 function buildExecArgs(runner: Runner, condition: ExecCondition): { command: string; args: string[]; display: string } {

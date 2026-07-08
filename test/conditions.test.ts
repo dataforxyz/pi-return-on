@@ -15,6 +15,7 @@ import {
 	mergeJobsForSave,
 	normalizeCondition,
 	patchFiredEvent,
+	readResponseTextLimited,
 	tryClaimFiredEvent,
 	normalizeReturnOnToolParams,
 } from "../src/index.ts";
@@ -266,6 +267,18 @@ test("patchFiredEvent preserves multi-fire event path and original capsule field
 
 test("normalizeCondition: file requires non-empty path", () => {
 	assert.throws(() => normalizeCondition({ type: "file" }), /file condition requires path/);
+});
+
+test("normalizeCondition: url conditions require http or https", () => {
+	assert.throws(() => normalizeCondition({ type: "url", url: "data:text/plain,ok" }), /url must use http or https/);
+	assert.throws(() => normalizeCondition({ type: "url", url: "file:///tmp/x" }), /url must use http or https/);
+	const c = normalizeCondition({ type: "url", url: "http://127.0.0.1:1234/health" }) as any;
+	assert.equal(c.url, "http://127.0.0.1:1234/health");
+});
+
+test("readResponseTextLimited caps url response bodies", async () => {
+	const response = new Response("abcdef");
+	assert.equal(await readResponseTextLimited(response, 3), "abc\n[truncated 3 bytes]");
 });
 
 test("normalizeCondition: webhook path must start with /", () => {
