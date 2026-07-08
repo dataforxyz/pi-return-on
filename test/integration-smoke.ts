@@ -1372,6 +1372,29 @@ async function testTimeoutWake(harness: Harness) {
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
 }
 
+async function testTimeoutBeatsSlowTrueEval(harness: Harness) {
+  const label = "smoke timeout beats slow eval";
+  const resume = "timeout beats slow eval resume";
+  const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => process.exit(0), 900)")}`;
+  const jobId = await harness.register({
+    label,
+    condition: { type: "exec", command, success: true, every: "2s", timeout: "2s" },
+    allowExec: true,
+    timeout: "1300ms",
+    resume,
+  });
+  await expectNoWake(harness, jobId, 1_100, "slow eval watcher fired before timeout elapsed");
+  const entry = await waitForWake(harness, { jobId, label, resume }, 4_000);
+  if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("slow eval watcher fired instead of timing out");
+  if (finalWakeEntries(harness, jobId).length !== 1) throw new Error("slow eval timeout delivered more than one final wake");
+  const jobsState = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8"));
+  const job = jobsState.jobs.find((candidate: any) => candidate.id === jobId);
+  if (job?.status !== "fired" || job?.fireReason !== "timeout") throw new Error(`slow eval job terminal state was not timeout: ${JSON.stringify(job)}`);
+  const firedDir = path.join(stateDir, "fired");
+  const firedFiles = (await fs.readdir(firedDir)).filter((name) => name.startsWith(jobId));
+  if (firedFiles.length !== 1) throw new Error(`expected one fired capsule for slow eval timeout, saw ${firedFiles.length}: ${firedFiles.join(",")}`);
+}
+
 async function waitForCheckIn(harness: Harness, jobId: string, expectedCount: number, timeoutMs: number) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -2190,6 +2213,7 @@ await testConditionJsonString(harness);
 await testBooleanTree(harness);
 await testCancelBeforeFire(harness);
 await testTimeoutWake(harness);
+await testTimeoutBeatsSlowTrueEval(harness);
 await testCheckInEvery(harness);
 await testCheckInStartupClearsPendingWake();
 await testCheckInSkipsBusyParent();
