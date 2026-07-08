@@ -65,6 +65,7 @@ const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
+const FIRED_EVENT_CLAIM_STALE_MS = 2 * 60_000;
 const RETURN_ON_PARENT_SESSION_FILE_ENV = "PI_RETURN_ON_PARENT_SESSION_FILE";
 const RETURN_ON_PARENT_SESSION_ID_ENV = "PI_RETURN_ON_PARENT_SESSION_ID";
 const RETURN_ON_PARENT_SESSION_NAME_ENV = "PI_RETURN_ON_PARENT_SESSION_NAME";
@@ -1004,6 +1005,51 @@ async function readPendingFiredEvents(): Promise<Array<{ path: string; event: Fi
 	return (await readFiredEventFiles()).filter(({ event }) => !event.deliveredAt || event.deliveryStatus === "failed");
 }
 
+function firedEventClaimPath(eventPath: string): string {
+	return `${eventPath}.claim`;
+}
+
+export async function tryClaimFiredEvent(eventPath: string, owner = `${process.pid}`, now = Date.now(), staleMs = FIRED_EVENT_CLAIM_STALE_MS): Promise<boolean> {
+	const claimPath = firedEventClaimPath(eventPath);
+	const tryCreate = async () => {
+		const handle = await fsp.open(claimPath, "wx");
+		try {
+			await handle.writeFile(JSON.stringify({ owner, claimedAt: now, eventPath }) + "\n", "utf8");
+		} finally {
+			await handle.close();
+		}
+	};
+	try {
+		await tryCreate();
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+	try {
+		const stat = await fsp.stat(claimPath);
+		if (now - stat.mtimeMs <= staleMs) return false;
+		await fsp.rm(claimPath, { force: true });
+		await tryCreate();
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return tryClaimFiredEvent(eventPath, owner, now, staleMs);
+		throw error;
+	}
+}
+
+async function releaseFiredEventClaim(eventPath: string): Promise<void> {
+	await fsp.rm(firedEventClaimPath(eventPath), { force: true });
+}
+
+export function applyFiredEventToJob(existing: ReturnOnJob | undefined, event: FiredEventState): { job: ReturnOnJob; changed: boolean } {
+	if (!existing) return { job: event.job, changed: true };
+	const merged = chooseMergedJob(existing, event.job);
+	const changed = merged !== existing;
+	if (changed) Object.assign(existing, merged);
+	return { job: existing, changed };
+}
+
 function terminalJobTime(job: ReturnOnJob): number | undefined {
 	if (job.status === "fired") return job.firedAt ?? job.updatedAt;
 	if (job.status === "cancelled") return job.cancelledAt ?? job.updatedAt;
@@ -1374,25 +1420,24 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 	let autoWakeQueuedThisPass = false;
 	for (const { path: eventPath, event } of pending) {
 		if (!firedEventMatchesCurrentSession(event)) continue;
-		const job = jobs.find((candidate) => candidate.id === event.jobId) ?? event.job;
-		if (job.status === "cancelled") {
-			await markFiredEventDelivered(eventPath, event.reason, "skipped-cancelled", job);
-			continue;
-		}
-		let changed = false;
-		if (job.status === "active") {
-			job.status = "fired";
-			job.firedAt = event.firedAt;
-			job.updatedAt = event.firedAt;
-			job.fireReason = event.reason;
-			changed = true;
-		}
-		if (!jobs.some((candidate) => candidate.id === job.id)) {
-			jobs.push(job);
-			changed = true;
-		}
-		if (changed) await saveJobs();
+		if (!await tryClaimFiredEvent(eventPath, currentSessionFile ?? `${process.pid}`)) continue;
+		let claimed = true;
+		const existingJob = jobs.find((candidate) => candidate.id === event.jobId);
+		const applied = applyFiredEventToJob(existingJob, event);
+		const job = applied.job;
 		try {
+			if (job.status === "cancelled") {
+				await markFiredEventDelivered(eventPath, event.reason, "skipped-cancelled", job);
+				claimed = false;
+				await releaseFiredEventClaim(eventPath);
+				continue;
+			}
+			let changed = applied.changed;
+			if (!jobs.some((candidate) => candidate.id === job.id)) {
+				jobs.push(job);
+				changed = true;
+			}
+			if (changed) await saveJobs();
 			const delivery = job.delivery ?? normalizeDelivery(undefined);
 			// If this delivery pass already queued an auto wake to the parent, do not
 			// immediately fork later same-pass auto events merely because our own wake
@@ -1419,6 +1464,8 @@ async function deliverPendingFiredEvents(pi: ExtensionAPI): Promise<void> {
 		} catch (error) {
 			await markFiredEventDelivered(eventPath, event.reason, "failed", job, error);
 			console.error(`[${EXTENSION_NAME}] Failed to deliver fired event ${eventPath}:`, error);
+		} finally {
+			if (claimed) await releaseFiredEventClaim(eventPath).catch((error) => console.error(`[${EXTENSION_NAME}] Failed to release fired event claim ${eventPath}:`, error));
 		}
 	}
 }
@@ -3130,14 +3177,18 @@ async function fireJob(pi: ExtensionAPI, job: ReturnOnJob, reason: string): Prom
 		job.leafState = {};
 		job.rearmPending = true;
 	}
-	await saveJobs();
-	await appendLifecycleAudit("job_fired", { id: job.id, label: job.label, reason, fireCount: job.fireCount, exhausted, status: job.status, firedAt: job.lastFiredAt, timedOut: reason === "timeout" });
 	let eventPath: string | undefined;
 	try {
+		// Write the durable delivery capsule before persisting the terminal job
+		// state. If the process crashes in this window, startup can replay the
+		// pending capsule and recover the job snapshot instead of leaving a fired
+		// job with no wakeable event.
 		eventPath = await writeFiredEvent(job, reason);
 	} catch (error) {
 		console.error(`[${EXTENSION_NAME}] Failed to write fired event for ${job.id}:`, error);
 	}
+	await saveJobs();
+	await appendLifecycleAudit("job_fired", { id: job.id, label: job.label, reason, fireCount: job.fireCount, exhausted, status: job.status, firedAt: job.lastFiredAt, timedOut: reason === "timeout", eventPath });
 	void sendWebhook(job, reason).catch((error) => {
 		console.error(`[${EXTENSION_NAME}] Webhook failed for ${job.id}:`, error);
 	});

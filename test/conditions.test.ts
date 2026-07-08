@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	applyFiredEventToJob,
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
 	evaluateCondition,
@@ -14,6 +15,7 @@ import {
 	mergeJobsForSave,
 	normalizeCondition,
 	patchFiredEvent,
+	tryClaimFiredEvent,
 	normalizeReturnOnToolParams,
 } from "../src/index.ts";
 
@@ -207,6 +209,31 @@ test("evaluateCondition blocks tampered exec leaves when job.allowExec is not tr
 	assert.equal(result.value, false);
 	assert.match(result.summary, /exec check blocked/);
 	await assert.rejects(fs.stat(marker), /ENOENT/);
+});
+
+test("applyFiredEventToJob preserves re-armed active multi-fire event snapshots", () => {
+	const existing = makeMergeJob("ro_multi", "active", 10);
+	const snapshot = { ...makeMergeJob("ro_multi", "active", 30), maxFires: 3, fireCount: 1, rearmPending: true };
+	const event: any = { job: snapshot };
+	const result = applyFiredEventToJob(existing, event);
+	assert.equal(result.job.status, "active");
+	assert.equal(result.job.fireCount, 1);
+	assert.equal(result.job.rearmPending, true);
+	assert.equal(existing.fireCount, 1);
+});
+
+test("tryClaimFiredEvent allows only one active claimant and reclaims stale claims", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-claim-"));
+	const eventPath = path.join(dir, "ro_claim.json");
+	await fs.writeFile(eventPath, "{}", "utf8");
+	assert.equal(await tryClaimFiredEvent(eventPath, "one", 1_000, 10_000), true);
+	assert.equal(await tryClaimFiredEvent(eventPath, "two", 2_000, 10_000), false);
+	const claimPath = `${eventPath}.claim`;
+	const old = new Date(0);
+	await fs.utimes(claimPath, old, old);
+	assert.equal(await tryClaimFiredEvent(eventPath, "three", 20_000, 1_000), true);
+	const claim = JSON.parse(await fs.readFile(claimPath, "utf8"));
+	assert.equal(claim.owner, "three");
 });
 
 test("patchFiredEvent preserves multi-fire event path and original capsule fields", async () => {
