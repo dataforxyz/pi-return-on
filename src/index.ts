@@ -756,7 +756,8 @@ function formatDirectWaitAudit(entries: DirectWaitAuditEntry[]): string {
 }
 
 async function loadJobs(): Promise<void> {
-	jobs = await readJobsFile();
+	const diskJobs = await readJobsFile();
+	jobs = jobs.length === 0 ? diskJobs : mergeJobsForReload(jobs, diskJobs);
 }
 
 function atomicTempPath(target: string): string {
@@ -802,6 +803,12 @@ export function mergeJobsForSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJo
 		merged.set(job.id, existing ? chooseMergedJob(existing, job) : job);
 	}
 	return [...merged.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+export function mergeJobsForReload(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[]): ReturnOnJob[] {
+	const diskIds = new Set(diskJobs.map((job) => job.id));
+	const liveMemoryJobs = memoryJobs.filter((job) => job.status === "active" || diskIds.has(job.id));
+	return mergeJobsForSave(liveMemoryJobs, diskJobs);
 }
 
 function shouldPruneTerminalJob(job: ReturnOnJob, cutoff: number, protectedJobIds: ReadonlySet<string>): boolean {

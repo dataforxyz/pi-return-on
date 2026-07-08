@@ -10,6 +10,7 @@ import {
 	collectIncomingWebhookTargets,
 	mergeHandlersForSave,
 	mergeJobsForPrunedSave,
+	mergeJobsForReload,
 	mergeJobsForSave,
 	normalizeCondition,
 	patchFiredEvent,
@@ -115,6 +116,22 @@ test("mergeJobsForPrunedSave keeps protected terminal fired events", () => {
 	const protectedTerminal = makeMergeJob("ro_protected", "fired", 50);
 	const merged = mergeJobsForPrunedSave([], [protectedTerminal], 100, ["ro_protected"]);
 	assert.deepEqual(merged.map((job) => job.id), ["ro_protected"]);
+});
+
+test("mergeJobsForReload preserves active in-memory latch progress over stale disk", () => {
+	const disk = makeMergeJob("ro_same", "active", 10);
+	const memory = { ...makeMergeJob("ro_same", "active", 20), latches: { root: { trueAt: 20, summary: "latched" } } };
+	const merged = mergeJobsForReload([memory], [disk]);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].latches.root.summary, "latched");
+});
+
+test("mergeJobsForReload preserves active memory-only jobs but does not resurrect pruned terminal jobs", () => {
+	const memoryActive = makeMergeJob("ro_active", "active", 20);
+	const memoryTerminal = makeMergeJob("ro_old_fired", "fired", 20);
+	const disk = makeMergeJob("ro_disk", "active", 10);
+	const merged = mergeJobsForReload([memoryActive, memoryTerminal], [disk]);
+	assert.deepEqual(merged.map((job) => job.id), ["ro_disk", "ro_active"]);
 });
 
 test("mergeHandlersForSave preserves handler runs added by another process", () => {
