@@ -393,6 +393,7 @@ interface PruneSummary {
 	handlersPruned: number;
 	handlerDirsPruned: number;
 	auditEntriesPruned: number;
+	tmpFilesPruned: number;
 }
 
 interface EvalResult {
@@ -1109,8 +1110,35 @@ function formatPruneSummary(summary: PruneSummary): string {
 		`Jobs pruned: ${summary.jobsPruned}`,
 		`Fired events pruned: ${summary.firedEventsPruned}`,
 		`Handlers pruned: ${summary.handlersPruned}; handler dirs pruned: ${summary.handlerDirsPruned}`,
+		`Temp files pruned: ${summary.tmpFilesPruned}`,
 		`Direct-wait audit entries pruned: ${summary.auditEntriesPruned}`,
 	].join("\n");
+}
+
+export async function pruneTempFiles(dir: string, cutoff: number, dryRun: boolean): Promise<number> {
+	let entries: fs.Dirent[];
+	try {
+		entries = await fsp.readdir(dir, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+		throw error;
+	}
+	let pruned = 0;
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".tmp")) continue;
+		const filePath = path.join(dir, entry.name);
+		let stat: fs.Stats;
+		try {
+			stat = await fsp.stat(filePath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (stat.mtimeMs >= cutoff) continue;
+		pruned += 1;
+		if (!dryRun) await fsp.rm(filePath, { force: true });
+	}
+	return pruned;
 }
 
 async function pruneDirectWaitAudit(cutoff: number, maxEntries: number, dryRun: boolean): Promise<number> {
@@ -1207,8 +1235,9 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		handlerDirsPruned = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id) && isPathInside(HANDLERS_DIR, run.dir)).length;
 	}
 
+	const tmpFilesPruned = await pruneTempFiles(STATE_DIR, cutoff, dryRun) + await pruneTempFiles(FIRED_DIR, cutoff, dryRun);
 	const auditEntriesPruned = await pruneDirectWaitAudit(cutoff, auditMaxEntries, dryRun);
-	return { dryRun, retentionMs, auditMaxEntries, jobsPruned, firedEventsPruned, handlersPruned, handlerDirsPruned, auditEntriesPruned };
+	return { dryRun, retentionMs, auditMaxEntries, jobsPruned, firedEventsPruned, handlersPruned, handlerDirsPruned, auditEntriesPruned, tmpFilesPruned };
 }
 
 function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
@@ -2639,6 +2668,11 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 				// Otherwise the watcher would deadlock in rearmPending and never re-fire.
 				const result = await evaluateCondition(job, job.condition, "root", !job.rearmPending);
 				if (JSON.stringify(job.leafState) !== previousLeafState) changed = true;
+				if (job.status === "active" && job.timeoutAt && Date.now() >= job.timeoutAt) {
+					await fireJob(pi, job, "timeout");
+					changed = true;
+					continue;
+				}
 				if (result.value) {
 					if (job.rearmPending) {
 						// After a fire, require the condition to evaluate false at least

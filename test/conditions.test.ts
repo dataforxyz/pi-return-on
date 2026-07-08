@@ -15,6 +15,7 @@ import {
 	mergeJobsForSave,
 	normalizeCondition,
 	patchFiredEvent,
+	pruneTempFiles,
 	readResponseTextLimited,
 	requestContentLengthExceedsLimit,
 	tryClaimFiredEvent,
@@ -264,6 +265,20 @@ test("patchFiredEvent preserves multi-fire event path and original capsule field
 	assert.equal(onDisk.job.fireCount, 2);
 	assert.equal(onDisk.deliveryStatus, "wake-sent");
 	assert.equal(onDisk.deliveredAt, 120);
+});
+
+test("pruneTempFiles removes only stale atomic write remnants", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prune-tmp-"));
+	const staleTmp = path.join(dir, "jobs.json.1.2.tmp");
+	const freshTmp = path.join(dir, "handlers.json.1.2.tmp");
+	const ordinary = path.join(dir, "keep.txt");
+	await fs.writeFile(staleTmp, "stale");
+	await fs.writeFile(freshTmp, "fresh");
+	await fs.writeFile(ordinary, "ordinary");
+	await fs.utimes(staleTmp, 1, 1);
+	const cutoff = Date.now() - 1_000;
+	assert.equal(await pruneTempFiles(dir, cutoff, false), 1);
+	assert.deepEqual((await fs.readdir(dir)).sort(), ["handlers.json.1.2.tmp", "keep.txt"]);
 });
 
 test("normalizeCondition: file requires non-empty path", () => {
