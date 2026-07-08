@@ -53,6 +53,7 @@ const DEFAULT_PORT_TIMEOUT_MS = 1000;
 const DEFAULT_URL_TIMEOUT_MS = 5000;
 const MAX_URL_TIMEOUT_MS = 30_000;
 const MAX_URL_BODY_BYTES = 64 * 1024;
+const INCOMING_WEBHOOK_BODY_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_WEBHOOK_HOST = process.env.PI_RETURN_ON_WEBHOOK_HOST || "127.0.0.1";
 const DEFAULT_WEBHOOK_PORT = Number.parseInt(process.env.PI_RETURN_ON_WEBHOOK_PORT || "0", 10) || 0;
 const DEFAULT_RETURN_ON_TIMEOUT_MS = 10 * 60_000;
@@ -2505,18 +2506,36 @@ async function ensureIncomingWebhookServer(pi: ExtensionAPI): Promise<void> {
 	}
 }
 
-function readRequestBody(req: http.IncomingMessage, limit = 64 * 1024): Promise<string> {
+class RequestBodyTooLargeError extends Error {
+	constructor() {
+		super("request body too large");
+		this.name = "RequestBodyTooLargeError";
+	}
+}
+
+export function requestContentLengthExceedsLimit(headers: http.IncomingHttpHeaders, limit = INCOMING_WEBHOOK_BODY_LIMIT_BYTES): boolean {
+	const raw = headers["content-length"];
+	const value = Array.isArray(raw) ? raw[0] : raw;
+	if (value === undefined) return false;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed > limit;
+}
+
+function readRequestBody(req: http.IncomingMessage, limit = INCOMING_WEBHOOK_BODY_LIMIT_BYTES): Promise<string> {
 	return new Promise((resolve, reject) => {
 		let body = "";
+		let tooLarge = false;
 		req.on("data", (chunk) => {
+			if (tooLarge) return;
 			body += chunk.toString();
 			if (Buffer.byteLength(body) > limit) {
-				reject(new Error("request body too large"));
+				tooLarge = true;
+				reject(new RequestBodyTooLargeError());
 				req.destroy();
 			}
 		});
-		req.on("end", () => resolve(body));
-		req.on("error", reject);
+		req.on("end", () => { if (!tooLarge) resolve(body); });
+		req.on("error", (error) => { if (!tooLarge) reject(error); });
 	});
 }
 
@@ -2524,14 +2543,29 @@ async function handleIncomingWebhook(pi: ExtensionAPI, req: http.IncomingMessage
 	try {
 		const base = getIncomingWebhookBaseUrl() ?? `http://${DEFAULT_WEBHOOK_HOST}:0`;
 		const url = new URL(req.url ?? "/", base);
-		const body = await readRequestBody(req);
 		const candidates = activeJobsForCurrentSession().flatMap((job) => collectIncomingWebhookTargets(job));
-		const matches = candidates.filter((target) => {
+		const token = url.searchParams.get("token") ?? req.headers["x-return-on-token"] ?? req.headers.authorization?.replace(/^Bearer\s+/i, "");
+		const prelimMatches = candidates.filter((target) => {
 			const condition = target.condition;
 			if ((condition.method ?? "POST").toUpperCase() !== (req.method ?? "GET").toUpperCase()) return false;
 			if ((condition.path ?? "/return-on") !== url.pathname) return false;
-			const token = url.searchParams.get("token") ?? req.headers["x-return-on-token"] ?? req.headers.authorization?.replace(/^Bearer\s+/i, "");
 			if (condition.token && token !== condition.token) return false;
+			return true;
+		});
+		if (prelimMatches.length === 0) {
+			res.writeHead(404, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: false, error: "no matching active return_on webhook" }));
+			return;
+		}
+		if (requestContentLengthExceedsLimit(req.headers)) {
+			res.writeHead(413, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: false, error: "request body too large" }));
+			return;
+		}
+		const needsBody = prelimMatches.some((target) => target.condition.bodyContains !== undefined || target.condition.bodyMatches !== undefined);
+		const body = needsBody ? await readRequestBody(req) : "";
+		const matches = prelimMatches.filter((target) => {
+			const condition = target.condition;
 			if (condition.bodyContains !== undefined && !body.includes(condition.bodyContains)) return false;
 			if (condition.bodyMatches !== undefined && !new RegExp(condition.bodyMatches).test(body)) return false;
 			return true;
@@ -2555,7 +2589,8 @@ async function handleIncomingWebhook(pi: ExtensionAPI, req: http.IncomingMessage
 		res.writeHead(202, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: true, matched: matches.map((target) => target.jobId) }));
 	} catch (error) {
-		res.writeHead(500, { "content-type": "application/json" });
+		const status = error instanceof RequestBodyTooLargeError ? 413 : 500;
+		res.writeHead(status, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
 	}
 }

@@ -16,6 +16,7 @@ import {
 	normalizeCondition,
 	patchFiredEvent,
 	readResponseTextLimited,
+	requestContentLengthExceedsLimit,
 	tryClaimFiredEvent,
 	normalizeReturnOnToolParams,
 } from "../src/index.ts";
@@ -279,6 +280,12 @@ test("normalizeCondition: url conditions require http or https", () => {
 test("readResponseTextLimited caps url response bodies", async () => {
 	const response = new Response("abcdef");
 	assert.equal(await readResponseTextLimited(response, 3), "abc\n[truncated 3 bytes]");
+});
+
+test("requestContentLengthExceedsLimit detects over-limit webhook bodies", () => {
+	assert.equal(requestContentLengthExceedsLimit({ "content-length": "65537" }, 65536), true);
+	assert.equal(requestContentLengthExceedsLimit({ "content-length": "65536" }, 65536), false);
+	assert.equal(requestContentLengthExceedsLimit({ "content-length": "not-a-number" }, 65536), false);
 });
 
 test("normalizeCondition: webhook path must start with /", () => {
