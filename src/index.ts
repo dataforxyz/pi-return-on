@@ -957,6 +957,20 @@ async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partia
 	return eventPath;
 }
 
+export async function patchFiredEvent(eventPath: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "lastAttemptAt" | "handlerRunId" | "error">>): Promise<FiredEventState> {
+	const existing = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
+	if (existing?.event !== "return_on.fired") throw new Error(`Invalid fired event: ${eventPath}`);
+	const event: FiredEventState = {
+		...existing,
+		...updates,
+		...(updates.deliveryStatus === "failed" ? { deliveredAt: undefined } : {}),
+	};
+	const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
+	await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
+	await fsp.rename(tmp, eventPath);
+	return event;
+}
+
 async function readFiredEventFiles(): Promise<Array<{ path: string; event: FiredEventState }>> {
 	let entries: fs.Dirent[];
 	try {
@@ -1338,16 +1352,13 @@ async function drainReturnOnBackgroundQueueLoop(pi: ExtensionAPI, reason: string
 
 async function markFiredEventDelivered(eventPath: string, reason: string, status: FiredEventDeliveryStatus, job: ReturnOnJob, error?: unknown): Promise<void> {
 	const now = Date.now();
-	await writeFiredEvent(job, reason, {
+	await patchFiredEvent(eventPath, {
 		deliveryStatus: status,
 		lastAttemptAt: now,
 		...(status === "failed" ? {} : { deliveredAt: now }),
 		...(job.handlerRunId ? { handlerRunId: job.handlerRunId } : {}),
 		...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
 	});
-	if (eventPath !== firedEventPath(job.id)) {
-		await fsp.rm(eventPath, { force: true });
-	}
 	await appendLifecycleAudit("delivery_marked", { jobId: job.id, label: job.label, reason, status, eventPath, handlerRunId: job.handlerRunId, error: error instanceof Error ? error.message : error ? String(error) : undefined });
 }
 

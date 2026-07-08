@@ -12,6 +12,7 @@ import {
 	mergeJobsForPrunedSave,
 	mergeJobsForSave,
 	normalizeCondition,
+	patchFiredEvent,
 	normalizeReturnOnToolParams,
 } from "../src/index.ts";
 
@@ -189,6 +190,34 @@ test("evaluateCondition blocks tampered exec leaves when job.allowExec is not tr
 	assert.equal(result.value, false);
 	assert.match(result.summary, /exec check blocked/);
 	await assert.rejects(fs.stat(marker), /ENOENT/);
+});
+
+test("patchFiredEvent preserves multi-fire event path and original capsule fields", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-fired-event-"));
+	const eventPath = path.join(dir, "ro_multi.2.json");
+	const job = { ...makeMergeJob("ro_multi", "active", 90), maxFires: 3, fireCount: 2 };
+	const original = {
+		version: 1,
+		event: "return_on.fired",
+		id: "ro_multi",
+		jobId: "ro_multi",
+		label: "multi",
+		reason: "second fire",
+		createdAt: 10,
+		firedAt: 100,
+		cwd: dir,
+		resume: "resume",
+		job,
+		deliveryStatus: "pending",
+	};
+	await fs.writeFile(eventPath, `${JSON.stringify(original, null, 2)}\n`, "utf8");
+	const patched = await patchFiredEvent(eventPath, { deliveryStatus: "wake-sent", deliveredAt: 120, lastAttemptAt: 120 });
+	const onDisk = JSON.parse(await fs.readFile(eventPath, "utf8"));
+	assert.equal(patched.firedAt, 100);
+	assert.equal(onDisk.reason, "second fire");
+	assert.equal(onDisk.job.fireCount, 2);
+	assert.equal(onDisk.deliveryStatus, "wake-sent");
+	assert.equal(onDisk.deliveredAt, 120);
 });
 
 test("normalizeCondition: file requires non-empty path", () => {
