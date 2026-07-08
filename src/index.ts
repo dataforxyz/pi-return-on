@@ -1993,7 +1993,7 @@ function matchingFileLines(text: string, condition: FileCondition): Array<{ line
 	return result;
 }
 
-async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root", latchLeaves = true): Promise<EvalResult> {
+export async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "root", latchLeaves = true): Promise<EvalResult> {
 	if (isGroupCondition(condition)) {
 		const op = condition.op;
 		const children = condition.children;
@@ -2018,7 +2018,9 @@ async function evaluateCondition(job: ReturnOnJob, condition: Condition, key = "
 	let result: EvalResult;
 	if (condition.type === "timer") result = evaluateTimer(job, condition);
 	else if (condition.type === "file") result = await evaluateFile(job, condition, key);
-	else if (condition.type === "exec") result = await evaluateExec(job, condition, key);
+	else if (condition.type === "exec") result = job.allowExec === true
+		? await evaluateExec(job, condition, key)
+		: { value: false, summary: "exec check blocked: job allowExec is not true", details: { blocked: true } };
 	else if (condition.type === "process") result = await evaluateProcess(job, condition, key);
 	else if (condition.type === "port") result = await evaluatePort(job, condition, key);
 	else if (condition.type === "url") result = await evaluateUrl(job, condition, key);

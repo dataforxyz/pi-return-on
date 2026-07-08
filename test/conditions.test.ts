@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
+	evaluateCondition,
 	collectIncomingWebhookTargets,
 	mergeHandlersForSave,
 	mergeJobsForPrunedSave,
@@ -176,6 +179,16 @@ test("normalizeCondition: exec command argv arrays become shell-safe command str
 	const c = normalizeCondition({ exec: { command: ["bash", "/tmp/watch pr.sh"] } }) as any;
 	assert.equal(c.type, "exec");
 	assert.equal(c.command, "bash '/tmp/watch pr.sh'");
+});
+
+test("evaluateCondition blocks tampered exec leaves when job.allowExec is not true", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-exec-block-"));
+	const marker = path.join(dir, "marker");
+	const job = { ...makeJob({ type: "timer", after: "1m" }), cwd: dir, allowExec: false };
+	const result = await evaluateCondition(job, normalizeCondition({ type: "exec", command: `touch ${JSON.stringify(marker)}` }), "root", false);
+	assert.equal(result.value, false);
+	assert.match(result.summary, /exec check blocked/);
+	await assert.rejects(fs.stat(marker), /ENOENT/);
 });
 
 test("normalizeCondition: file requires non-empty path", () => {
