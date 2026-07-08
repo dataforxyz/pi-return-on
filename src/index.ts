@@ -456,6 +456,7 @@ let ticking = false;
 let backgroundQueueDrainActive = false;
 let backgroundQueueDrainPending = false;
 let backgroundQueueDrainTimer: ReturnType<typeof setTimeout> | undefined;
+let shuttingDown = false;
 const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
 const STARTING_HANDLER_WITH_SESSION_STALE_MS = 2 * 60 * 60 * 1000;
 let savingJobs = false;
@@ -1372,11 +1373,13 @@ async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
 }
 
 function kickReturnOnBackgroundQueueDrain(pi: ExtensionAPI, reason: string): void {
+	if (shuttingDown) return;
 	if (backgroundQueueDrainTimer) {
 		backgroundQueueDrainPending = true;
 		return;
 	}
 	backgroundQueueDrainTimer = setTimeout(() => {
+		if (shuttingDown) return;
 		void drainReturnOnBackgroundQueueLoop(pi, reason);
 	}, 0);
 	backgroundQueueDrainTimer.unref?.();
@@ -1384,6 +1387,7 @@ function kickReturnOnBackgroundQueueDrain(pi: ExtensionAPI, reason: string): voi
 
 async function drainReturnOnBackgroundQueueLoop(pi: ExtensionAPI, reason: string): Promise<void> {
 	backgroundQueueDrainTimer = undefined;
+	if (shuttingDown) return;
 	if (backgroundQueueDrainActive) {
 		backgroundQueueDrainPending = true;
 		return;
@@ -1670,6 +1674,7 @@ async function startJobsStateWatcher(pi: ExtensionAPI): Promise<void> {
 			if (eventType !== "rename" && eventType !== "change") return;
 			scheduleJobsStateReload(pi);
 		});
+		jobsStateWatcher.unref?.();
 		jobsStateWatcher.on("error", (error) => {
 			console.error(`[${EXTENSION_NAME}] Jobs state watcher failed:`, error);
 			stopJobsStateWatcher();
@@ -1924,7 +1929,7 @@ export function normalizeCondition(input: unknown): Condition {
 	}
 	if (conditionInput.type === "webhook") {
 		if (conditionInput.path !== undefined && (typeof conditionInput.path !== "string" || !conditionInput.path.startsWith("/"))) throw new Error("webhook condition path must start with '/'");
-		if (conditionInput.token !== undefined && typeof conditionInput.token !== "string") throw new Error("webhook condition token must be a string");
+		if (conditionInput.token !== undefined && (typeof conditionInput.token !== "string" || !conditionInput.token.trim())) throw new Error("webhook condition token must be a non-empty string");
 		if (conditionInput.method !== undefined && typeof conditionInput.method !== "string") throw new Error("webhook condition method must be a string");
 		return conditionInput as IncomingWebhookCondition;
 	}
@@ -1992,6 +1997,7 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 				}
 				requestImmediateTick(pi);
 			});
+			watcher.unref?.();
 			watcher.on("error", () => {
 				watcher.close();
 				fileWatchers.delete(dir);
@@ -2448,10 +2454,15 @@ async function ensureIncomingWebhookServer(pi: ExtensionAPI): Promise<void> {
 		const server = http.createServer((req, res) => {
 			void handleIncomingWebhook(pi, req, res);
 		});
-		server.once("error", reject);
+		const onError = (error: Error) => {
+			if (incomingWebhookServer === server) incomingWebhookServer = undefined;
+			reject(error);
+		};
+		server.unref?.();
+		incomingWebhookServer = server;
+		server.once("error", onError);
 		server.listen(DEFAULT_WEBHOOK_PORT, DEFAULT_WEBHOOK_HOST, () => {
-			incomingWebhookServer = server;
-			server.off("error", reject);
+			server.off("error", onError);
 			resolve();
 		});
 	});
@@ -4237,6 +4248,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
 		latestCtx = ctx;
 		piForksExtensionEnabled(pi);
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
@@ -4267,11 +4279,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		agentTurnActive = false;
 		stopTicker();
 		stopJobsStateWatcher();
 		stopFileWatchers();
 		stopIncomingWebhookServer();
+		if (backgroundQueueDrainTimer) clearTimeout(backgroundQueueDrainTimer);
+		backgroundQueueDrainTimer = undefined;
+		backgroundQueueDrainPending = false;
 		if (immediateTickTimer) clearTimeout(immediateTickTimer);
 		immediateTickTimer = undefined;
 		latestCtx = undefined;

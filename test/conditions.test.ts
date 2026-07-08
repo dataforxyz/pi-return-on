@@ -274,6 +274,11 @@ test("normalizeCondition: webhook path must start with /", () => {
 	assert.equal(c.path, "/hook");
 });
 
+test("normalizeCondition: webhook token must be non-empty when provided", () => {
+	assert.throws(() => normalizeCondition({ type: "webhook", path: "/hook", token: "" }), /webhook condition token must be a non-empty string/);
+	assert.throws(() => normalizeCondition({ type: "webhook", path: "/hook", token: "   " }), /webhook condition token must be a non-empty string/);
+});
+
 test("normalizeCondition: unknown type throws", () => {
 	assert.throws(() => normalizeCondition({ type: "nope" }), /unsupported condition type/);
 });
