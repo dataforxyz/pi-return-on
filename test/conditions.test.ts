@@ -3,22 +3,31 @@ import test from "node:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import {
 	applyFiredEventToJob,
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
 	evaluateCondition,
+	firedEventNeedsJobProtection,
 	collectIncomingWebhookTargets,
 	mergeHandlersForSave,
 	mergeJobsForPrunedSave,
 	mergeJobsForReload,
 	mergeJobsForSave,
+	jobEvaluationPersistenceKey,
+	jobsNeedProtectionLookup,
 	normalizeCondition,
 	patchFiredEvent,
 	pruneTempFiles,
 	readResponseTextLimited,
 	requestContentLengthExceedsLimit,
+	releaseFiredEventClaim,
+	retainBoundedJobs,
+	revisionMarkerIsCurrent,
 	tryClaimFiredEvent,
+	withJobsFileLock,
+	withJobsFileLockRetry,
 	normalizeReturnOnToolParams,
 } from "../src/index.ts";
 
@@ -70,11 +79,21 @@ function makeHandler(id: string, status: "starting" | "running" | "complete" | "
 test("mergeJobsForSave preserves jobs added by another process", () => {
 	const disk = makeMergeJob("ro_disk", "active", 10);
 	const memory = makeMergeJob("ro_memory", "active", 20);
-	assert.deepEqual(mergeJobsForSave([memory], [disk]).map((job) => job.id), ["ro_disk", "ro_memory"]);
+	assert.deepEqual(mergeJobsForSave([memory], [disk], [], [memory.id]).map((job) => job.id), ["ro_disk", "ro_memory"]);
+});
+
+test("mergeJobsForSave does not resurrect a terminal job absent from disk", () => {
+	const staleTerminal = makeMergeJob("ro_pruned", "fired", 20);
+	assert.deepEqual(mergeJobsForSave([staleTerminal], []), []);
+});
+
+test("mergeJobsForSave restores a missing terminal job only when pending delivery protects it", () => {
+	const pendingTerminal = makeMergeJob("ro_pending", "fired", 20);
+	assert.deepEqual(mergeJobsForSave([pendingTerminal], [], [pendingTerminal.id]).map((job) => job.id), [pendingTerminal.id]);
 });
 
 test("mergeJobsForSave does not resurrect terminal jobs from stale active memory", () => {
-	const staleActive = makeMergeJob("ro_same", "active", 10);
+	const staleActive = { ...makeMergeJob("ro_same", "active", 10), updatedAt: 1_000_000, leafState: { root: { lastCheckAt: 1_000_000, lastValue: false } } };
 	const diskFired = makeMergeJob("ro_same", "fired", 20);
 	const merged = mergeJobsForSave([staleActive], [diskFired]);
 	assert.equal(merged.length, 1);
@@ -89,6 +108,13 @@ test("mergeJobsForSave preserves newer re-armed active job over stale terminal c
 	assert.equal(merged.length, 1);
 	assert.equal(merged[0].status, "active");
 	assert.equal(merged[0].fireCount, 1);
+});
+
+test("mergeJobsForSave never lets stale multi-fire active state override cancellation", () => {
+	const cancelled = { ...makeMergeJob("ro_same", "cancelled", 20), fireCount: 1 };
+	const staleActive = { ...makeMergeJob("ro_same", "active", 1_000), maxFires: 3, fireCount: 1, lastFiredAt: 30, rearmPending: true };
+	const merged = mergeJobsForSave([staleActive], [cancelled]);
+	assert.equal(merged[0].status, "cancelled");
 });
 
 test("mergeJobsForSave keeps the newer active copy", () => {
@@ -123,6 +149,30 @@ test("mergeJobsForPrunedSave keeps protected terminal fired events", () => {
 	assert.deepEqual(merged.map((job) => job.id), ["ro_protected"]);
 });
 
+test("retainBoundedJobs caps thousands of terminal jobs while preserving active and protected jobs", () => {
+	const terminal = Array.from({ length: 4_000 }, (_, index) => makeMergeJob(`ro_terminal_${index}`, "fired", index + 1));
+	const active = makeMergeJob("ro_active", "active", 5_000);
+	const protectedOld = makeMergeJob("ro_protected_old", "fired", 1);
+	const retained = retainBoundedJobs([...terminal, active, protectedOld], 0, 500, [protectedOld.id]);
+	assert.equal(retained.filter((job) => job.status !== "active" && job.id !== protectedOld.id).length, 500);
+	assert.equal(retained.some((job) => job.id === active.id), true);
+	assert.equal(retained.some((job) => job.id === protectedOld.id), true);
+	assert.equal(retained.some((job) => job.id === "ro_terminal_3999"), true);
+	assert.equal(retained.some((job) => job.id === "ro_terminal_0"), false);
+});
+
+test("retainBoundedJobs applies age retention before the count bound", () => {
+	const old = makeMergeJob("ro_old", "cancelled", 50);
+	const recent = makeMergeJob("ro_recent", "fired", 150);
+	assert.deepEqual(retainBoundedJobs([old, recent], 100, 500).map((job) => job.id), [recent.id]);
+});
+
+test("jobsNeedProtectionLookup counts unique terminal ids across memory and disk", () => {
+	const terminal = Array.from({ length: 500 }, (_, index) => makeMergeJob(`ro_terminal_${index}`, "fired", 1_000 + index));
+	assert.equal(jobsNeedProtectionLookup(terminal, structuredClone(terminal), 0, 500), false);
+	assert.equal(jobsNeedProtectionLookup([...terminal, makeMergeJob("ro_extra", "fired", 2_000)], terminal, 0, 500), true);
+});
+
 test("mergeJobsForReload preserves active in-memory latch progress over stale disk", () => {
 	const disk = makeMergeJob("ro_same", "active", 10);
 	const memory = { ...makeMergeJob("ro_same", "active", 20), latches: { root: { trueAt: 20, summary: "latched" } } };
@@ -131,12 +181,13 @@ test("mergeJobsForReload preserves active in-memory latch progress over stale di
 	assert.equal(merged[0].latches.root.summary, "latched");
 });
 
-test("mergeJobsForReload preserves active memory-only jobs but does not resurrect pruned terminal jobs", () => {
-	const memoryActive = makeMergeJob("ro_active", "active", 20);
+test("mergeJobsForReload preserves explicit unsaved inserts but does not resurrect absent stale jobs", () => {
+	const memoryInsert = makeMergeJob("ro_insert", "active", 20);
+	const staleActive = makeMergeJob("ro_stale_active", "active", 30);
 	const memoryTerminal = makeMergeJob("ro_old_fired", "fired", 20);
 	const disk = makeMergeJob("ro_disk", "active", 10);
-	const merged = mergeJobsForReload([memoryActive, memoryTerminal], [disk]);
-	assert.deepEqual(merged.map((job) => job.id), ["ro_disk", "ro_active"]);
+	const merged = mergeJobsForReload([memoryInsert, staleActive, memoryTerminal], [disk], [memoryInsert.id]);
+	assert.deepEqual(merged.map((job) => job.id), ["ro_disk", "ro_insert"]);
 });
 
 test("mergeHandlersForSave preserves handler runs added by another process", () => {
@@ -204,6 +255,95 @@ test("normalizeCondition: exec command argv arrays become shell-safe command str
 	assert.equal(c.command, "bash '/tmp/watch pr.sh'");
 });
 
+test("jobEvaluationPersistenceKey ignores observation-only poll metadata", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-semantic-poll-"));
+	const job = { ...makeJob({ type: "file", path: "missing", contains: "READY", every: 1 }), cwd: dir };
+	await evaluateCondition(job, job.condition, "root", false);
+	const firstKey = jobEvaluationPersistenceKey(job);
+	const firstCheckAt = job.leafState.root.lastCheckAt;
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	await evaluateCondition(job, job.condition, "root", false);
+	assert.equal(jobEvaluationPersistenceKey(job), firstKey);
+	assert.notEqual(job.leafState.root.lastCheckAt, firstCheckAt);
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("revisionMarkerIsCurrent detects the jobs-rename-before-marker crash window", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-revision-window-"));
+	const jobsFile = path.join(dir, "jobs.json");
+	const revisionFile = path.join(dir, "jobs.revision");
+	await fs.writeFile(jobsFile, "{}", "utf8");
+	await fs.writeFile(revisionFile, "old\n", "utf8");
+	const old = new Date(1_000);
+	const newer = new Date(2_000);
+	await fs.utimes(revisionFile, old, old);
+	await fs.utimes(jobsFile, newer, newer);
+	assert.equal(await revisionMarkerIsCurrent("old", jobsFile, revisionFile), false);
+	await fs.utimes(revisionFile, newer, newer);
+	assert.equal(await revisionMarkerIsCurrent("old", jobsFile, revisionFile), true);
+	assert.equal(await revisionMarkerIsCurrent("different", jobsFile, revisionFile), false);
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("withJobsFileLock serializes concurrent writers and does not steal a live lock", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-flock-"));
+	const lockFile = path.join(dir, "jobs.lock");
+	let releaseFirst!: () => void;
+	let firstAcquired!: () => void;
+	const acquired = new Promise<void>((resolve) => { firstAcquired = resolve; });
+	const hold = new Promise<void>((resolve) => { releaseFirst = resolve; });
+	const first = withJobsFileLock(async () => {
+		firstAcquired();
+		await hold;
+	}, lockFile, 1_000);
+	await acquired;
+	await assert.rejects(withJobsFileLock(async () => undefined, lockFile, 50), /Timed out acquiring/);
+	releaseFirst();
+	await first;
+	let counter = 0;
+	await Promise.all(Array.from({ length: 8 }, () => withJobsFileLock(async () => {
+		const observed = counter;
+		await new Promise((resolve) => setTimeout(resolve, 2));
+		counter = observed + 1;
+	}, lockFile, 2_000)));
+	assert.equal(counter, 8);
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("withJobsFileLockRetry acquires after transient contention", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-flock-retry-"));
+	const lockFile = path.join(dir, "jobs.lock");
+	let releaseFirst!: () => void;
+	let firstAcquired!: () => void;
+	const acquired = new Promise<void>((resolve) => { firstAcquired = resolve; });
+	const hold = new Promise<void>((resolve) => { releaseFirst = resolve; });
+	const first = withJobsFileLock(async () => {
+		firstAcquired();
+		await hold;
+	}, lockFile, 1_000);
+	await acquired;
+	setTimeout(releaseFirst, 80);
+	let retried = false;
+	await withJobsFileLockRetry(async () => { retried = true; }, lockFile, 30, 4, 10);
+	assert.equal(retried, true);
+	await first;
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("withJobsFileLock recovers after a dead lock owner", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-flock-dead-"));
+	const lockFile = path.join(dir, "jobs.lock");
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn("flock", ["-x", lockFile, "sh", "-c", "kill -9 $$"]);
+		child.once("error", reject);
+		child.once("close", () => resolve());
+	});
+	let acquired = false;
+	await withJobsFileLock(async () => { acquired = true; }, lockFile, 1_000);
+	assert.equal(acquired, true);
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("evaluateCondition blocks tampered exec leaves when job.allowExec is not true", async () => {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-exec-block-"));
 	const marker = path.join(dir, "marker");
@@ -212,6 +352,16 @@ test("evaluateCondition blocks tampered exec leaves when job.allowExec is not tr
 	assert.equal(result.value, false);
 	assert.match(result.summary, /exec check blocked/);
 	await assert.rejects(fs.stat(marker), /ENOENT/);
+});
+
+test("firedEventNeedsJobProtection preserves pending delivery but releases completed handlers", () => {
+	const base: any = { deliveryStatus: "wake-sent", deliveredAt: 10 };
+	assert.equal(firedEventNeedsJobProtection({ ...base, deliveryStatus: "pending", deliveredAt: undefined }, new Set()), true);
+	assert.equal(firedEventNeedsJobProtection({ ...base, deliveryStatus: "failed" }, new Set()), true);
+	assert.equal(firedEventNeedsJobProtection({ ...base, deliveryStatus: "queued" }, new Set()), true);
+	assert.equal(firedEventNeedsJobProtection({ ...base, deliveryStatus: "handler-launched", handlerRunId: "run_active" }, new Set(["run_active"])), true);
+	assert.equal(firedEventNeedsJobProtection({ ...base, deliveryStatus: "handler-launched", handlerRunId: "run_complete" }, new Set()), false);
+	assert.equal(firedEventNeedsJobProtection(base, new Set()), false);
 });
 
 test("applyFiredEventToJob preserves re-armed active multi-fire event snapshots", () => {
@@ -230,13 +380,25 @@ test("tryClaimFiredEvent allows only one active claimant and reclaims stale clai
 	const eventPath = path.join(dir, "ro_claim.json");
 	await fs.writeFile(eventPath, "{}", "utf8");
 	assert.equal(await tryClaimFiredEvent(eventPath, "one", 1_000, 10_000), true);
-	assert.equal(await tryClaimFiredEvent(eventPath, "two", 2_000, 10_000), false);
 	const claimPath = `${eventPath}.claim`;
+	const firstClaim = JSON.parse(await fs.readFile(claimPath, "utf8"));
+	assert.equal(await tryClaimFiredEvent(eventPath, "two", 2_000, 10_000), false);
 	const old = new Date(0);
 	await fs.utimes(claimPath, old, old);
 	assert.equal(await tryClaimFiredEvent(eventPath, "three", 20_000, 1_000), true);
-	const claim = JSON.parse(await fs.readFile(claimPath, "utf8"));
+	let claim = JSON.parse(await fs.readFile(claimPath, "utf8"));
 	assert.equal(claim.owner, "three");
+	await releaseFiredEventClaim(eventPath, firstClaim.token);
+	claim = JSON.parse(await fs.readFile(claimPath, "utf8"));
+	assert.equal(claim.owner, "three");
+	await fs.utimes(claimPath, old, old);
+	const reclaimed = await Promise.all([
+		tryClaimFiredEvent(eventPath, "four", 30_000, 1_000),
+		tryClaimFiredEvent(eventPath, "five", 30_000, 1_000),
+	]);
+	assert.equal(reclaimed.filter(Boolean).length, 1);
+	claim = JSON.parse(await fs.readFile(claimPath, "utf8"));
+	assert.equal(["four", "five"].includes(claim.owner), true);
 });
 
 test("patchFiredEvent preserves multi-fire event path and original capsule fields", async () => {

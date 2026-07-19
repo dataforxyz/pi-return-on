@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as net from "node:net";
 
 function getFreePort(): Promise<number> {
@@ -344,6 +345,58 @@ async function testDirectWaitPolicy(harness: Harness) {
   if (!notification.includes("Direct-wait audit") || !notification.includes("allowed_short_sleep") || !notification.includes("blocked")) {
     throw new Error(`direct wait audit command did not summarize entries: ${notification}`);
   }
+}
+
+async function testNoOpPollingDoesNotRewriteJobs(harness: Harness) {
+  const jobsPath = path.join(stateDir, "jobs.json");
+  const revisionPath = path.join(stateDir, "jobs.revision");
+  const jobId = await harness.register({
+    label: "smoke no-op polling",
+    condition: { type: "file", path: "never-created-noop-poll", contains: "READY", every: "100ms" },
+    timeout: "30s",
+    resume: "no-op polling resume",
+  });
+  await sleep(2_200);
+  const firstJobsStat = await fs.stat(jobsPath);
+  const firstRevision = await fs.readFile(revisionPath, "utf8");
+  await sleep(2_200);
+  const secondJobsStat = await fs.stat(jobsPath);
+  const secondRevision = await fs.readFile(revisionPath, "utf8");
+  if (secondJobsStat.mtimeMs !== firstJobsStat.mtimeMs || secondRevision !== firstRevision) {
+    throw new Error(`no-op polling rewrote jobs state: mtime ${firstJobsStat.mtimeMs} -> ${secondJobsStat.mtimeMs}`);
+  }
+  await harness.cancel(jobId);
+}
+
+async function testDelayedEvaluationSurvivesInterleavedSave(harness: Harness) {
+  const marker = path.join(cwd, "delayed-evaluation-started");
+  const command = `node -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setTimeout(() => process.exit(1), 500)`)}`;
+  const evaluatedJobId = await harness.register({
+    label: "smoke delayed evaluation interleave",
+    condition: { type: "exec", command, success: true, every: "2s" },
+    allowExec: true,
+    timeout: "30s",
+    resume: "delayed evaluation resume",
+  });
+  const markerDeadline = Date.now() + 3_000;
+  while (Date.now() < markerDeadline) {
+    if (await fs.access(marker).then(() => true, () => false)) break;
+    await sleep(25);
+  }
+  if (!await fs.access(marker).then(() => true, () => false)) throw new Error("delayed exec evaluation did not start");
+  const interleavedJobId = await harness.register({
+    label: "smoke interleaved registration",
+    condition: { type: "timer", after: "30s" },
+    resume: "interleaved registration resume",
+  });
+  await sleep(1_000);
+  const savedJobs = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8").then((text) => text)).jobs as any[];
+  const evaluatedJob = savedJobs.find((job) => job.id === evaluatedJobId);
+  if (evaluatedJob?.leafState?.root?.lastValue !== false) {
+    throw new Error(`interleaved save lost delayed evaluation state: ${JSON.stringify(evaluatedJob?.leafState)}`);
+  }
+  await harness.cancel(evaluatedJobId);
+  await harness.cancel(interleavedJobId);
 }
 
 async function testTimer(harness: Harness) {
@@ -1803,6 +1856,10 @@ async function testPendingFiredEventDelivery() {
     job: firedJob,
     deliveryStatus: "pending",
   }, null, 2), "utf8");
+  const jobsWithoutPending = jobsState.jobs.filter((candidate: any) => candidate.id !== jobId);
+  const jobsRevision = createHash("sha256").update(JSON.stringify(jobsWithoutPending)).digest("hex");
+  await fs.writeFile(jobsPath, JSON.stringify({ version: 1, revision: jobsRevision, jobs: jobsWithoutPending }, null, 2), "utf8");
+  await fs.writeFile(path.join(stateDir, "jobs.revision"), `${jobsRevision}\n`, "utf8");
 
   const second = createHarness("pending-fired-event");
   await second.emit("session_start");
@@ -1912,6 +1969,24 @@ async function testRetentionPrune() {
   if (!(await fs.stat(runningHandlerDir).then(() => true, () => false))) throw new Error("running handler dir was pruned");
   const auditLines = (await fs.readFile(auditPath, "utf8")).trim().split("\n");
   if (auditLines.length !== 2 || !auditLines[0].includes("sleep 13") || !auditLines[1].includes("sleep 14")) throw new Error(`audit prune kept wrong lines: ${auditLines.join(" | ")}`);
+
+  const recentTerminalJobs = Array.from({ length: 600 }, (_, index) => ({
+    ...recentFired,
+    id: `recent_terminal_${index}`,
+    label: `recent terminal ${index}`,
+    createdAt: recent + index,
+    updatedAt: recent + index,
+    firedAt: recent + index,
+  }));
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: recentTerminalJobs }, null, 2), "utf8");
+  await harness.runCommand("return-on-prune", "dry-run --days=30");
+  const countDryRun = harness.notifications.at(-1)?.message ?? "";
+  if (!countDryRun.includes("Jobs pruned: 100")) throw new Error(`count-bounded prune dry run was wrong: ${countDryRun}`);
+  await harness.runCommand("return-on-prune", "--days=30");
+  const boundedJobs = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8")).jobs as any[];
+  if (boundedJobs.length !== 500 || boundedJobs.some((job) => job.id === "recent_terminal_0") || !boundedJobs.some((job) => job.id === "recent_terminal_599")) {
+    throw new Error(`count-bounded prune kept wrong jobs: count=${boundedJobs.length}`);
+  }
   await harness.emit("session_shutdown");
 }
 
@@ -2169,6 +2244,8 @@ const harness = createHarness("main-session");
 await harness.emit("session_start");
 
 await testDirectWaitPolicy(harness);
+await testNoOpPollingDoesNotRewriteJobs(harness);
+await testDelayedEvaluationSurvivesInterleavedSave(harness);
 await testCommonShorthandAccepted(harness);
 await testTimer(harness);
 await testRegisterWithoutEndingTurn(harness);
