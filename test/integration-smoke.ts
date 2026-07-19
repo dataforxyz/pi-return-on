@@ -1890,12 +1890,14 @@ async function testRetentionPrune() {
   await harness.emit("session_start");
   const now = Date.now();
   const old = now - 40 * 86_400_000;
+  const eightDaysAgo = now - 8 * 86_400_000;
   const recent = now - 60_000;
   const activeJob = { id: "prune_active", label: "active", cwd, sessionFile: harness.sessionFile, createdAt: old, updatedAt: old, status: "active", condition: { type: "timer", after: "1h" }, resume: "active resume", latches: {}, leafState: {} };
   const oldCancelled = { id: "prune_old_cancelled", label: "old cancelled", cwd, sessionFile: harness.sessionFile, createdAt: old, updatedAt: old, status: "cancelled", condition: { type: "timer", after: "1h" }, resume: "old resume", cancelledAt: old, latches: {}, leafState: {} };
+  const eightDayCancelled = { ...oldCancelled, id: "prune_eight_day_cancelled", label: "eight day cancelled", createdAt: eightDaysAgo, updatedAt: eightDaysAgo, cancelledAt: eightDaysAgo };
   const recentFired = { id: "prune_recent_fired", label: "recent fired", cwd, sessionFile: harness.sessionFile, createdAt: recent, updatedAt: recent, status: "fired", condition: { type: "timer", after: "1h" }, resume: "recent resume", firedAt: recent, latches: {}, leafState: {} };
   await fs.mkdir(stateDir, { recursive: true });
-  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [activeJob, oldCancelled, recentFired] }, null, 2), "utf8");
+  await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, jobs: [activeJob, oldCancelled, eightDayCancelled, recentFired] }, null, 2), "utf8");
 
   const firedDir = path.join(stateDir, "fired");
   await fs.mkdir(firedDir, { recursive: true });
@@ -1923,10 +1925,25 @@ async function testRetentionPrune() {
   const handlersDir = path.join(stateDir, "handlers");
   const oldHandlerDir = path.join(handlersDir, "old-handler");
   const runningHandlerDir = path.join(handlersDir, "running-handler");
+  const oldOrphanHandlerDir = path.join(handlersDir, "old-orphan-handler");
+  const eightDayOrphanHandlerDir = path.join(handlersDir, "eight-day-orphan-handler");
+  const recentOrphanHandlerDir = path.join(handlersDir, "recent-orphan-handler");
   const unsafeHandlerDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-unsafe-handler-"));
   await fs.mkdir(oldHandlerDir, { recursive: true });
   await fs.mkdir(runningHandlerDir, { recursive: true });
+  await fs.mkdir(oldOrphanHandlerDir, { recursive: true });
+  await fs.mkdir(eightDayOrphanHandlerDir, { recursive: true });
+  await fs.mkdir(recentOrphanHandlerDir, { recursive: true });
   await fs.writeFile(path.join(oldHandlerDir, "stdout.log"), "old", "utf8");
+  const oldOrphanLog = path.join(oldOrphanHandlerDir, "stdout.log");
+  const eightDayOrphanLog = path.join(eightDayOrphanHandlerDir, "stdout.log");
+  await fs.writeFile(oldOrphanLog, "orphaned old handler transcript", "utf8");
+  await fs.writeFile(eightDayOrphanLog, "orphaned eight-day handler transcript", "utf8");
+  await fs.writeFile(path.join(recentOrphanHandlerDir, "stdout.log"), "recent orphan transcript", "utf8");
+  await fs.utimes(oldOrphanLog, old / 1000, old / 1000);
+  await fs.utimes(oldOrphanHandlerDir, old / 1000, old / 1000);
+  await fs.utimes(eightDayOrphanLog, eightDaysAgo / 1000, eightDaysAgo / 1000);
+  await fs.utimes(eightDayOrphanHandlerDir, eightDaysAgo / 1000, eightDaysAgo / 1000);
   await fs.writeFile(path.join(unsafeHandlerDir, "sentinel"), "do not remove", "utf8");
   const handlerBase = { jobId: "job", label: "handler", cwd, parentSessionFile: harness.sessionFile, pid: 123, eventPath: "event.json", promptPath: "prompt.md", stdoutPath: "stdout.log", stderrPath: "stderr.log", sessionDir: "session" };
   await fs.writeFile(path.join(stateDir, "handlers.json"), JSON.stringify({ version: 1, handlers: [
@@ -1942,22 +1959,28 @@ async function testRetentionPrune() {
   await harness.runCommand("return-on-prune", "--days=1junk");
   const invalidText = harness.notifications.at(-1)?.message ?? "";
   if (!invalidText.includes("--days must be a non-negative number")) throw new Error(`invalid prune arg did not warn: ${invalidText}`);
+  await harness.runCommand("return-on-prune", "dry-run");
+  const defaultDryRunText = harness.notifications.at(-1)?.message ?? "";
+  if (!defaultDryRunText.includes("State retention: 30d; handler artifact retention: 7d") || !defaultDryRunText.includes("Jobs pruned: 1") || !defaultDryRunText.includes("orphan handler dirs pruned: 2")) {
+    throw new Error(`default handler retention dry-run was wrong: ${defaultDryRunText}`);
+  }
   await harness.runCommand("return-on-prune", "dry-run --days=1 --audit-max=2");
   const dryRunText = harness.notifications.at(-1)?.message ?? "";
-  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 1") || !dryRunText.includes("Fired events pruned: 1") || !dryRunText.includes("Handlers pruned: 2; handler dirs pruned: 1")) {
+  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 2") || !dryRunText.includes("Fired events pruned: 1") || !dryRunText.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2")) {
     throw new Error(`prune dry-run summary was wrong: ${dryRunText}`);
   }
   if (!(await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false))) throw new Error("dry-run removed old fired event");
+  if (!(await fs.stat(oldOrphanHandlerDir).then(() => true, () => false))) throw new Error("dry-run removed old orphan handler dir");
 
   const pruneTool = harness.tools.get("return_on_prune");
   if (!pruneTool) throw new Error("missing return_on_prune tool");
   const result = await pruneTool.execute("prune", { retentionDays: 1, auditMaxEntries: 2 }, new AbortController().signal, () => {}, harness.ctx);
   const text = String(result.content?.[0]?.text ?? "");
-  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 1") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 2; handler dirs pruned: 1") || !text.includes("Direct-wait audit entries pruned: 3")) {
+  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 2") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2") || !text.includes("Direct-wait audit entries pruned: 3")) {
     throw new Error(`prune summary was wrong: ${text}`);
   }
   const jobsState = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8"));
-  if (jobsState.jobs.some((job: any) => job.id === "prune_old_cancelled") || !jobsState.jobs.some((job: any) => job.id === "prune_active")) {
+  if (jobsState.jobs.some((job: any) => job.id === "prune_old_cancelled" || job.id === "prune_eight_day_cancelled") || !jobsState.jobs.some((job: any) => job.id === "prune_active")) {
     throw new Error(`prune kept/removed wrong jobs: ${JSON.stringify(jobsState)}`);
   }
   if (await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false)) throw new Error("old delivered fired event was not pruned");
@@ -1965,6 +1988,9 @@ async function testRetentionPrune() {
     if (!(await fs.stat(path.join(firedDir, name)).then(() => true, () => false))) throw new Error(`prune removed protected fired event ${name}`);
   }
   if (await fs.stat(oldHandlerDir).then(() => true, () => false)) throw new Error("old handler dir was not pruned");
+  if (await fs.stat(oldOrphanHandlerDir).then(() => true, () => false)) throw new Error("old orphan handler dir was not pruned");
+  if (await fs.stat(eightDayOrphanHandlerDir).then(() => true, () => false)) throw new Error("eight-day orphan handler dir was not pruned");
+  if (!(await fs.stat(recentOrphanHandlerDir).then(() => true, () => false))) throw new Error("recent orphan handler dir was pruned");
   if (!(await fs.stat(path.join(unsafeHandlerDir, "sentinel")).then(() => true, () => false))) throw new Error("unsafe handler dir outside state was pruned");
   if (!(await fs.stat(runningHandlerDir).then(() => true, () => false))) throw new Error("running handler dir was pruned");
   const auditLines = (await fs.readFile(auditPath, "utf8")).trim().split("\n");

@@ -70,6 +70,8 @@ const DIRECT_TIMEOUT_BLOCK_THRESHOLD_MS = 300_000;
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
+const DEFAULT_HANDLER_ARTIFACT_RETENTION_DAYS = 7;
+const DEFAULT_HANDLER_ARTIFACT_RETENTION_MS = DEFAULT_HANDLER_ARTIFACT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_TERMINAL_JOB_MAX = 500;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
 const JOBS_LOCK_TIMEOUT_MS = Math.max(10, Number.parseInt(process.env.PI_RETURN_ON_LOCK_TIMEOUT_MS || "10000", 10) || 10_000);
@@ -388,6 +390,7 @@ function installedPiForksBackgroundEventsModule(): string | undefined {
 
 interface PruneOptions {
 	retentionMs?: number;
+	handlerRetentionMs?: number;
 	auditMaxEntries?: number;
 	dryRun?: boolean;
 }
@@ -395,11 +398,14 @@ interface PruneOptions {
 interface PruneSummary {
 	dryRun: boolean;
 	retentionMs: number;
+	handlerRetentionMs: number;
 	auditMaxEntries: number;
 	jobsPruned: number;
 	firedEventsPruned: number;
 	handlersPruned: number;
 	handlerDirsPruned: number;
+	orphanHandlerDirsPruned: number;
+	orphanHandlerBytesPruned: number;
 	auditEntriesPruned: number;
 	tmpFilesPruned: number;
 }
@@ -1312,6 +1318,7 @@ function parsePruneCommandArgs(args: string): PruneOptions {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	let dryRun = false;
 	let retentionMs: number | undefined;
+	let handlerRetentionMs: number | undefined;
 	let auditMaxEntries: number | undefined;
 	for (const part of parts) {
 		if (part === "--dry-run" || part === "dry-run" || part === "dryrun") {
@@ -1321,6 +1328,11 @@ function parsePruneCommandArgs(args: string): PruneOptions {
 		if (part.startsWith("--days=")) {
 			const days = parseNonNegativeNumber(part.slice("--days=".length), "--days");
 			retentionMs = Math.round(days * 86_400_000);
+			continue;
+		}
+		if (part.startsWith("--handler-days=")) {
+			const days = parseNonNegativeNumber(part.slice("--handler-days=".length), "--handler-days");
+			handlerRetentionMs = Math.round(days * 86_400_000);
 			continue;
 		}
 		if (part.startsWith("--audit-max=")) {
@@ -1333,16 +1345,21 @@ function parsePruneCommandArgs(args: string): PruneOptions {
 		}
 		throw new Error(`Unknown return_on prune argument: ${part}`);
 	}
-	return { dryRun, ...(retentionMs !== undefined ? { retentionMs } : {}), ...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}) };
+	return {
+		dryRun,
+		...(retentionMs !== undefined ? { retentionMs } : {}),
+		...(handlerRetentionMs !== undefined ? { handlerRetentionMs } : {}),
+		...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}),
+	};
 }
 
 function formatPruneSummary(summary: PruneSummary): string {
 	return [
 		`return_on prune ${summary.dryRun ? "dry run" : "complete"}`,
-		`Retention: ${formatDuration(summary.retentionMs)}; audit max entries: ${summary.auditMaxEntries}`,
+		`State retention: ${formatDuration(summary.retentionMs)}; handler artifact retention: ${formatDuration(summary.handlerRetentionMs)}; audit max entries: ${summary.auditMaxEntries}`,
 		`Jobs pruned: ${summary.jobsPruned}`,
 		`Fired events pruned: ${summary.firedEventsPruned}`,
-		`Handlers pruned: ${summary.handlersPruned}; handler dirs pruned: ${summary.handlerDirsPruned}`,
+		`Handlers pruned: ${summary.handlersPruned}; handler dirs pruned: ${summary.handlerDirsPruned}; orphan handler dirs pruned: ${summary.orphanHandlerDirsPruned} (${summary.orphanHandlerBytesPruned} bytes)`,
 		`Temp files pruned: ${summary.tmpFilesPruned}`,
 		`Direct-wait audit entries pruned: ${summary.auditEntriesPruned}`,
 	].join("\n");
@@ -1428,11 +1445,67 @@ async function pruneFiredEventsIfEligible(eventPaths: string[], cutoff: number):
 	});
 }
 
+async function handlerArtifactTreeStats(root: string): Promise<{ latestMtimeMs: number; bytes: number } | undefined> {
+	const stack = [root];
+	let latestMtimeMs = 0;
+	let bytes = 0;
+	while (stack.length > 0) {
+		const current = stack.pop()!;
+		let stat: fs.Stats;
+		try {
+			stat = await fsp.lstat(current);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		latestMtimeMs = Math.max(latestMtimeMs, stat.mtimeMs);
+		if (stat.isFile() || stat.isSymbolicLink()) bytes += stat.size;
+		if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+		let entries: fs.Dirent[];
+		try {
+			entries = await fsp.readdir(current, { withFileTypes: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		for (const entry of entries) stack.push(path.join(current, entry.name));
+	}
+	return latestMtimeMs > 0 ? { latestMtimeMs, bytes } : undefined;
+}
+
+async function pruneOrphanHandlerDirs(cutoff: number, dryRun: boolean): Promise<{ dirsPruned: number; bytesPruned: number }> {
+	return withJobsFileLockRetry(async () => {
+		const referencedIds = new Set((await readHandlersFile()).map((run) => run.id));
+		let entries: fs.Dirent[];
+		try {
+			entries = await fsp.readdir(HANDLERS_DIR, { withFileTypes: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { dirsPruned: 0, bytesPruned: 0 };
+			throw error;
+		}
+		let dirsPruned = 0;
+		let bytesPruned = 0;
+		for (const entry of entries) {
+			if (!entry.isDirectory() || referencedIds.has(entry.name)) continue;
+			const dir = path.join(HANDLERS_DIR, entry.name);
+			if (!isPathInside(HANDLERS_DIR, dir) || path.dirname(dir) !== HANDLERS_DIR) continue;
+			const stats = await handlerArtifactTreeStats(dir);
+			if (!stats || stats.latestMtimeMs >= cutoff) continue;
+			dirsPruned += 1;
+			bytesPruned += stats.bytes;
+			if (!dryRun) await fsp.rm(dir, { recursive: true, force: true });
+		}
+		return { dirsPruned, bytesPruned };
+	});
+}
+
 async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	const retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
+	const handlerRetentionMs = options.handlerRetentionMs ?? options.retentionMs ?? DEFAULT_HANDLER_ARTIFACT_RETENTION_MS;
 	const auditMaxEntries = options.auditMaxEntries ?? DEFAULT_AUDIT_MAX_ENTRIES;
 	const dryRun = options.dryRun === true;
 	const cutoff = Date.now() - retentionMs;
+	const handlerCutoff = Date.now() - handlerRetentionMs;
 	const firedEvents = await readFiredEventFiles();
 	const deliveryProtection = await readPendingDeliveryProtectionSnapshot();
 	const protectedJobIds = deliveryProtection.jobIds;
@@ -1458,7 +1531,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	let handlersPruned = 0;
 	let handlerDirsPruned = 0;
 	const keptHandlers = handlerRuns.filter((run) => {
-		const prune = shouldPruneTerminalHandler(run, cutoff);
+		const prune = shouldPruneTerminalHandler(run, handlerCutoff);
 		if (prune) handlersPruned += 1;
 		return !prune;
 	});
@@ -1477,15 +1550,38 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 			}
 		}
 		handlerRuns = keptHandlers;
-		await saveHandlers({ pruneTerminalBefore: cutoff });
-		await appendLifecycleAudit("handlers_pruned", { handlersPruned, handlerDirsPruned, cutoff });
+		await saveHandlers({ pruneTerminalBefore: handlerCutoff });
+		await appendLifecycleAudit("handlers_pruned", { handlersPruned, handlerDirsPruned, cutoff: handlerCutoff, retentionMs: handlerRetentionMs });
 	} else if (dryRun) {
 		handlerDirsPruned = handlerRuns.filter((run) => !keptHandlers.some((kept) => kept.id === run.id) && isPathInside(HANDLERS_DIR, run.dir)).length;
 	}
 
+	const orphanHandlerPrune = await pruneOrphanHandlerDirs(handlerCutoff, dryRun);
+	if (!dryRun && orphanHandlerPrune.dirsPruned > 0) {
+		await appendLifecycleAudit("orphan_handler_dirs_pruned", {
+			handlerDirsPruned: orphanHandlerPrune.dirsPruned,
+			bytesPruned: orphanHandlerPrune.bytesPruned,
+			cutoff: handlerCutoff,
+			retentionMs: handlerRetentionMs,
+		});
+	}
+
 	const tmpFilesPruned = await pruneTempFiles(STATE_DIR, cutoff, dryRun) + await pruneTempFiles(FIRED_DIR, cutoff, dryRun);
 	const auditEntriesPruned = await pruneDirectWaitAudit(cutoff, auditMaxEntries, dryRun);
-	return { dryRun, retentionMs, auditMaxEntries, jobsPruned, firedEventsPruned, handlersPruned, handlerDirsPruned, auditEntriesPruned, tmpFilesPruned };
+	return {
+		dryRun,
+		retentionMs,
+		handlerRetentionMs,
+		auditMaxEntries,
+		jobsPruned,
+		firedEventsPruned,
+		handlersPruned,
+		handlerDirsPruned,
+		orphanHandlerDirsPruned: orphanHandlerPrune.dirsPruned,
+		orphanHandlerBytesPruned: orphanHandlerPrune.bytesPruned,
+		auditEntriesPruned,
+		tmpFilesPruned,
+	};
 }
 
 function firedEventMatchesCurrentSession(event: FiredEventState): boolean {
@@ -4722,7 +4818,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("return-on-prune", {
-		description: "Prune old return_on state: /return-on-prune [--dry-run] [--days=N] [--audit-max=N]",
+		description: "Prune old return_on state: /return-on-prune [--dry-run] [--days=N] [--handler-days=N] [--audit-max=N]",
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
 			let options: PruneOptions;
@@ -4959,10 +5055,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "return_on_prune",
 		label: "Prune Return On State",
-		description: "Prune old retained return_on jobs, delivered fired-event capsules, completed handler runs/artifacts, and direct-wait audit entries. Defaults to 30 days and 5000 audit entries.",
+		description: "Prune old retained return_on jobs, delivered fired-event capsules, completed or orphaned handler artifacts, and direct-wait audit entries. Defaults to 30 days for shared state, 7 days for handler transcripts, and 5000 audit entries.",
 		parameters: Type.Object({
 			dryRun: Type.Optional(Type.Boolean()),
 			retentionDays: Type.Optional(Type.Number()),
+			handlerRetentionDays: Type.Optional(Type.Number()),
 			auditMaxEntries: Type.Optional(Type.Number()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -4972,14 +5069,19 @@ export default function (pi: ExtensionAPI) {
 			if (params.retentionDays !== undefined && (typeof params.retentionDays !== "number" || !Number.isFinite(params.retentionDays) || params.retentionDays < 0)) {
 				throw new Error("retentionDays must be a non-negative number");
 			}
+			if (params.handlerRetentionDays !== undefined && (typeof params.handlerRetentionDays !== "number" || !Number.isFinite(params.handlerRetentionDays) || params.handlerRetentionDays < 0)) {
+				throw new Error("handlerRetentionDays must be a non-negative number");
+			}
 			if (params.auditMaxEntries !== undefined && (typeof params.auditMaxEntries !== "number" || !Number.isSafeInteger(params.auditMaxEntries) || params.auditMaxEntries < 0)) {
 				throw new Error("auditMaxEntries must be a non-negative integer");
 			}
 			const retentionDays = params.retentionDays;
+			const handlerRetentionDays = params.handlerRetentionDays;
 			const auditMaxEntries = params.auditMaxEntries;
 			const summary = await pruneState({
 				dryRun: params.dryRun === true,
 				...(retentionDays !== undefined ? { retentionMs: Math.round(retentionDays * 86_400_000) } : {}),
+				...(handlerRetentionDays !== undefined ? { handlerRetentionMs: Math.round(handlerRetentionDays * 86_400_000) } : {}),
 				...(auditMaxEntries !== undefined ? { auditMaxEntries } : {}),
 			});
 			return { content: [{ type: "text", text: formatPruneSummary(summary) }], details: { summary } };
