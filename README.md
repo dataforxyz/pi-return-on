@@ -69,9 +69,10 @@ Diagnostics:
 - `npm run check:lifecycle` is the CI/automation gate. It runs the lifecycle scan and fails when counts exceed threshold env vars such as `RETURN_ON_MAX_EXPIRED_ACTIVE` or `RETURN_ON_MAX_DEAD_HANDLER_PIDS`.
 - `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns or long runtime thresholds and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
 - `npm run review:direct-waits` summarizes/dedupes that corpus, samples unreviewed examples, and can append human verdicts to the sidecar `~/.local/state/pi-return-on/direct-wait-example-reviews.jsonl` without mutating session logs.
-- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, fired event capsules under `fired/<job-id>.json`, `handlers.json`, append-only `lifecycle-audit.jsonl`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
-- Startup cleanup reconciles stale fork-handler ledger entries, keeps active jobs, pending/failed fired events, still-running handlers, and direct-wait example corpora, while pruning terminal jobs, delivered fired-event capsules, completed handler artifacts, stale atomic `.tmp` write remnants, and old direct-wait audit entries after 30 days by default. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window.
-- State saves merge against the latest on-disk jobs/handlers to avoid clobbering active watchers from sibling Pi sessions. There is intentionally no cross-process lock around the full read/merge/write sequence yet; lifecycle scanning (`npm run scan-lifecycle` / `npm run check:lifecycle`) is the guardrail for detecting any remaining rare write-window anomalies.
+- Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, its small `jobs.revision` notification marker, fired event capsules under `fired/<job-id>.json`, `handlers.json`, append-only `lifecycle-audit.jsonl`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
+- Startup cleanup reconciles stale fork-handler ledger entries, keeps active jobs and jobs with pending/failed/queued or actively handled delivery, and prunes ordinary terminal history by both age (30 days by default) and count (the newest 500 terminal jobs). Delivered fired-event capsules, completed handler artifacts, stale atomic `.tmp` write remnants, and old direct-wait audit entries use the age policy. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window; the terminal count bound still applies.
+- Job saves use an OS advisory `flock` around the read/merge/write/rename transaction, re-read state only after acquiring the lock, and retry transient lock contention. Explicit local insert intent distinguishes a new unsaved registration from a stale memory-only job, so a process cannot resurrect an active or terminal job that another process already removed.
+- Poll ticks keep observation-only timestamps such as `lastCheckAt` in memory without rewriting `jobs.json`. Semantic transitions still persist immediately. `jobs.revision` lets filesystem watchers ignore their own/already-seen saves without reparsing the full jobs payload.
 
 ## `return_on` parameters
 
@@ -716,6 +717,8 @@ Jobs are persisted to:
 
 ```text
 ~/.local/state/pi-return-on/jobs.json
+~/.local/state/pi-return-on/jobs.revision
+~/.local/state/pi-return-on/jobs.lock
 ~/.local/state/pi-return-on/handlers.json
 ~/.local/state/pi-return-on/handlers/<handler-id>/
 ```
@@ -728,7 +731,7 @@ Jobs are scoped by Pi session file. A watcher resumes the session that registere
 npm test
 ```
 
-This runs TypeScript typechecking for `src/` and `test/`, then runs a hermetic smoke suite with a temporary `HOME`. The smoke suite covers timers, fork-delivery handler launch/summary, incoming webhook wakeups, outgoing webhook delivery, file/log checks, event-driven file rechecks, stable files, first-class process/port/url checks, boolean trees, `not` across skipped polling intervals, exec approval/validation, list/status/cancel surfaces, timeout, restart persistence, and session isolation.
+This runs TypeScript typechecking for `src/` and `test/`, cross-process concurrency/retention tests, then a hermetic smoke suite with a temporary `HOME`. Coverage includes no-op polling write suppression, concurrent registration, stale-writer prune resurrection, lock timeout/retry and dead-owner recovery, revision crash windows, 4,000-job bounded-history startup, delayed evaluation interleaving, pending-event restart recovery, timers, fork-delivery handler launch/summary, incoming webhook wakeups, outgoing webhook delivery, file/log/process/port/url checks, boolean trees, exec approval/validation, timeout, restart persistence, and session isolation.
 
 For manual development checks, run the smoke suite directly and inspect the temporary state path printed at the end:
 
@@ -740,6 +743,7 @@ The smoke harness loads `src/index.ts` as a Pi extension with a fake Pi API, reg
 
 ## Current limitations
 
+- Cross-process job serialization currently requires the `flock` command (normally provided by util-linux on Linux).
 - Agent/subagent watchers are currently expressed through file, URL, incoming webhook, or exec checks rather than a dedicated first-class leaf type.
 - File checks are event-assisted with polling fallback; incoming webhooks are event-driven; process, port, URL, and exec checks are polling-based.
 - Background commands should be treated as trusted local code.

@@ -37,7 +37,10 @@ const RETURN_ON_SHORTCUT_LABEL = "Ctrl+Alt+W";
 const RETURN_ON_MODAL_BODY_LINES = 28;
 const STATE_DIR = resolveReturnOnStateDir();
 const JOBS_FILE = path.join(STATE_DIR, "jobs.json");
+const JOBS_REVISION_FILE = path.join(STATE_DIR, "jobs.revision");
+const JOBS_LOCK_FILE = path.join(STATE_DIR, "jobs.lock");
 const FIRED_DIR = path.join(STATE_DIR, "fired");
+const FIRED_CLAIMS_LOCK_FILE = path.join(STATE_DIR, "fired-claims.lock");
 const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
 const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
 const DIRECT_WAIT_AUDIT_FILE = path.join(STATE_DIR, "direct-wait-audit.jsonl");
@@ -67,7 +70,11 @@ const DIRECT_TIMEOUT_BLOCK_THRESHOLD_MS = 300_000;
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
+const DEFAULT_TERMINAL_JOB_MAX = 500;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
+const JOBS_LOCK_TIMEOUT_MS = Math.max(10, Number.parseInt(process.env.PI_RETURN_ON_LOCK_TIMEOUT_MS || "10000", 10) || 10_000);
+const FLOCK_BIN = process.env.PI_RETURN_ON_FLOCK_BIN || ["/usr/bin/flock", "/bin/flock"].find((candidate) => fs.existsSync(candidate)) || "flock";
+const SH_BIN = ["/bin/sh", "/usr/bin/sh"].find((candidate) => fs.existsSync(candidate)) || "sh";
 const FIRED_EVENT_CLAIM_STALE_MS = 2 * 60_000;
 const RETURN_ON_PARENT_SESSION_FILE_ENV = "PI_RETURN_ON_PARENT_SESSION_FILE";
 const RETURN_ON_PARENT_SESSION_ID_ENV = "PI_RETURN_ON_PARENT_SESSION_ID";
@@ -309,6 +316,7 @@ interface ReturnOnHandlerRun {
 
 interface JobsState {
 	version: 1;
+	revision?: string;
 	jobs: ReturnOnJob[];
 }
 
@@ -464,6 +472,9 @@ let shuttingDown = false;
 const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
 const STARTING_HANDLER_WITH_SESSION_STALE_MS = 2 * 60 * 60 * 1000;
 let savingJobs = false;
+let lastSeenJobsRevision: string | undefined;
+const pendingJobInsertIds = new Set<string>();
+const ownedFiredEventClaimTokens = new Map<string, string>();
 let saveJobsQueue: Promise<void> = Promise.resolve();
 let saveHandlersQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
@@ -762,8 +773,10 @@ function formatDirectWaitAudit(entries: DirectWaitAuditEntry[]): string {
 }
 
 async function loadJobs(): Promise<void> {
-	const diskJobs = await readJobsFile();
-	jobs = jobs.length === 0 ? diskJobs : mergeJobsForReload(jobs, diskJobs);
+	const state = await readJobsState();
+	lastSeenJobsRevision = state.revision;
+	jobs = jobs.length === 0 ? state.jobs : mergeJobsForReload(jobs, state.jobs, pendingJobInsertIds);
+	for (const job of state.jobs) pendingJobInsertIds.delete(job.id);
 }
 
 function atomicTempPath(target: string): string {
@@ -775,46 +788,63 @@ function isTerminalJob(job: ReturnOnJob): boolean {
 }
 
 function jobMergeTime(job: ReturnOnJob): number {
-	const leafChecks = Object.values(job.leafState ?? {}).map((state) => state.lastCheckAt ?? 0);
 	const latchTimes = Object.values(job.latches ?? {}).map((latch) => latch.trueAt ?? 0);
-	return Math.max(job.updatedAt ?? 0, job.firedAt ?? 0, job.lastFiredAt ?? 0, job.cancelledAt ?? 0, ...leafChecks, ...latchTimes);
+	return Math.max(job.updatedAt ?? 0, job.firedAt ?? 0, job.lastFiredAt ?? 0, job.cancelledAt ?? 0, ...latchTimes);
+}
+
+function isLegitimateRearmedActive(active: ReturnOnJob, terminal: ReturnOnJob): boolean {
+	const activeFireCount = active.fireCount ?? 0;
+	const terminalFireCount = terminal.fireCount ?? 0;
+	return terminal.status !== "cancelled"
+		&& active.status === "active"
+		&& (active.maxFires ?? 1) > 1
+		&& activeFireCount > terminalFireCount
+		&& (active.lastFiredAt ?? 0) >= (terminal.lastFiredAt ?? terminal.firedAt ?? 0);
 }
 
 function chooseMergedJob(a: ReturnOnJob, b: ReturnOnJob): ReturnOnJob {
 	if (a.status !== b.status) {
-		if (isTerminalJob(a) && !isTerminalJob(b)) return jobMergeTime(a) >= jobMergeTime(b) ? a : b;
-		if (isTerminalJob(b) && !isTerminalJob(a)) return jobMergeTime(b) >= jobMergeTime(a) ? b : a;
+		if (isTerminalJob(a) && !isTerminalJob(b)) return isLegitimateRearmedActive(b, a) ? b : a;
+		if (isTerminalJob(b) && !isTerminalJob(a)) return isLegitimateRearmedActive(a, b) ? a : b;
 	}
 	return jobMergeTime(b) >= jobMergeTime(a) ? b : a;
 }
 
-async function readJobsFile(): Promise<ReturnOnJob[]> {
+async function readJobsState(): Promise<JobsState> {
 	try {
 		const raw = await fsp.readFile(JOBS_FILE, "utf8");
 		const parsed = JSON.parse(raw) as JobsState;
-		return Array.isArray(parsed.jobs) ? parsed.jobs : [];
+		return { version: 1, ...(typeof parsed.revision === "string" ? { revision: parsed.revision } : {}), jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [] };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			console.error(`[${EXTENSION_NAME}] Failed to load jobs:`, error);
 		}
-		return [];
+		return { version: 1, jobs: [] };
 	}
 }
 
-export function mergeJobsForSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[]): ReturnOnJob[] {
+async function readJobsFile(): Promise<ReturnOnJob[]> {
+	return (await readJobsState()).jobs;
+}
+
+export function mergeJobsForSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], protectedJobIdsInput: Iterable<string> = [], insertedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
+	const protectedJobIds = new Set(protectedJobIdsInput);
+	const insertedJobIds = new Set(insertedJobIdsInput);
 	const merged = new Map<string, ReturnOnJob>();
 	for (const job of diskJobs) merged.set(job.id, job);
 	for (const job of memoryJobs) {
 		const existing = merged.get(job.id);
-		merged.set(job.id, existing ? chooseMergedJob(existing, job) : job);
+		if (existing) merged.set(job.id, chooseMergedJob(existing, job));
+		else if (insertedJobIds.has(job.id) || protectedJobIds.has(job.id)) merged.set(job.id, job);
 	}
 	return [...merged.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 }
 
-export function mergeJobsForReload(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[]): ReturnOnJob[] {
+export function mergeJobsForReload(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], insertedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
+	const insertedJobIds = new Set(insertedJobIdsInput);
 	const diskIds = new Set(diskJobs.map((job) => job.id));
-	const liveMemoryJobs = memoryJobs.filter((job) => job.status === "active" || diskIds.has(job.id));
-	return mergeJobsForSave(liveMemoryJobs, diskJobs);
+	const liveMemoryJobs = memoryJobs.filter((job) => diskIds.has(job.id) || insertedJobIds.has(job.id));
+	return mergeJobsForSave(liveMemoryJobs, diskJobs, [], insertedJobIds);
 }
 
 function shouldPruneTerminalJob(job: ReturnOnJob, cutoff: number, protectedJobIds: ReadonlySet<string>): boolean {
@@ -824,26 +854,201 @@ function shouldPruneTerminalJob(job: ReturnOnJob, cutoff: number, protectedJobId
 	return terminalAt !== undefined && terminalAt < cutoff;
 }
 
-export function mergeJobsForPrunedSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], cutoff: number, protectedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
+export function retainBoundedJobs(inputJobs: ReturnOnJob[], cutoff: number, maxTerminalJobs: number, protectedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
 	const protectedJobIds = new Set(protectedJobIdsInput);
-	return mergeJobsForSave(memoryJobs, diskJobs).filter((job) => !shouldPruneTerminalJob(job, cutoff, protectedJobIds));
+	const active = inputJobs.filter((job) => job.status === "active");
+	const protectedTerminal = inputJobs.filter((job) => isTerminalJob(job) && protectedJobIds.has(job.id));
+	const retainedTerminal = inputJobs
+		.filter((job) => isTerminalJob(job) && !protectedJobIds.has(job.id) && !shouldPruneTerminalJob(job, cutoff, protectedJobIds))
+		.sort((a, b) => (terminalJobTime(b) ?? 0) - (terminalJobTime(a) ?? 0) || b.id.localeCompare(a.id))
+		.slice(0, Math.max(0, maxTerminalJobs));
+	return [...active, ...protectedTerminal, ...retainedTerminal].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 }
 
-async function saveJobs(options: { merge?: boolean; pruneTerminalBefore?: number; protectedJobIds?: ReadonlySet<string> } = {}): Promise<void> {
-	const memoryJobs = jobs;
+export function mergeJobsForPrunedSave(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], cutoff: number, protectedJobIdsInput: Iterable<string> = []): ReturnOnJob[] {
+	const protectedJobIds = new Set(protectedJobIdsInput);
+	const insertedJobIds = memoryJobs.filter((job) => job.status === "active").map((job) => job.id);
+	return retainBoundedJobs(mergeJobsForSave(memoryJobs, diskJobs, protectedJobIds, insertedJobIds), cutoff, Number.MAX_SAFE_INTEGER, protectedJobIds);
+}
+
+function jobsContentRevision(inputJobs: ReturnOnJob[]): string {
+	return createHash("sha256").update(JSON.stringify(inputJobs)).digest("hex");
+}
+
+function cloneJobs(inputJobs: ReturnOnJob[]): ReturnOnJob[] {
+	return JSON.parse(JSON.stringify(inputJobs)) as ReturnOnJob[];
+}
+
+export function firedEventNeedsJobProtection(event: FiredEventState, activeHandlerIds: ReadonlySet<string>): boolean {
+	if (!event.deliveredAt || event.deliveryStatus === "failed" || event.deliveryStatus === "queued") return true;
+	if (event.deliveryStatus === "handler-launched" || event.deliveryStatus === "attached-to-handler") {
+		return !event.handlerRunId || activeHandlerIds.has(event.handlerRunId);
+	}
+	return false;
+}
+
+interface PendingDeliveryProtectionSnapshot {
+	jobIds: Set<string>;
+	fingerprint: string;
+}
+
+async function protectionStateFingerprint(): Promise<string> {
+	const statPart = async (file: string): Promise<string> => {
+		try {
+			const stat = await fsp.stat(file, { bigint: true });
+			return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+			throw error;
+		}
+	};
+	const [fired, handlers] = await Promise.all([statPart(FIRED_DIR), statPart(HANDLERS_FILE)]);
+	return `${fired}|${handlers}`;
+}
+
+async function readPendingDeliveryProtectionSnapshot(): Promise<PendingDeliveryProtectionSnapshot> {
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		const before = await protectionStateFingerprint();
+		const [events, handlers] = await Promise.all([
+			readFiredEventFiles(),
+			readHandlersFile(),
+		]);
+		const after = await protectionStateFingerprint();
+		if (before !== after) continue;
+		const activeHandlerIds = new Set(handlers.filter(isActiveHandlerRun).map((run) => run.id));
+		return {
+			jobIds: new Set(events.filter(({ event }) => firedEventNeedsJobProtection(event, activeHandlerIds)).map(({ event }) => event.jobId)),
+			fingerprint: after,
+		};
+	}
+	throw new Error("return_on delivery state kept changing while preparing jobs retention");
+}
+
+
+export function jobsNeedProtectionLookup(memoryJobs: ReturnOnJob[], diskJobs: ReturnOnJob[], cutoff: number, maxTerminalJobs: number): boolean {
+	const diskIds = new Set(diskJobs.map((job) => job.id));
+	if (memoryJobs.some((job) => isTerminalJob(job) && !diskIds.has(job.id))) return true;
+	const terminalById = new Map<string, ReturnOnJob>();
+	for (const job of [...diskJobs, ...memoryJobs]) {
+		if (!isTerminalJob(job)) continue;
+		const existing = terminalById.get(job.id);
+		if (!existing || (terminalJobTime(job) ?? 0) > (terminalJobTime(existing) ?? 0)) terminalById.set(job.id, job);
+	}
+	const terminal = [...terminalById.values()];
+	return terminal.length > maxTerminalJobs || terminal.some((job) => (terminalJobTime(job) ?? Number.MAX_SAFE_INTEGER) < cutoff);
+}
+
+export async function withJobsFileLock<T>(task: () => Promise<T>, lockFile = JOBS_LOCK_FILE, timeoutMs = JOBS_LOCK_TIMEOUT_MS): Promise<T> {
+	await fsp.mkdir(path.dirname(lockFile), { recursive: true });
+	const timeoutSeconds = Math.max(0.001, timeoutMs / 1000).toFixed(3);
+	const child = spawn(FLOCK_BIN, ["-x", "-w", timeoutSeconds, "-E", "75", lockFile, SH_BIN, "-c", "printf 'locked\\n'; IFS= read -r _"], {
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let stderr = "";
+	let acquired = false;
+	child.stderr?.setEncoding("utf8");
+	child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+	const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
+	await new Promise<void>((resolve, reject) => {
+		child.once("error", reject);
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.once("data", (chunk) => {
+			if (String(chunk).includes("locked")) {
+				acquired = true;
+				resolve();
+			}
+		});
+		child.once("close", (code) => {
+			if (!acquired) reject(new Error(code === 75 ? `Timed out acquiring return_on jobs lock after ${timeoutMs}ms` : `return_on jobs lock exited with ${code}: ${stderr.trim()}`));
+		});
+	});
+	try {
+		return await task();
+	} finally {
+		child.stdin?.end();
+		await closed;
+	}
+}
+
+export async function withJobsFileLockRetry<T>(
+	task: () => Promise<T>,
+	lockFile = JOBS_LOCK_FILE,
+	timeoutMs = JOBS_LOCK_TIMEOUT_MS,
+	attempts = 3,
+	backoffMs = 50,
+): Promise<T> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
+		try {
+			return await withJobsFileLock(task, lockFile, timeoutMs);
+		} catch (error) {
+			lastError = error;
+			if (!String(error).includes("Timed out acquiring") || attempt >= attempts) throw error;
+			await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt + Math.floor(Math.random() * backoffMs)));
+		}
+	}
+	throw lastError;
+}
+
+async function writeJobsRevision(revision: string): Promise<void> {
+	const tmp = atomicTempPath(JOBS_REVISION_FILE);
+	await fsp.writeFile(tmp, `${revision}\n`, "utf8");
+	await fsp.rename(tmp, JOBS_REVISION_FILE);
+}
+
+class ProtectionSnapshotChangedError extends Error {}
+
+async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds?: ReadonlySet<string>; protectedJobIdsComplete?: boolean; protectionFingerprint?: string } = {}): Promise<void> {
+	const memoryJobs = cloneJobs(jobs);
+	const insertedJobIds = new Set(pendingJobInsertIds);
 	const run = async () => {
 		await fsp.mkdir(STATE_DIR, { recursive: true });
+		const cutoff = options.pruneTerminalBefore ?? Date.now() - DEFAULT_RETENTION_MS;
 		savingJobs = true;
 		try {
-			const diskJobs = await readJobsFile();
-			jobs = options.merge === false ? memoryJobs : mergeJobsForSave(memoryJobs, diskJobs);
-			if (options.pruneTerminalBefore !== undefined) {
-				const protectedJobIds = options.protectedJobIds ?? new Set<string>();
-				jobs = jobs.filter((job) => !shouldPruneTerminalJob(job, options.pruneTerminalBefore!, protectedJobIds));
+			for (let snapshotAttempt = 0; snapshotAttempt < 5; snapshotAttempt += 1) {
+				const protectedJobIds = new Set(options.protectedJobIds ?? []);
+				let protectionSnapshot: PendingDeliveryProtectionSnapshot | undefined = snapshotAttempt === 0 && options.protectionFingerprint
+					? { jobIds: new Set(protectedJobIds), fingerprint: options.protectionFingerprint }
+					: undefined;
+				if (options.protectedJobIdsComplete !== true && !protectionSnapshot) {
+					const previewState = await readJobsState();
+					if (jobsNeedProtectionLookup(memoryJobs, previewState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
+						protectionSnapshot = await readPendingDeliveryProtectionSnapshot();
+						for (const jobId of protectionSnapshot.jobIds) protectedJobIds.add(jobId);
+					}
+				}
+				try {
+					await withJobsFileLockRetry(async () => {
+						const diskState = await readJobsState();
+						if (options.protectedJobIdsComplete !== true && jobsNeedProtectionLookup(memoryJobs, diskState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
+							if (!protectionSnapshot || await protectionStateFingerprint() !== protectionSnapshot.fingerprint) {
+								throw new ProtectionSnapshotChangedError("return_on delivery protection changed before jobs commit");
+							}
+						}
+						const merged = mergeJobsForSave(memoryJobs, diskState.jobs, protectedJobIds, insertedJobIds);
+						const nextJobs = retainBoundedJobs(merged, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
+						const revision = jobsContentRevision(nextJobs);
+						if (diskState.revision !== revision) {
+							const tmp = atomicTempPath(JOBS_FILE);
+							await fsp.writeFile(tmp, JSON.stringify({ version: 1, revision, jobs: nextJobs } satisfies JobsState, null, 2), "utf8");
+							await fsp.rename(tmp, JOBS_FILE);
+							await writeJobsRevision(revision);
+						}
+						// Preserve object identity for jobs that callers may still be mutating
+						// after an awaited save (fire/delivery paths do this), while accepting
+						// the bounded on-disk set and dropping pruned terminal memory records.
+						jobs = mergeJobsForReload(jobs, nextJobs, pendingJobInsertIds);
+						for (const jobId of insertedJobIds) {
+							if (nextJobs.some((job) => job.id === jobId)) pendingJobInsertIds.delete(jobId);
+						}
+						lastSeenJobsRevision = revision;
+					});
+					return;
+				} catch (error) {
+					if (!(error instanceof ProtectionSnapshotChangedError) || snapshotAttempt === 4) throw error;
+				}
 			}
-			const tmp = atomicTempPath(JOBS_FILE);
-			await fsp.writeFile(tmp, JSON.stringify({ version: 1, jobs } satisfies JobsState, null, 2), "utf8");
-			await fsp.rename(tmp, JOBS_FILE);
 		} finally {
 			savingJobs = false;
 		}
@@ -913,14 +1118,16 @@ async function saveHandlers(options: { merge?: boolean; pruneTerminalBefore?: nu
 	const memoryHandlers = handlerRuns;
 	const run = async () => {
 		await fsp.mkdir(STATE_DIR, { recursive: true });
-		const diskHandlers = await readHandlersFile();
-		handlerRuns = options.merge === false ? memoryHandlers : mergeHandlersForSave(memoryHandlers, diskHandlers);
-		if (options.pruneTerminalBefore !== undefined) {
-			handlerRuns = handlerRuns.filter((handler) => !shouldPruneTerminalHandler(handler, options.pruneTerminalBefore!));
-		}
-		const tmp = atomicTempPath(HANDLERS_FILE);
-		await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: retainedHandlerRuns() } satisfies HandlersState, null, 2), "utf8");
-		await fsp.rename(tmp, HANDLERS_FILE);
+		await withJobsFileLockRetry(async () => {
+			const diskHandlers = await readHandlersFile();
+			handlerRuns = options.merge === false ? memoryHandlers : mergeHandlersForSave(memoryHandlers, diskHandlers);
+			if (options.pruneTerminalBefore !== undefined) {
+				handlerRuns = handlerRuns.filter((handler) => !shouldPruneTerminalHandler(handler, options.pruneTerminalBefore!));
+			}
+			const tmp = atomicTempPath(HANDLERS_FILE);
+			await fsp.writeFile(tmp, JSON.stringify({ version: 1, handlers: retainedHandlerRuns() } satisfies HandlersState, null, 2), "utf8");
+			await fsp.rename(tmp, HANDLERS_FILE);
+		});
 	};
 	const result = saveHandlersQueue.then(run, run);
 	saveHandlersQueue = result.catch(() => undefined);
@@ -945,43 +1152,47 @@ function firedEventPath(jobId: string, fireCount?: number): string {
 async function writeFiredEvent(job: ReturnOnJob, reason: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "lastAttemptAt" | "handlerRunId" | "error">> = {}): Promise<string> {
 	await fsp.mkdir(FIRED_DIR, { recursive: true });
 	const eventPath = firedEventPath(job.id, job.fireCount);
-	const event: FiredEventState = {
-		version: 1,
-		event: "return_on.fired",
-		id: job.id,
-		jobId: job.id,
-		label: job.label,
-		reason,
-		createdAt: job.createdAt,
-		firedAt: job.lastFiredAt ?? job.firedAt ?? Date.now(),
-		cwd: job.cwd,
-		...(job.sessionFile ? { sessionFile: job.sessionFile } : {}),
-		resume: job.resume,
-		job,
-		deliveryStatus: updates.deliveryStatus ?? "pending",
-		...(updates.deliveredAt ? { deliveredAt: updates.deliveredAt } : {}),
-		...(updates.lastAttemptAt ? { lastAttemptAt: updates.lastAttemptAt } : {}),
-		...(updates.handlerRunId ? { handlerRunId: updates.handlerRunId } : {}),
-		...(updates.error ? { error: updates.error } : {}),
-	};
-	const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
-	await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
-	await fsp.rename(tmp, eventPath);
+	await withJobsFileLockRetry(async () => {
+		const event: FiredEventState = {
+			version: 1,
+			event: "return_on.fired",
+			id: job.id,
+			jobId: job.id,
+			label: job.label,
+			reason,
+			createdAt: job.createdAt,
+			firedAt: job.lastFiredAt ?? job.firedAt ?? Date.now(),
+			cwd: job.cwd,
+			...(job.sessionFile ? { sessionFile: job.sessionFile } : {}),
+			resume: job.resume,
+			job,
+			deliveryStatus: updates.deliveryStatus ?? "pending",
+			...(updates.deliveredAt ? { deliveredAt: updates.deliveredAt } : {}),
+			...(updates.lastAttemptAt ? { lastAttemptAt: updates.lastAttemptAt } : {}),
+			...(updates.handlerRunId ? { handlerRunId: updates.handlerRunId } : {}),
+			...(updates.error ? { error: updates.error } : {}),
+		};
+		const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
+		await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
+		await fsp.rename(tmp, eventPath);
+	});
 	return eventPath;
 }
 
 export async function patchFiredEvent(eventPath: string, updates: Partial<Pick<FiredEventState, "deliveryStatus" | "deliveredAt" | "lastAttemptAt" | "handlerRunId" | "error">>): Promise<FiredEventState> {
-	const existing = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
-	if (existing?.event !== "return_on.fired") throw new Error(`Invalid fired event: ${eventPath}`);
-	const event: FiredEventState = {
-		...existing,
-		...updates,
-		...(updates.deliveryStatus === "failed" ? { deliveredAt: undefined } : {}),
-	};
-	const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
-	await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
-	await fsp.rename(tmp, eventPath);
-	return event;
+	return withJobsFileLockRetry(async () => {
+		const existing = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
+		if (existing?.event !== "return_on.fired") throw new Error(`Invalid fired event: ${eventPath}`);
+		const event: FiredEventState = {
+			...existing,
+			...updates,
+			...(updates.deliveryStatus === "failed" ? { deliveredAt: undefined } : {}),
+		};
+		const tmp = `${eventPath}.${process.pid}.${Date.now()}.tmp`;
+		await fsp.writeFile(tmp, JSON.stringify(event, null, 2), "utf8");
+		await fsp.rename(tmp, eventPath);
+		return event;
+	});
 }
 
 async function readFiredEventFiles(): Promise<Array<{ path: string; event: FiredEventState }>> {
@@ -1016,35 +1227,57 @@ function firedEventClaimPath(eventPath: string): string {
 
 export async function tryClaimFiredEvent(eventPath: string, owner = `${process.pid}`, now = Date.now(), staleMs = FIRED_EVENT_CLAIM_STALE_MS): Promise<boolean> {
 	const claimPath = firedEventClaimPath(eventPath);
-	const tryCreate = async () => {
-		const handle = await fsp.open(claimPath, "wx");
+	const token = makeToken(12);
+	return withJobsFileLockRetry(async () => {
+		const tryCreate = async () => {
+			const handle = await fsp.open(claimPath, "wx");
+			try {
+				await handle.writeFile(JSON.stringify({ owner, token, claimedAt: now, eventPath }) + "\n", "utf8");
+			} finally {
+				await handle.close();
+			}
+			ownedFiredEventClaimTokens.set(eventPath, token);
+		};
 		try {
-			await handle.writeFile(JSON.stringify({ owner, claimedAt: now, eventPath }) + "\n", "utf8");
-		} finally {
-			await handle.close();
+			await tryCreate();
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-	};
-	try {
-		await tryCreate();
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-	}
-	try {
-		const stat = await fsp.stat(claimPath);
-		if (now - stat.mtimeMs <= staleMs) return false;
-		await fsp.rm(claimPath, { force: true });
-		await tryCreate();
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return tryClaimFiredEvent(eventPath, owner, now, staleMs);
-		throw error;
-	}
+		try {
+			const stat = await fsp.stat(claimPath);
+			if (now - stat.mtimeMs <= staleMs) return false;
+			await fsp.rm(claimPath, { force: true });
+			await tryCreate();
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				try {
+					await tryCreate();
+					return true;
+				} catch (retryError) {
+					if ((retryError as NodeJS.ErrnoException).code === "EEXIST") return false;
+					throw retryError;
+				}
+			}
+			throw error;
+		}
+	}, FIRED_CLAIMS_LOCK_FILE);
 }
 
-async function releaseFiredEventClaim(eventPath: string): Promise<void> {
-	await fsp.rm(firedEventClaimPath(eventPath), { force: true });
+export async function releaseFiredEventClaim(eventPath: string, expectedToken = ownedFiredEventClaimTokens.get(eventPath)): Promise<void> {
+	if (!expectedToken) return;
+	await withJobsFileLockRetry(async () => {
+		const claimPath = firedEventClaimPath(eventPath);
+		try {
+			const claim = JSON.parse(await fsp.readFile(claimPath, "utf8")) as { token?: string };
+			if (claim.token === expectedToken) await fsp.rm(claimPath, { force: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}, FIRED_CLAIMS_LOCK_FILE);
+	if (ownedFiredEventClaimTokens.get(eventPath) === expectedToken) ownedFiredEventClaimTokens.delete(eventPath);
 }
 
 export function applyFiredEventToJob(existing: ReturnOnJob | undefined, event: FiredEventState): { job: ReturnOnJob; changed: boolean } {
@@ -1173,20 +1406,39 @@ async function pruneDirectWaitAudit(cutoff: number, maxEntries: number, dryRun: 
 	return pruned;
 }
 
+async function pruneFiredEventsIfEligible(eventPaths: string[], cutoff: number): Promise<number> {
+	if (eventPaths.length === 0) return 0;
+	return withJobsFileLockRetry(async () => {
+		const handlers = await readHandlersFile();
+		const activeHandlerIds = new Set(handlers.filter(isActiveHandlerRun).map((run) => run.id));
+		let pruned = 0;
+		for (const eventPath of eventPaths) {
+			let event: FiredEventState;
+			try {
+				event = JSON.parse(await fsp.readFile(eventPath, "utf8")) as FiredEventState;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw error;
+			}
+			if (!event.deliveredAt || event.deliveredAt >= cutoff || firedEventNeedsJobProtection(event, activeHandlerIds)) continue;
+			await fsp.rm(eventPath, { force: true });
+			pruned += 1;
+		}
+		return pruned;
+	});
+}
+
 async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	const retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
 	const auditMaxEntries = options.auditMaxEntries ?? DEFAULT_AUDIT_MAX_ENTRIES;
 	const dryRun = options.dryRun === true;
 	const cutoff = Date.now() - retentionMs;
 	const firedEvents = await readFiredEventFiles();
-	const protectedJobIds = new Set(firedEvents.filter(({ event }) => !event.deliveredAt || event.deliveryStatus === "failed").map(({ event }) => event.jobId));
+	const deliveryProtection = await readPendingDeliveryProtectionSnapshot();
+	const protectedJobIds = deliveryProtection.jobIds;
 
-	let jobsPruned = 0;
-	const keptJobs = jobs.filter((job) => {
-		const prune = shouldPruneTerminalJob(job, cutoff, protectedJobIds);
-		if (prune) jobsPruned += 1;
-		return !prune;
-	});
+	const keptJobs = retainBoundedJobs(jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
+	const jobsPruned = jobs.length - keptJobs.length;
 	if (!dryRun && jobsPruned > 0) {
 		jobs = keptJobs;
 		// Prune must still merge against the latest on-disk jobs. Multiple Pi
@@ -1194,18 +1446,14 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		// otherwise delete an active watcher that another session registered a
 		// moment earlier, leaving only a job_registered audit entry and no fired,
 		// timeout, or cancelled terminal state.
-		await saveJobs({ pruneTerminalBefore: cutoff, protectedJobIds });
-		await appendLifecycleAudit("jobs_pruned", { jobsPruned, cutoff, protectedJobCount: protectedJobIds.size });
+		await saveJobs({ pruneTerminalBefore: cutoff, protectedJobIds, protectionFingerprint: deliveryProtection.fingerprint });
+		await appendLifecycleAudit("jobs_pruned", { jobsPruned, cutoff, terminalMax: DEFAULT_TERMINAL_JOB_MAX, protectedJobCount: protectedJobIds.size });
 	}
 
-	let firedEventsPruned = 0;
-	for (const { path: eventPath, event } of firedEvents) {
-		const deliveredAt = event.deliveredAt;
-		const prune = deliveredAt !== undefined && deliveredAt < cutoff && event.deliveryStatus !== "failed";
-		if (!prune) continue;
-		firedEventsPruned += 1;
-		if (!dryRun) await fsp.rm(eventPath, { force: true });
-	}
+	const firedEventPruneCandidates = firedEvents
+		.filter(({ event }) => event.deliveredAt !== undefined && event.deliveredAt < cutoff && !protectedJobIds.has(event.jobId))
+		.map(({ path: eventPath }) => eventPath);
+	const firedEventsPruned = dryRun ? firedEventPruneCandidates.length : await pruneFiredEventsIfEligible(firedEventPruneCandidates, cutoff);
 
 	let handlersPruned = 0;
 	let handlerDirsPruned = 0;
@@ -1396,6 +1644,15 @@ async function drainReturnOnBackgroundQueue(pi: ExtensionAPI): Promise<number> {
 			if (!job) continue;
 			const delivery = job.delivery ?? normalizeDelivery(undefined);
 			const result = await launchReturnHandler(pi, job, fired.reason ?? "background queue drain", delivery, { handlerId: bundle.handlerId, skipBackgroundRoute: true });
+			if (result) {
+				const now = Date.now();
+				await patchFiredEvent(firstEvent.payloadPath, {
+					deliveryStatus: result === "launched" ? "handler-launched" : result,
+					deliveredAt: now,
+					lastAttemptAt: now,
+					...(job.handlerRunId ? { handlerRunId: job.handlerRunId } : {}),
+				});
+			}
 			if (result === "launched") launched += 1;
 		}
 		return launched;
@@ -1688,11 +1945,26 @@ function scheduleJobsStateReload(pi: ExtensionAPI, delayMs = 100): void {
 	jobsStateReloadTimer.unref?.();
 }
 
+export async function revisionMarkerIsCurrent(lastSeenRevision: string | undefined, jobsFile = JOBS_FILE, revisionFile = JOBS_REVISION_FILE): Promise<boolean> {
+	if (!lastSeenRevision) return false;
+	try {
+		const [revision, markerStat, jobsStat] = await Promise.all([
+			fsp.readFile(revisionFile, "utf8").then((value) => value.trim()),
+			fsp.stat(revisionFile, { bigint: true }),
+			fsp.stat(jobsFile, { bigint: true }),
+		]);
+		return revision === lastSeenRevision && markerStat.mtimeNs >= jobsStat.mtimeNs;
+	} catch {
+		return false;
+	}
+}
+
 async function reloadJobsStateFromDisk(pi: ExtensionAPI): Promise<void> {
 	if (savingJobs || ticking) {
 		scheduleJobsStateReload(pi, 250);
 		return;
 	}
+	if (await revisionMarkerIsCurrent(lastSeenJobsRevision)) return;
 	await loadJobs();
 	ensureTicker(pi);
 }
@@ -1701,8 +1973,9 @@ async function startJobsStateWatcher(pi: ExtensionAPI): Promise<void> {
 	if (jobsStateWatcher) return;
 	await fsp.mkdir(STATE_DIR, { recursive: true });
 	try {
+		const watchedNames = new Set([path.basename(JOBS_FILE), path.basename(JOBS_REVISION_FILE)]);
 		jobsStateWatcher = fs.watch(STATE_DIR, (eventType, filename) => {
-			if (filename && filename !== path.basename(JOBS_FILE)) return;
+			if (filename && !watchedNames.has(filename.toString())) return;
 			if (eventType !== "rename" && eventType !== "change") return;
 			scheduleJobsStateReload(pi);
 		});
@@ -2649,6 +2922,22 @@ function runProcess(command: string, args: string[], options: { cwd: string; tim
 	});
 }
 
+export function jobEvaluationPersistenceKey(job: ReturnOnJob): string {
+	const semanticLeafState = Object.fromEntries(Object.entries(job.leafState ?? {}).map(([key, state]) => [key, {
+		...(state.lastMtimeMs !== undefined ? { lastMtimeMs: state.lastMtimeMs } : {}),
+		...(state.stableSince !== undefined ? { stableSince: state.stableSince } : {}),
+		...(state.lastValue !== undefined ? { lastValue: state.lastValue } : {}),
+	}]));
+	return stableJson({
+		status: job.status,
+		latches: job.latches,
+		leafState: semanticLeafState,
+		rearmPending: job.rearmPending,
+		fireCount: job.fireCount,
+		lastFiredAt: job.lastFiredAt,
+	});
+}
+
 async function tick(pi: ExtensionAPI): Promise<void> {
 	if (ticking) return;
 	ticking = true;
@@ -2658,47 +2947,41 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 			const now = Date.now();
 			if (job.timeoutAt && now >= job.timeoutAt) {
 				await fireJob(pi, job, "timeout");
-				changed = true;
 				continue;
 			}
 			try {
-				const previousLeafState = JSON.stringify(job.leafState);
+				const previousEvaluationState = jobEvaluationPersistenceKey(job);
 				// While re-arming, evaluate without latching so a leaf that is still true
 				// cannot re-latch and permanently mask the false edge we are waiting for.
 				// Otherwise the watcher would deadlock in rearmPending and never re-fire.
 				const result = await evaluateCondition(job, job.condition, "root", !job.rearmPending);
-				if (JSON.stringify(job.leafState) !== previousLeafState) changed = true;
+				const evaluationChanged = jobEvaluationPersistenceKey(job) !== previousEvaluationState;
 				if (job.status === "active" && job.timeoutAt && Date.now() >= job.timeoutAt) {
 					await fireJob(pi, job, "timeout");
-					changed = true;
 					continue;
 				}
-				if (result.value) {
-					if (job.rearmPending) {
-						// After a fire, require the condition to evaluate false at least
-						// once before we'll fire again. Skip this tick.
-						changed = true;
-					} else {
-						await fireJob(pi, job, result.summary);
-						changed = true;
-					}
-				} else {
-					if (job.rearmPending) {
-						job.rearmPending = false;
-						changed = true;
-					}
-					if (Object.keys(job.latches).length > 0) changed = true;
+				if (result.value && !job.rearmPending) {
+					await fireJob(pi, job, result.summary);
+					continue;
+				}
+				if (evaluationChanged) changed = true;
+				if (!result.value && job.rearmPending) {
+					job.rearmPending = false;
+					changed = true;
 				}
 				const dueCheckInAt = nextCheckInAt(job);
 				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) {
 					changed = (await sendCheckIn(pi, job)) || changed;
 				}
 			} catch (error) {
-				job.leafState.root = { ...job.leafState.root, lastSummary: `evaluation error: ${error instanceof Error ? error.message : String(error)}` };
-				job.updatedAt = now;
+				const errorSummary = `evaluation error: ${error instanceof Error ? error.message : String(error)}`;
+				if (job.leafState.root?.lastSummary !== errorSummary) {
+					job.leafState.root = { ...job.leafState.root, lastSummary: errorSummary };
+					job.updatedAt = now;
+					changed = true;
+				}
 				const dueCheckInAt = nextCheckInAt(job);
 				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) await sendCheckIn(pi, job);
-				changed = true;
 			}
 		}
 		if (changed) await saveJobs();
@@ -4594,6 +4877,7 @@ export default function (pi: ExtensionAPI) {
 			const endTurn = request.endTurn !== false;
 			const duplicate = findDuplicateActiveJob(job);
 			if (duplicate) {
+				if (pendingJobInsertIds.has(duplicate.id)) await saveJobs();
 				await appendLifecycleAudit("job_deduped", { id: duplicate.id, duplicateAttemptId: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, attemptedAt: job.createdAt });
 				try {
 					pi.appendEntry?.("return-on-deduped", { id: duplicate.id, attemptedId: job.id, label: duplicate.label, existingCreatedAt: duplicate.createdAt, attemptedAt: job.createdAt, condition: duplicate.condition });
@@ -4614,6 +4898,7 @@ export default function (pi: ExtensionAPI) {
 			if (!lineageFollowupGate.allowed) throw new Error(`return_on background lineage budget exhausted: ${lineageFollowupGate.reason ?? "lineage-followup-budget"}`);
 			if (conditionHasIncomingWebhook(job.condition)) await ensureIncomingWebhookServer(pi);
 			jobs.push(job);
+			pendingJobInsertIds.add(job.id);
 			await saveJobs();
 			await appendLifecycleAudit("job_registered", { id: job.id, label: job.label, cwd: job.cwd, sessionFile: job.sessionFile, registeredFromSessionFile: currentSessionFile, parentRouting, inheritedParentSession, createdAt: job.createdAt, timeoutAt: job.timeoutAt, timeoutMs, deliveryMode: job.delivery?.mode ?? "wake", maxFires, checkInEveryMs, condition: job.condition, resume: job.resume, every: job.every });
 			try {
