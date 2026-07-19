@@ -34,7 +34,7 @@ Slash commands:
 - `/return-on-cancel <id>`
 - `/return-on-handlers`
 - `/return-on-fired-events [pending|delivered|failed|all] [limit]`
-- `/return-on-prune [--dry-run] [--days=N] [--audit-max=N]`
+- `/return-on-prune [--dry-run] [--days=N] [--handler-days=N] [--audit-max=N]`
 - `/return-on-direct-waits [limit]`
 - `/return-on-audit [limit]`
 
@@ -70,7 +70,7 @@ Diagnostics:
 - `npm run collect:direct-waits` runs a read-only structured session scanner that extracts actual bash tool calls matching direct-wait patterns or long runtime thresholds and nearby `return_on` registrations into `~/.local/state/pi-return-on/direct-wait-examples.jsonl` for review. It does not auto-convert commands.
 - `npm run review:direct-waits` summarizes/dedupes that corpus, samples unreviewed examples, and can append human verdicts to the sidecar `~/.local/state/pi-return-on/direct-wait-example-reviews.jsonl` without mutating session logs.
 - Extension state is stored under `~/.local/state/pi-return-on/`, including `jobs.json`, its small `jobs.revision` notification marker, fired event capsules under `fired/<job-id>.json`, `handlers.json`, append-only `lifecycle-audit.jsonl`, direct-wait audit/corpus/review files, and per-handler stdout/stderr/session artifacts under `handlers/<handler-id>/`.
-- Startup cleanup reconciles stale fork-handler ledger entries, keeps active jobs and jobs with pending/failed/queued or actively handled delivery, and prunes ordinary terminal history by both age (30 days by default) and count (the newest 500 terminal jobs). Delivered fired-event capsules, completed handler artifacts, stale atomic `.tmp` write remnants, and old direct-wait audit entries use the age policy. Use `/return-on-prune --dry-run` or `return_on_prune` to inspect or override the retention window; the terminal count bound still applies.
+- Startup cleanup reconciles stale fork-handler ledger entries, keeps active jobs and jobs with pending/failed/queued or actively handled delivery, and prunes ordinary terminal history by both age (30 days by default) and count (the newest 500 terminal jobs). Delivered fired-event capsules, stale atomic `.tmp` write remnants, and old direct-wait audit entries use the 30-day state policy. Background handler transcripts and logs use a separate 7-day default: both completed ledger entries and unreferenced `handlers/<handler-id>/` directories are removed after that window, while primary Pi conversations under `~/.pi/agent/sessions/` are never touched. Use `/return-on-prune --dry-run`, `--days=N`, or `--handler-days=N` (tool field `handlerRetentionDays`) to inspect or override the windows; the terminal job count bound still applies.
 - Job saves use an OS advisory `flock` around the read/merge/write/rename transaction, re-read state only after acquiring the lock, and retry transient lock contention. Explicit local insert intent distinguishes a new unsaved registration from a stale memory-only job, so a process cannot resurrect an active or terminal job that another process already removed.
 - Poll ticks keep observation-only timestamps such as `lastCheckAt` in memory without rewriting `jobs.json`. Semantic transitions still persist immediately. `jobs.revision` lets filesystem watchers ignore their own/already-seen saves without reparsing the full jobs payload.
 
