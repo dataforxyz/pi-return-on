@@ -8,8 +8,9 @@ Prefer this pattern:
 
 1. Start long-running work in the background.
 2. Capture logs and pid files, preferably under `.return-on/`.
-3. Register a `return_on` watcher for the readiness/completion signal.
-4. End the current turn and let `return_on` wake the session later.
+3. Make terminal signals failure-safe: a `.done`/status file must still be written when the command exits nonzero, and process exit should be used as a fallback when practical.
+4. Register a `return_on` watcher for the readiness/completion signal.
+5. End the current turn and let `return_on` wake the session later.
 
 Avoid this pattern:
 
@@ -35,8 +36,9 @@ Block obvious direct waits in bash tool calls and return an actionable reason. T
 - common foreground dev/server commands such as `npm run dev`, `pnpm dev`, `yarn start`, `next dev`, `vite`, and `python -m http.server`
 - `timeout N <cmd>` (GNU coreutils) where `N` is 5 minutes or longer. Bounding a slow command with a hard ceiling still blocks the turn for up to `N`; the same workload should run in the background with a `return_on` watcher on its pid/log. `timeout` values between 30s and 5m are audited as `allowed_short_timeout` for visibility but not blocked.
 - `gh run watch <run-id>` and `gh pr checks --watch` (not `--watch=false`). Both poll a CI run synchronously and can pin the turn for the full duration of the workflow. Use an `exec` watcher that polls `gh run view <id> --json status` instead.
+- High-confidence fragile background completion wrappers: when `set -e`/`errexit` is enabled, a command such as `( work; printf '%s\\n' "$?" > "$DONE" ) &` never writes the sentinel if `work` returns nonzero. Use `if work; then rc=0; else rc=$?; fi`, or an `EXIT` trap, before writing terminal status. Capture `$!` and watch process exit as a fallback so unexpected wrapper failure cannot leave a file-only watcher waiting until timeout.
 
-Commands that are explicitly backgrounded with `&`, `nohup`, `setsid`, or `disown` are not blocked by this policy.
+Commands that are explicitly backgrounded with `&`, `nohup`, `setsid`, or `disown` are not blocked for merely being long-running. An explicitly backgrounded command can still be blocked when its completion wrapper is provably fragile under errexit.
 
 ## Observability
 

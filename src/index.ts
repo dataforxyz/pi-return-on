@@ -99,6 +99,7 @@ const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
 	"- Do not block the conversation with direct waits such as sleep commands of 10 seconds or longer, tail -f, watch, infinite polling loops, or foreground dev servers.",
 	"- For long-running work, start the command in the background, capture logs/pid files, then register a return_on watcher for the file, process, port, URL, webhook, or timer that means it is ready/done.",
+	"- Completion signals must survive command failure. With set -e/errexit, do not put a .done/status write after a command that may return nonzero; use if/else or an EXIT trap to record the status, and preferably watch the pid/process exit as a fallback.",
 	"- Choose a timeout that covers the longest reasonable wait; the packaged default max is 2h, so do not assume older 10m caps unless project settings say otherwise.",
 	"- For long waits, set checkInEvery (for example '5m', '10m', '15m', or '30m') when the parent should be woken periodically while the watcher is still pending.",
 	"- After registering return_on, end the turn and let return_on wake the session instead of polling manually.",
@@ -633,6 +634,33 @@ function isExplicitlyBackgrounded(command: string): boolean {
 		|| /(^|[^&])&(\s*(echo\s+\$!|disown|$|[;]))/.test(normalized);
 }
 
+function detectFragileErrexitCompletionSentinel(normalized: string): DirectWaitMatch | undefined {
+	if (!isExplicitlyBackgrounded(normalized)) return undefined;
+	if (!/(?:^|[;&()]\s*)set\s+(?:-[a-zA-Z]*e[a-zA-Z]*\b|-o\s+errexit\b)/.test(normalized)) return undefined;
+	// Be conservative when the wrapper contains an explicit errexit escape or
+	// failure-safe control flow. These forms can reliably reach their sentinel.
+	if (/(?:^|[;&()]\s*)set\s+(?:\+[a-zA-Z]*e[a-zA-Z]*\b|\+o\s+errexit\b)/.test(normalized)) return undefined;
+	if (/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/.test(normalized)) return undefined;
+	if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(normalized) || /\|\|/.test(normalized)) return undefined;
+
+	for (const assignment of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;]+))/g)) {
+		const variable = assignment[1];
+		const value = assignment[2] ?? assignment[3] ?? assignment[4] ?? "";
+		if (!/\.(?:done|status|exit|rc)$/.test(value)) continue;
+		const escapedVariable = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const redirect = `>{1,2}\\s*["']?\\$\\{?${escapedVariable}\\}?["']?`;
+		const directExitWrite = new RegExp(`;\\s*(?:printf|echo)\\b[^;&|)]*\\$\\?[^;&|)]*${redirect}`);
+		const capturedExitWrite = new RegExp(`;\\s*[A-Za-z_][A-Za-z0-9_]*=\\$\\?\\s*;\\s*(?:printf|echo)\\b[^;&|)]*${redirect}`);
+		if (directExitWrite.test(normalized) || capturedExitWrite.test(normalized)) {
+			return {
+				kind: "fragile completion sentinel",
+				detail: `set -e may skip the ${path.basename(value)} write after a nonzero exit`,
+			};
+		}
+	}
+	return undefined;
+}
+
 function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefined {
 	for (const match of normalized.matchAll(/(?:^|[;&|]\s*)(?:rtk\s+run\s+)?sleep\s+(\d+(?:\.\d+)?)(ms|s|m|h|d)?\b/g)) {
 		const durationMs = parseShellSleepDurationMs(match[1], match[2] ?? "s");
@@ -681,6 +709,8 @@ function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefine
 function analyzeDirectWait(command: string): DirectWaitAnalysis | undefined {
 	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
 	if (!normalized) return undefined;
+	const fragileSentinel = detectFragileErrexitCompletionSentinel(normalized);
+	if (fragileSentinel) return { ...fragileSentinel, action: "blocked" };
 	const match = detectDirectWaitPattern(normalized);
 	if (!match) return undefined;
 	if (isExplicitlyBackgrounded(normalized)) return { ...match, action: "allowed_backgrounded" };
@@ -695,6 +725,9 @@ function findDirectWait(command: string): DirectWaitMatch | undefined {
 }
 
 function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
+	if (match.kind === "fragile completion sentinel") {
+		return `Make terminal-state recording errexit-safe, for example: if <command>; then rc=0; else rc=$?; fi; printf '%s\\n' "$rc" > "$DONE". Also capture $! in a pid file and prefer a process-exited watcher (or any of process exit and sentinel file) so wrapper failure still wakes the session.`;
+	}
 	if (match.kind === "long sleep" && match.durationMs !== undefined) {
 		const after = formatDuration(match.durationMs);
 		return `Use a timer watcher: return_on({condition:{type:"timer", after:"${after}"}, resume:"continue"}).`;
@@ -722,7 +755,9 @@ function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
 
 function formatDirectWaitBlockReason(match: DirectWaitMatch): string {
 	return [
-		`Blocked direct wait (${match.kind}: ${match.detail}).`,
+		match.kind === "fragile completion sentinel"
+			? `Blocked fragile background wrapper (${match.detail}).`
+			: `Blocked direct wait (${match.kind}: ${match.detail}).`,
 		"Do not keep the agent turn busy waiting.",
 		suggestReturnOnForDirectWait(match),
 		"Capture logs and pid under .return-on/ so the watcher can observe them.",
@@ -5085,6 +5120,7 @@ export default function (pi: ExtensionAPI) {
 			"For long timeouts, set checkInEvery (for example '5m', '10m', '15m', or '30m') when the parent should be woken periodically while the watcher is still pending.",
 			"Do not use direct waits like sleep commands of 10 seconds or longer, tail -f, watch, foreground dev servers, or manual polling loops; start the work in the background and register return_on instead.",
 			"For long-running commands, capture logs and pid files (for example under .return-on/) so return_on can watch a file/log/process/port/url signal and wake the session later.",
+			"Make completion signals failure-safe: under set -e/errexit, a nonzero command can skip a following .done/status write. Record status through if/else or an EXIT trap, and preferably include a process-exited watcher as a fallback.",
 			"return_on conditions latch once true; combine leaves with op='and', op='or', op='not' or shorthand any/all/not.",
 			"By default each watcher fires once and is retired. Set maxFires to a positive integer to fire up to N times (edge-triggered: the condition must evaluate false between fires); timer-only conditions cannot be combined with maxFires>1.",
 			"Prefer first-class process/port/url/file/timer leaves before exec. Exec leaves run arbitrary local commands; set allowExec only after user approval.",
