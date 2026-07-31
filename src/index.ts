@@ -4793,6 +4793,31 @@ async function findJobForCommand(args: string, ctx: ExtensionContext): Promise<R
 	return job;
 }
 
+interface CancellationTarget {
+	job: ReturnOnJob;
+	cancellable: boolean;
+}
+
+async function findVisibleJobForCancellation(id: string, session: string | undefined): Promise<CancellationTarget | undefined> {
+	const visible = (candidate: ReturnOnJob) => candidate.id === id && jobVisibleForSession(candidate, session);
+	const active = jobs.find((candidate) => candidate.status === "active" && visible(candidate));
+	if (active) return { job: active, cancellable: true };
+	const terminal = jobs.find((candidate) => visible(candidate));
+	if (!terminal) return undefined;
+	if (terminal.status === "fired" && terminal.handlerRunId) {
+		await loadHandlers();
+		const handler = handlerRuns.find((run) => run.id === terminal.handlerRunId);
+		if (handler && isActiveHandlerRun(handler)) return { job: terminal, cancellable: true };
+	}
+	return { job: terminal, cancellable: false };
+}
+
+function formatCancellationNotNeeded(job: ReturnOnJob): string {
+	if (job.status === "cancelled") return `Cancellation not needed for ${job.id}: watcher is already cancelled.`;
+	if (job.fireReason === "timeout") return `Cancellation not needed for ${job.id}: watcher already expired.`;
+	return `Cancellation not needed for ${job.id}: watcher is already done.`;
+}
+
 async function notifyDirectWaitAudit(args: string, ctx: ExtensionContext): Promise<void> {
 	latestCtx = ctx;
 	const requestedLimit = Number.parseInt(args.trim(), 10);
@@ -5014,10 +5039,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("return-on-cancel", {
-		description: "Cancel a return_on job: /return-on-cancel <id>",
+		description: "Cancel an active return_on job: /return-on-cancel <id>",
 		handler: async (args, ctx) => {
-			const job = await findJobForCommand(args, ctx);
-			if (!job) return;
+			latestCtx = ctx;
+			await loadJobs();
+			const id = args.trim();
+			const session = ctx.sessionManager.getSessionFile() ?? undefined;
+			const target = await findVisibleJobForCancellation(id, session);
+			if (!target) {
+				ctx.ui.notify(`No return_on job found for '${id}'`, "warning");
+				return;
+			}
+			const { job } = target;
+			if (!target.cancellable) {
+				ctx.ui.notify(formatCancellationNotNeeded(job), "info");
+				return;
+			}
 			job.status = "cancelled";
 			job.cancelledAt = Date.now();
 			job.updatedAt = job.cancelledAt;
@@ -5176,21 +5213,28 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "return_on_cancel",
 		label: "Cancel Return On",
-		description: "Cancel a background return_on watcher by id.",
+		description: "Cancel an active background return_on watcher by id. Already completed, expired, or cancelled watchers are reported without being modified.",
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			await loadJobs();
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;
-			const job = jobs.find((candidate) => candidate.id === params.id && jobVisibleForSession(candidate, session));
-			if (!job) throw new Error(`No return_on job found for '${params.id}'`);
+			const target = await findVisibleJobForCancellation(params.id, session);
+			if (!target) throw new Error(`No return_on job found for '${params.id}'`);
+			const { job } = target;
+			if (!target.cancellable) {
+				return {
+					content: [{ type: "text", text: formatCancellationNotNeeded(job) }],
+					details: { job, cancelled: false, alreadyTerminal: true },
+				};
+			}
 			job.status = "cancelled";
 			job.cancelledAt = Date.now();
 			job.updatedAt = job.cancelledAt;
 			await saveJobs();
 			await appendLifecycleAudit("job_cancelled", { id: job.id, label: job.label, cancelledAt: job.cancelledAt });
 			ensureTicker(pi);
-			return { content: [{ type: "text", text: `Cancelled ${job.id}.` }], details: { job } };
+			return { content: [{ type: "text", text: `Cancelled ${job.id}.` }], details: { job, cancelled: true } };
 		},
 	});
 

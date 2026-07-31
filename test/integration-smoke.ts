@@ -196,7 +196,7 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
   }
 
   async function cancel(id: string) {
-    await requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
+    return requireTool("return_on_cancel").execute("cancel", { id }, new AbortController().signal, () => {}, ctx);
   }
 
   return { beforeAgentStart, callTool, commands, ctx, emit, entries, messages, notifications, register, cancel, runCommand, sessionFile, statuses, toolCall, tools, get confirmCalls() { return confirmCalls; } };
@@ -405,6 +405,14 @@ async function testTimer(harness: Harness) {
   const jobId = await harness.register({ label, condition: { type: "timer", after: "1500ms" }, resume });
   await expectNoWake(harness, jobId, 900, "timer fired before target");
   await waitForWake(harness, { jobId, label, resume }, 2_500);
+  const cancelResult = await harness.callTool("return_on_cancel", { id: jobId });
+  const cancelText = String(cancelResult.content?.[0]?.text ?? "");
+  if (!cancelText.includes("Cancellation not needed") || !cancelText.includes("already done")) {
+    throw new Error(`completed watcher cancellation returned the wrong message: ${cancelText}`);
+  }
+  if (cancelResult.details?.cancelled !== false || cancelResult.details?.job?.status !== "fired") {
+    throw new Error(`completed watcher was changed by cancellation: ${JSON.stringify(cancelResult.details)}`);
+  }
 }
 
 async function testRegisterWithoutEndingTurn(harness: Harness) {
@@ -1423,6 +1431,20 @@ async function testTimeoutWake(harness: Harness) {
   await expectNoWake(harness, jobId, 900, "timeout fired too early");
   const entry = await waitForWake(harness, { jobId, label, resume }, 3_000);
   if (!String(entry.message.content).includes("Reason: timeout")) throw new Error("timeout wake did not include timeout reason");
+
+  await harness.runCommand("return-on-cancel", jobId);
+  const commandText = harness.notifications.at(-1)?.message ?? "";
+  if (!commandText.includes("Cancellation not needed") || !commandText.includes("already expired")) {
+    throw new Error(`expired watcher cancel command returned the wrong message: ${commandText}`);
+  }
+  const cancelResult = await harness.callTool("return_on_cancel", { id: jobId });
+  const cancelText = String(cancelResult.content?.[0]?.text ?? "");
+  if (!cancelText.includes("Cancellation not needed") || !cancelText.includes("already expired")) {
+    throw new Error(`expired watcher cancellation returned the wrong message: ${cancelText}`);
+  }
+  if (cancelResult.details?.cancelled !== false || cancelResult.details?.job?.status !== "fired" || cancelResult.details?.job?.fireReason !== "timeout") {
+    throw new Error(`expired watcher was changed by cancellation: ${JSON.stringify(cancelResult.details)}`);
+  }
 }
 
 async function testTimeoutBeatsSlowTrueEval(harness: Harness) {
@@ -1830,6 +1852,14 @@ async function testListToolAndCommands() {
   }
   const cancelId = await harness.register({ label: "list cancel", condition: { type: "timer", after: "10s" }, resume: "list cancel resume" });
   await harness.cancel(cancelId);
+  const redundantCancel = await harness.cancel(cancelId);
+  const redundantCancelText = String(redundantCancel.content?.[0]?.text ?? "");
+  if (!redundantCancelText.includes("Cancellation not needed") || !redundantCancelText.includes("already cancelled")) {
+    throw new Error(`already-cancelled watcher returned the wrong message: ${redundantCancelText}`);
+  }
+  if (redundantCancel.details?.cancelled !== false || redundantCancel.details?.job?.status !== "cancelled") {
+    throw new Error(`already-cancelled watcher changed state: ${JSON.stringify(redundantCancel.details)}`);
+  }
 
   const listTool = harness.tools.get("return_on_list");
   if (!listTool) throw new Error("missing return_on_list tool");
