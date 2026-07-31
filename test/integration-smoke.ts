@@ -311,6 +311,42 @@ rm -f "$LOG" "$DONE"
     throw new Error(`errexit-fragile completion sentinel was not blocked with a safe rewrite: ${JSON.stringify(fragileSentinel)}`);
   }
 
+  const hardenedFragileCases = [
+    {
+      name: "multiline set -e after shebang",
+      command: `#!/usr/bin/env bash
+printf 'preparation\\n'
+set -e
+DONE=.return-on/later.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "literal sentinel path",
+      command: `set -e
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > .return-on/literal.done ) &`,
+    },
+    {
+      name: "unrelated safe control flow outside wrapper",
+      command: `if test -d .; then printf ready; fi
+false || true
+set -e
+DONE=.return-on/scoped.done
+( pr-state.sh 3969 --wait; rc=$?; printf '%s\\n' "$rc" > "$DONE" ) &`,
+    },
+    {
+      name: "compound set -o errexit",
+      command: `set -o pipefail -o errexit
+DONE=.return-on/compound.status
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "\${DONE}" ) &`,
+    },
+  ];
+  for (const candidate of hardenedFragileCases) {
+    const result = await harness.toolCall("bash", { command: candidate.command });
+    if (!result?.block || !String(result.reason).includes("fragile background wrapper")) {
+      throw new Error(`${candidate.name} was not blocked: ${JSON.stringify(result)}`);
+    }
+  }
+
   const safeSentinel = await harness.toolCall("bash", {
     command: `set -e
 LOG=.return-on/pr-state.log
@@ -326,6 +362,20 @@ DONE=.return-on/pr-state.done
 ( trap 'rc=$?; printf "%s\\n" "$rc" > "$DONE"' EXIT; pr-state.sh 3969 --wait ) &`,
   });
   if (trappedSentinel?.block) throw new Error(`EXIT-trapped completion sentinel should not be blocked: ${JSON.stringify(trappedSentinel)}`);
+
+  const disabledErrexitSentinel = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/pr-state.done
+( set +e; pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (disabledErrexitSentinel?.block) throw new Error(`set +e completion sentinel should not be blocked: ${JSON.stringify(disabledErrexitSentinel)}`);
+
+  const differentVariable = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/pr-state.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONEX" ) &`,
+  });
+  if (differentVariable?.block) throw new Error(`different variable name should not match DONE: ${JSON.stringify(differentVariable)}`);
 
   const longTimeout = await harness.toolCall("bash", { command: "timeout 900 uv run pytest tests/" });
   if (!longTimeout?.block || !String(longTimeout.reason).includes("timeout-bounded command")) {
