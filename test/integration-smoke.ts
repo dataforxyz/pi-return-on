@@ -1564,6 +1564,58 @@ async function testCheckInSkipsActiveAgentTurn() {
   await harness.emit("session_shutdown");
 }
 
+async function testAgentEndRearmsPendingCheckIn() {
+  const harness = createHarness("checkin-agent-end-rearm-session");
+  await harness.emit("session_start");
+  const jobId = await harness.register({
+    label: "smoke agent-end check-in rearm",
+    condition: { type: "webhook" },
+    timeout: "6s",
+    checkInEvery: "1s",
+    resume: "agent-end check-in rearm resume",
+  });
+  await waitForCheckIn(harness, jobId, 1, 1_800);
+  await harness.emit("agent_end");
+  await waitForCheckIn(harness, jobId, 2, 1_500);
+  await harness.cancel(jobId);
+  await harness.emit("session_shutdown");
+}
+
+async function testPostShutdownWebhookCannotReviveScheduler() {
+  const harness = createHarness("post-shutdown-webhook-session");
+  await harness.emit("session_start");
+  const result = await harness.callTool("return_on", {
+    label: "smoke post-shutdown webhook fence",
+    condition: { type: "webhook", bodyContains: "done" },
+    timeout: "5s",
+    resume: "post-shutdown webhook fence resume",
+  });
+  const jobId = result.details.job.id as string;
+  allJobIds.push(jobId);
+  const webhookUrl = new URL(result.details.incomingWebhooks?.[0]?.url);
+  const socket = net.createConnection({ host: webhookUrl.hostname, port: Number(webhookUrl.port) });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write([
+    `POST ${webhookUrl.pathname}${webhookUrl.search} HTTP/1.1`,
+    `Host: ${webhookUrl.host}`,
+    "Content-Length: 4",
+    "Connection: close",
+    "",
+    "do",
+  ].join("\r\n"));
+  await sleep(100);
+  await harness.emit("session_shutdown");
+  socket.end("ne");
+  await new Promise<void>((resolve) => {
+    socket.once("close", resolve);
+    setTimeout(resolve, 1_000).unref?.();
+  });
+  await expectNoWake(harness, jobId, 500, "a webhook handler completed after session shutdown");
+}
+
 async function testCheckInEvery(harness: Harness) {
   const label = "smoke check-in";
   const resume = "check-in resume";
@@ -2289,6 +2341,7 @@ const busyHarness = createHarness("busy-session", { isIdle: () => false });
 await busyHarness.emit("session_start");
 await testAutoDeliveryForksBusyParent(busyHarness);
 await busyHarness.emit("session_shutdown");
+await harness.emit("session_start");
 await testEmptyForkHandlerSummaryFallback(harness);
 await testCancelledForkHandlerSuppressesSummary(harness);
 await testForkLaunchFailureFallsBackToWake(harness);
@@ -2323,6 +2376,9 @@ await testCheckInSkipsBusyParent();
 await testCheckInSkipsBeforeAgentStartTurn();
 await testCheckInSkipsActiveSignal();
 await testCheckInSkipsActiveAgentTurn();
+await testAgentEndRearmsPendingCheckIn();
+await testPostShutdownWebhookCannotReviveScheduler();
+await harness.emit("session_start");
 await testDefaultMaxTimeoutIsTwoHours(harness);
 await testDefaultTimeoutAndMax(harness);
 await testDefaultDeliverySettings(harness);

@@ -8,6 +8,7 @@ import {
 	applyFiredEventToJob,
 	collectConditionLeafTargets,
 	collectFileWatchTargets,
+	deferCheckInRetry,
 	evaluateCondition,
 	firedEventNeedsJobProtection,
 	collectIncomingWebhookTargets,
@@ -18,6 +19,8 @@ import {
 	jobEvaluationPersistenceKey,
 	jobsNeedProtectionLookup,
 	normalizeCondition,
+	nextJobEvaluationAt,
+	nextTickerDelay,
 	patchFiredEvent,
 	pruneTempFiles,
 	readResponseTextLimited,
@@ -57,6 +60,54 @@ function makeMergeJob(id: string, status: "active" | "fired" | "cancelled", upda
 		...(status === "cancelled" ? { cancelledAt: updatedAt } : {}),
 	};
 }
+
+test("deadline scheduler uses polling deadlines and a coarse fallback", () => {
+	const url = { ...makeJob({ type: "url", url: "https://example.test", every: "60s" }), createdAt: 10_000, timeoutAt: 300_000 };
+	assert.equal(nextJobEvaluationAt(url, 10_000), 10_500, "first poll retains a bounded sub-second startup cadence");
+	url.leafState.root = { lastCheckAt: 1_000, lastValue: false };
+	assert.equal(nextJobEvaluationAt(url, 10_000), 61_000);
+	assert.equal(nextTickerDelay([url], 10_000), 51_000);
+
+	const webhook = makeJob({ type: "webhook", path: "/return-on/test" });
+	assert.equal(nextJobEvaluationAt(webhook, 10_000), undefined);
+	assert.equal(nextTickerDelay([webhook], 10_000), 60_000);
+});
+
+test("deadline scheduler preserves timer, latch, rearm, not, and stableFor semantics", () => {
+	const timer = makeJob({ type: "timer", after: "5m" });
+	assert.equal(nextJobEvaluationAt(timer, 10_000), 300_000);
+	timer.latches.root = { trueAt: 300_000, summary: "timer elapsed" };
+	assert.equal(nextJobEvaluationAt(timer, 310_000), undefined);
+	timer.rearmPending = true;
+	assert.equal(nextJobEvaluationAt(timer, 310_000), undefined, "an elapsed timer cannot help a re-arming tree observe a false edge");
+
+	const negatedTimer = makeJob({ op: "not", children: [{ type: "timer", after: "5m" }] });
+	assert.equal(nextJobEvaluationAt(negatedTimer, 10_000), 300_000);
+	assert.equal(nextJobEvaluationAt(negatedTimer, 310_000), undefined, "an elapsed timer under not is permanently true and must not spin");
+
+	const negated = makeJob({ op: "not", children: [{ type: "process", pid: 123, state: "running", every: "30s" }] });
+	negated.latches["root.0"] = { trueAt: 1, summary: "synthetic stale latch" };
+	negated.leafState["root.0"] = { lastCheckAt: 5_000, lastValue: true };
+	assert.equal(nextJobEvaluationAt(negated, 10_000), 35_000, "not descendants never use latches");
+
+	const stable = makeJob({ type: "file", path: "/tmp/example", stableFor: "10s", every: "30s" });
+	stable.leafState.root = { lastCheckAt: 5_000, stableSince: 6_000, lastValue: false };
+	assert.equal(nextJobEvaluationAt(stable, 10_000), 35_000, "stableFor remains gated by the poll interval");
+});
+
+test("deadline scheduler retries due work conservatively after a completed tick", () => {
+	const due = { ...makeJob({ type: "url", url: "https://example.test", every: "60s" }), timeoutAt: 5_000 };
+	assert.equal(nextTickerDelay([due], 10_000), 0);
+	assert.equal(nextTickerDelay([due], 10_000, 250), 250);
+});
+
+test("undeliverable check-ins use a bounded retry floor instead of staying overdue", () => {
+	const job = { ...makeJob({ type: "webhook", path: "/return-on/test" }), checkInEveryMs: 1_000 };
+	assert.equal(nextJobEvaluationAt(job, 1_500), 1_000);
+	assert.equal(deferCheckInRetry(job, 1_500), 2_500);
+	assert.equal(nextJobEvaluationAt(job, 1_500), 2_500);
+	assert.equal(nextTickerDelay([job], 1_500, 250), 1_000);
+});
 
 function makeHandler(id: string, status: "starting" | "running" | "complete" | "failed", startedAt: number): any {
 	return {

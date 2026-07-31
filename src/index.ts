@@ -45,7 +45,11 @@ const HANDLERS_FILE = path.join(STATE_DIR, "handlers.json");
 const HANDLERS_DIR = path.join(STATE_DIR, "handlers");
 const DIRECT_WAIT_AUDIT_FILE = path.join(STATE_DIR, "direct-wait-audit.jsonl");
 const LIFECYCLE_AUDIT_FILE = path.join(STATE_DIR, "lifecycle-audit.jsonl");
-const DEFAULT_TICK_MS = 1000;
+const DUE_WORK_RETRY_MS = 250;
+const CHECK_IN_RETRY_MAX_MS = 5_000;
+const INITIAL_POLL_DELAY_MS = 500;
+const TICK_FALLBACK_MS = 60_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const DEFAULT_EXEC_EVERY_MS = 5000;
 const DEFAULT_EXEC_TIMEOUT_MS = 10_000;
 const DEFAULT_FILE_EVERY_MS = 1000;
@@ -465,12 +469,19 @@ let jobs: ReturnOnJob[] = [];
 let handlerRuns: ReturnOnHandlerRun[] = [];
 let currentSessionFile: string | undefined;
 let agentTurnActive = false;
-let tickTimer: ReturnType<typeof setInterval> | undefined;
+let tickTimer: ReturnType<typeof setTimeout> | undefined;
+let tickTimerAt: number | undefined;
+let tickTimerOwner: ExtensionAPI | undefined;
 let immediateTickTimer: ReturnType<typeof setTimeout> | undefined;
 let jobsStateWatcher: fs.FSWatcher | undefined;
 let jobsStateReloadTimer: ReturnType<typeof setTimeout> | undefined;
 let latestCtx: ExtensionContext | undefined;
+let currentPi: ExtensionAPI | undefined;
+let schedulerGeneration = 0;
 let ticking = false;
+let tickPending = false;
+const immediateJobIds = new Set<string>();
+const checkInRetryAtByJob = new WeakMap<ReturnOnJob, number>();
 let backgroundQueueDrainActive = false;
 let backgroundQueueDrainPending = false;
 let backgroundQueueDrainTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2013,23 +2024,117 @@ async function shouldLaunchForkForDelivery(pi: ExtensionAPI, job: ReturnOnJob, d
 	return lineageGate.allowed;
 }
 
+function activateScheduler(pi: ExtensionAPI): void {
+	if (currentPi === pi) return;
+	schedulerGeneration += 1;
+	currentPi = pi;
+	tickPending = false;
+	stopTicker();
+	if (immediateTickTimer) clearTimeout(immediateTickTimer);
+	immediateTickTimer = undefined;
+}
+
 function updateStatus(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
 	const active = activeJobsForCurrentSession();
 	ctx.ui.setStatus(EXTENSION_NAME, active.length > 0 ? formatStatusTag(active, ctx.ui.theme) : undefined);
 }
 
-function startTicker(pi: ExtensionAPI): void {
-	if (tickTimer) return;
-	tickTimer = setInterval(() => {
-		void tick(pi);
-	}, DEFAULT_TICK_MS);
+interface ScheduledLeafTarget extends ConditionLeafTarget {
+	latchable: boolean;
+}
+
+function collectScheduledLeafTargets(
+	condition: Condition,
+	key = "root",
+	latchable = true,
+	targets: ScheduledLeafTarget[] = [],
+): ScheduledLeafTarget[] {
+	if (isGroupCondition(condition)) {
+		const childLatchable = latchable && condition.op !== "not";
+		condition.children.forEach((child, index) => collectScheduledLeafTargets(child, `${key}.${index}`, childLatchable, targets));
+		return targets;
+	}
+	targets.push({ key, condition, latchable });
+	return targets;
+}
+
+export function nextJobEvaluationAt(job: ReturnOnJob, now = Date.now()): number | undefined {
+	if (job.status !== "active") return undefined;
+	const deadlines: number[] = [];
+	if (job.timeoutAt !== undefined) deadlines.push(job.timeoutAt);
+	if (!job.checkInWakePending) {
+		const checkInAt = nextCheckInAt(job);
+		if (checkInAt !== undefined) deadlines.push(Math.max(checkInAt, checkInRetryAtByJob.get(job) ?? 0));
+	}
+	for (const target of collectScheduledLeafTargets(job.condition)) {
+		if (!job.rearmPending && target.latchable && job.latches[target.key]) continue;
+		const condition = target.condition;
+		if (condition.type === "timer") {
+			const timerAt = timerTargetAt(job, condition);
+			if (timerAt !== undefined && (timerAt > now || (!job.rearmPending && target.latchable && !job.latches[target.key]))) {
+				deadlines.push(timerAt);
+			}
+			continue;
+		}
+		if (condition.type === "webhook") continue;
+		if (condition.type === "exec" && job.allowExec !== true) continue;
+		const everyMs = pollingIntervalForLeaf(job, condition);
+		if (everyMs === undefined) continue;
+		const lastCheckAt = job.leafState[target.key]?.lastCheckAt;
+		deadlines.push(lastCheckAt === 0
+			? now
+			: lastCheckAt !== undefined
+				? lastCheckAt + everyMs
+				: job.createdAt + Math.min(everyMs, INITIAL_POLL_DELAY_MS));
+	}
+	return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+}
+
+export function nextEvaluationAt(active: readonly ReturnOnJob[], now = Date.now()): number | undefined {
+	const deadlines = active
+		.map((job) => nextJobEvaluationAt(job, now))
+		.filter((deadline): deadline is number => deadline !== undefined);
+	return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+}
+
+export function nextTickerDelay(active: readonly ReturnOnJob[], now = Date.now(), dueRetryMs = 0): number {
+	const deadline = nextEvaluationAt(active, now);
+	const targetAt = Math.min(deadline ?? Number.POSITIVE_INFINITY, now + TICK_FALLBACK_MS);
+	if (targetAt <= now) return Math.max(0, dueRetryMs);
+	return Math.min(MAX_TIMER_DELAY_MS, Math.max(1, targetAt - now));
+}
+
+function startTicker(pi: ExtensionAPI, active: readonly ReturnOnJob[], dueRetryMs = 0): void {
+	const now = Date.now();
+	const delayMs = nextTickerDelay(active, now, dueRetryMs);
+	if (delayMs === 0) {
+		requestImmediateTick(pi);
+		return;
+	}
+	const targetAt = now + delayMs;
+	// Concurrent saves, file events, and handler completions can observe slightly
+	// different in-memory snapshots. Never let a later/stale schedule postpone an
+	// already armed earlier deadline; an early wake is harmless and recomputes.
+	if (tickTimer && tickTimerOwner === pi && tickTimerAt !== undefined && tickTimerAt <= targetAt) return;
+	stopTicker();
+	tickTimerAt = targetAt;
+	tickTimerOwner = pi;
+	const generation = schedulerGeneration;
+	tickTimer = setTimeout(() => {
+		tickTimer = undefined;
+		tickTimerAt = undefined;
+		tickTimerOwner = undefined;
+		void tick(pi, generation);
+	}, delayMs);
 	tickTimer.unref?.();
 }
 
 function stopTicker(): void {
-	if (tickTimer) clearInterval(tickTimer);
+	if (tickTimer) clearTimeout(tickTimer);
 	tickTimer = undefined;
+	tickTimerAt = undefined;
+	tickTimerOwner = undefined;
 }
 
 function scheduleJobsStateReload(pi: ExtensionAPI, delayMs = 100): void {
@@ -2093,10 +2198,12 @@ function stopJobsStateWatcher(): void {
 }
 
 function requestImmediateTick(pi: ExtensionAPI): void {
+	if (shuttingDown || currentPi !== pi) return;
 	if (immediateTickTimer) return;
+	const generation = schedulerGeneration;
 	immediateTickTimer = setTimeout(() => {
 		immediateTickTimer = undefined;
-		void tick(pi);
+		void tick(pi, generation);
 	}, 0);
 	immediateTickTimer.unref?.();
 }
@@ -2113,15 +2220,18 @@ function stopIncomingWebhookServer(): void {
 	incomingWebhookServerStarting = undefined;
 }
 
-function ensureTicker(pi: ExtensionAPI): void {
+function ensureTicker(pi: ExtensionAPI, dueRetryMs = 0): void {
+	if (shuttingDown || currentPi !== pi) return;
 	const active = activeJobsForCurrentSession();
 	if (active.length > 0) {
-		startTicker(pi);
+		startTicker(pi, active, dueRetryMs);
 		reconcileFileWatchers(pi);
 		if (active.some((job) => conditionHasIncomingWebhook(job.condition))) void ensureIncomingWebhookServer(pi);
 		else stopIncomingWebhookServer();
 	} else {
-		stopTicker();
+		// Do not cancel an already armed timeout from an empty snapshot: concurrent
+		// save/reload paths may momentarily omit a newly inserted active job. The
+		// timeout is one-shot, so a genuinely empty state costs at most one wake.
 		stopFileWatchers();
 		stopIncomingWebhookServer();
 	}
@@ -2397,6 +2507,7 @@ function reconcileFileWatchers(pi: ExtensionAPI): void {
 					if (!job) continue;
 					const state = job.leafState[target.key] ??= {};
 					state.lastCheckAt = 0;
+					immediateJobIds.add(job.id);
 				}
 				requestImmediateTick(pi);
 			});
@@ -2981,6 +3092,7 @@ async function handleIncomingWebhook(pi: ExtensionAPI, req: http.IncomingMessage
 			job.latches[target.key] = { trueAt: now, summary, details: { method: req.method, path: url.pathname, body: truncateText(body) } };
 			job.leafState[target.key] = { ...job.leafState[target.key], lastValue: true, lastSummary: summary, lastCheckAt: now };
 			job.updatedAt = now;
+			immediateJobIds.add(job.id);
 		}
 		await saveJobs();
 		requestImmediateTick(pi);
@@ -3034,13 +3146,22 @@ export function jobEvaluationPersistenceKey(job: ReturnOnJob): string {
 	});
 }
 
-async function tick(pi: ExtensionAPI): Promise<void> {
-	if (ticking) return;
+async function tick(pi: ExtensionAPI, generation: number): Promise<void> {
+	if (generation !== schedulerGeneration || pi !== currentPi || shuttingDown) return;
+	if (ticking) {
+		tickPending = true;
+		return;
+	}
 	ticking = true;
+	let tickerScheduled = false;
 	try {
 		let changed = false;
 		for (const job of activeJobsForCurrentSession()) {
+			if (generation !== schedulerGeneration || pi !== currentPi || shuttingDown) return;
 			const now = Date.now();
+			const forced = immediateJobIds.delete(job.id);
+			const dueAt = nextJobEvaluationAt(job, now);
+			if (!forced && dueAt !== undefined && dueAt > now) continue;
 			if (job.timeoutAt && now >= job.timeoutAt) {
 				await fireJob(pi, job, "timeout");
 				continue;
@@ -3080,10 +3201,29 @@ async function tick(pi: ExtensionAPI): Promise<void> {
 				if (job.status === "active" && dueCheckInAt !== undefined && now >= dueCheckInAt) await sendCheckIn(pi, job);
 			}
 		}
-		if (changed) await saveJobs();
-		ensureTicker(pi);
+		// Arm the next deadline before persistence. saveJobs() can queue behind
+		// other processes; leaving no timer during that wait can lose the only
+		// future wake when an in-memory merge is temporarily stale.
+		if (generation === schedulerGeneration && pi === currentPi && !shuttingDown) {
+			ensureTicker(pi, DUE_WORK_RETRY_MS);
+			tickerScheduled = true;
+		}
+		if (changed) {
+			// Observation persistence is serialized by saveJobsQueue and snapshots the
+			// current state synchronously. Do not hold the single evaluation gate while
+			// waiting behind unrelated writers; later terminal/check-in saves remain
+			// ordered behind this snapshot and are still awaited by their own paths.
+			void saveJobs().catch((error) => console.error(`[${EXTENSION_NAME}] Failed to persist condition progress:`, error));
+		}
 	} finally {
 		ticking = false;
+		const stillCurrent = !shuttingDown && generation === schedulerGeneration && pi === currentPi;
+		if (stillCurrent && !tickerScheduled) ensureTicker(pi, DUE_WORK_RETRY_MS);
+		if (tickPending) {
+			tickPending = false;
+			if (stillCurrent) requestImmediateTick(pi);
+			else if (!shuttingDown && currentPi) requestImmediateTick(currentPi);
+		}
 	}
 }
 
@@ -3793,9 +3933,20 @@ function formatCheckInMessage(job: ReturnOnJob, checkedInAt = Date.now()): strin
 	].join("\n");
 }
 
+export function deferCheckInRetry(job: ReturnOnJob, now = Date.now()): number | undefined {
+	if (!job.checkInEveryMs) return undefined;
+	const retryAt = now + Math.min(CHECK_IN_RETRY_MAX_MS, Math.max(1_000, job.checkInEveryMs));
+	checkInRetryAtByJob.set(job, retryAt);
+	return retryAt;
+}
+
 async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean> {
 	if (job.status !== "active" || !job.checkInEveryMs || job.checkInWakePending) return false;
-	if (!canQueueParentTurn()) return false;
+	if (!canQueueParentTurn()) {
+		deferCheckInRetry(job);
+		return false;
+	}
+	checkInRetryAtByJob.delete(job);
 	const now = Date.now();
 	job.lastCheckInAt = now;
 	job.checkInCount = (job.checkInCount ?? 0) + 1;
@@ -3829,7 +3980,9 @@ async function sendCheckIn(pi: ExtensionAPI, job: ReturnOnJob): Promise<boolean>
 async function clearPendingCheckInWakes(sessionFile?: string): Promise<void> {
 	let changed = false;
 	for (const job of jobs) {
-		if (!job.checkInWakePending || !jobVisibleForSession(job, sessionFile)) continue;
+		if (!jobVisibleForSession(job, sessionFile)) continue;
+		checkInRetryAtByJob.delete(job);
+		if (!job.checkInWakePending) continue;
 		job.checkInWakePending = false;
 		changed = true;
 	}
@@ -4696,6 +4849,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async () => {
 		agentTurnActive = false;
 		await clearPendingCheckInWakes(currentSessionFile);
+		ensureTicker(pi);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -4729,6 +4883,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		activateScheduler(pi);
 		latestCtx = ctx;
 		piForksExtensionEnabled(pi);
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
@@ -4759,7 +4914,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (currentPi !== pi) return;
 		shuttingDown = true;
+		schedulerGeneration += 1;
+		currentPi = undefined;
+		tickPending = false;
+		immediateJobIds.clear();
 		agentTurnActive = false;
 		stopTicker();
 		stopJobsStateWatcher();
