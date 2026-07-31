@@ -21,7 +21,7 @@ Use this when the agent would otherwise waste tokens waiting for a build, render
 - `return_on` — register a watcher and terminate the current LLM turn.
 - `return_on_list` — list watcher jobs for the current session.
 - `return_on_status` — show detailed status for one watcher by id.
-- `return_on_cancel` — cancel a watcher by id.
+- `return_on_cancel` — cancel an active watcher by id. Completed, expired, and already-cancelled watchers are left unchanged and reported as not needing cancellation; a fired watcher with a still-running handler remains cancellable so its pending summary can be suppressed.
 - `return_on_handlers` — list background fork/sibling handlers launched for fired watchers.
 - `return_on_fired_events` — list durable fired-event capsules used for restart-safe delivery.
 - `return_on_prune` — prune old retained jobs, fired-event capsules, handler artifacts, and direct-wait audit entries.
