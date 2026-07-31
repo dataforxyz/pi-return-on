@@ -339,6 +339,27 @@ DONE=.return-on/scoped.done
 DONE=.return-on/compound.status
 ( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "\${DONE}" ) &`,
     },
+    {
+      name: "nested parentheses after sentinel write",
+      command: `if test -d .; then printf ready; fi
+set -e
+DONE=.return-on/nested.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE"; printf '%s\\n' "$(date)" ) &`,
+    },
+    {
+      name: "set +e in completed sibling subshell does not leak",
+      command: `set -e
+( set +e; printf isolated )
+DONE=.return-on/sibling-disable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "sentinel assignment in parent survives sibling reassignment",
+      command: `DONE=.return-on/parent.done
+( DONE=.return-on/not-a-sentinel.txt; printf isolated )
+set -e
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
   ];
   for (const candidate of hardenedFragileCases) {
     const result = await harness.toolCall("bash", { command: candidate.command });
@@ -376,6 +397,21 @@ DONE=.return-on/pr-state.done
 ( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONEX" ) &`,
   });
   if (differentVariable?.block) throw new Error(`different variable name should not match DONE: ${JSON.stringify(differentVariable)}`);
+
+  const siblingErrexitDoesNotLeak = await harness.toolCall("bash", {
+    command: `set +e
+( set -e; printf isolated )
+DONE=.return-on/no-leak.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (siblingErrexitDoesNotLeak?.block) throw new Error(`set -e from a completed sibling subshell should not leak: ${JSON.stringify(siblingErrexitDoesNotLeak)}`);
+
+  const siblingAssignmentDoesNotLeak = await harness.toolCall("bash", {
+    command: `( DONE=.return-on/hidden.done; printf isolated )
+set -e
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (siblingAssignmentDoesNotLeak?.block) throw new Error(`sentinel assignment from a completed sibling subshell should not leak: ${JSON.stringify(siblingAssignmentDoesNotLeak)}`);
 
   const longTimeout = await harness.toolCall("bash", { command: "timeout 900 uv run pytest tests/" });
   if (!longTimeout?.block || !String(longTimeout.reason).includes("timeout-bounded command")) {
@@ -420,7 +456,7 @@ DONE=.return-on/pr-state.done
     throw new Error(`short timeout-bounded command was not audited: ${JSON.stringify(auditLines)}`);
   }
 
-  await harness.runCommand("return-on-direct-waits", "10");
+  await harness.runCommand("return-on-direct-waits", "30");
   const notification = harness.notifications.at(-1)?.message ?? "";
   if (!notification.includes("Direct-wait audit") || !notification.includes("allowed_short_sleep") || !notification.includes("blocked")) {
     throw new Error(`direct wait audit command did not summarize entries: ${notification}`);
