@@ -639,24 +639,34 @@ const COMPLETION_SENTINEL_SUFFIX = /\.(?:done|status|exit|rc)$/;
 function normalizeShellForSentinelAnalysis(command: string): string {
 	let normalized = "";
 	let quote: "'" | '"' | "`" | undefined;
+	let comment = false;
 	for (let index = 0; index < command.length; index += 1) {
 		const char = command[index];
 		const next = command[index + 1];
-		if (char === "\\" && quote !== "'" && (next === "\n" || (next === "\r" && command[index + 2] === "\n"))) {
+		if (!comment && char === "\\" && quote !== "'" && (next === "\n" || (next === "\r" && command[index + 2] === "\n"))) {
 			index += next === "\r" ? 2 : 1;
 			normalized += " ";
 			continue;
 		}
 		if (char === "\n" || (char === "\r" && next === "\n")) {
 			if (char === "\r") index += 1;
-			normalized += quote ? " " : " ; ";
+			// Keep a real newline so comment scanning can distinguish end-of-line
+			// from a literal semicolon inside the comment. The following semicolon
+			// still gives the regex heuristics an explicit statement boundary.
+			normalized += quote ? " " : "\n; ";
+			comment = false;
 			continue;
 		}
-		if (!quote && (char === "'" || char === '"' || char === "`")) quote = char;
+		if (comment) {
+			normalized += char;
+			continue;
+		}
+		if (!quote && char === "#" && (index === 0 || /[\s;]/.test(command[index - 1]))) comment = true;
+		else if (!quote && (char === "'" || char === '"' || char === "`")) quote = char;
 		else if (quote === char && command[index - 1] !== "\\") quote = undefined;
 		normalized += char;
 	}
-	return normalized.replace(/\s+/g, " ").replace(/;\s*;/g, ";").trim();
+	return normalized.replace(/[\t\f\v ]+/g, " ").trim();
 }
 
 interface ShellParenPair {
@@ -667,19 +677,22 @@ interface ShellParenPair {
 interface ShellStructure {
 	pairs: ShellParenPair[];
 	ignored: Uint8Array;
+	commented: Uint8Array;
 }
 
 function scanShellStructure(command: string): ShellStructure {
 	const pairs: ShellParenPair[] = [];
 	const stack: number[] = [];
 	const ignored = new Uint8Array(command.length);
+	const commented = new Uint8Array(command.length);
 	let quote: "'" | '"' | "`" | undefined;
 	let comment = false;
 	for (let index = 0; index < command.length; index += 1) {
 		const char = command[index];
 		if (comment) {
 			ignored[index] = 1;
-			if (char === ";") comment = false;
+			commented[index] = 1;
+			if (char === "\n") comment = false;
 			continue;
 		}
 		if (quote) {
@@ -695,6 +708,7 @@ function scanShellStructure(command: string): ShellStructure {
 		if (char === "#" && (index === 0 || /[\s;]/.test(command[index - 1]))) {
 			comment = true;
 			ignored[index] = 1;
+			commented[index] = 1;
 			continue;
 		}
 		if (char === "(") stack.push(index);
@@ -703,7 +717,7 @@ function scanShellStructure(command: string): ShellStructure {
 			if (open !== undefined) pairs.push({ open, close: index });
 		}
 	}
-	return { pairs: pairs.sort((left, right) => left.open - right.open), ignored };
+	return { pairs: pairs.sort((left, right) => left.open - right.open), ignored, commented };
 }
 
 function shellScopeAncestry(structure: ShellStructure, index: number): ShellParenPair[] {
@@ -731,9 +745,19 @@ function errexitEnabledBefore(command: string, beforeIndex: number, structure: S
 		if (!shellScopeIsAncestor(statementScope, candidateScope)) continue;
 		const args = statement[1] ?? "";
 		const argumentOffset = (statement.index ?? 0) + statement[0].length - args.length;
+		let optionTerminatorIndex: number | undefined;
+		for (const terminator of args.matchAll(/(?:^|\s)(--|-)(?=\s|$)/g)) {
+			const tokenIndex = argumentOffset + (terminator.index ?? 0) + terminator[0].lastIndexOf(terminator[1]);
+			if (!structure.commented[tokenIndex]) {
+				optionTerminatorIndex = tokenIndex;
+				break;
+			}
+		}
 		for (const option of args.matchAll(/(?:^|\s)(-[a-zA-Z]*e[a-zA-Z]*|\+[a-zA-Z]*e[a-zA-Z]*|-o\s+errexit|\+o\s+errexit)(?=\s|$)/g)) {
 			const token = option[1];
-			last = { index: argumentOffset + (option.index ?? 0), enabled: token.startsWith("-") };
+			const tokenIndex = argumentOffset + (option.index ?? 0) + option[0].indexOf(token);
+			if (structure.commented[tokenIndex] || (optionTerminatorIndex !== undefined && tokenIndex > optionTerminatorIndex)) continue;
+			last = { index: tokenIndex, enabled: token.startsWith("-") };
 		}
 	}
 	return last?.enabled === true;
@@ -741,26 +765,48 @@ function errexitEnabledBefore(command: string, beforeIndex: number, structure: S
 
 interface BackgroundWrapperScope {
 	start: number;
-	text: string;
 	code: string;
 }
 
 function backgroundWrapperScope(command: string, writeIndex: number, structure: ShellStructure): BackgroundWrapperScope | undefined {
 	const containing = shellScopeAncestry(structure, writeIndex).sort((left, right) => right.open - left.open);
 	for (const pair of containing) {
-		if (!/^\s*&/.test(command.slice(pair.close + 1))) continue;
+		if (!/^\s*&(?!&)/.test(command.slice(pair.close + 1))) continue;
 		const start = pair.open + 1;
-		return { start, text: command.slice(start, writeIndex), code: shellCodeSlice(command, structure, start, writeIndex) };
+		return { start, code: shellCodeSlice(command, structure, start, writeIndex) };
 	}
-	if (!isExplicitlyBackgrounded(command)) return undefined;
-	return { start: 0, text: command.slice(0, writeIndex), code: shellCodeSlice(command, structure, 0, writeIndex) };
+	// A write inside a foreground `( ... )`/`$( ... )` group is not made
+	// backgrounded merely because some unrelated command elsewhere uses `&`.
+	if (containing.length > 0 || !isExplicitlyBackgrounded(command)) return undefined;
+	return { start: 0, code: shellCodeSlice(command, structure, 0, writeIndex) };
 }
 
-function wrapperHasExitTrap(scope: BackgroundWrapperScope, structure: ShellStructure): boolean {
-	for (const trap of scope.text.matchAll(/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/g)) {
-		if (!structure.ignored[scope.start + (trap.index ?? 0)]) return true;
+function shellScopesEqual(left: readonly ShellParenPair[], right: readonly ShellParenPair[]): boolean {
+	return left.length === right.length && shellScopeIsAncestor(left, right);
+}
+
+function wrapperEndsWithFailureSafeControl(scope: BackgroundWrapperScope, writeIndex: number, structure: ShellStructure): boolean {
+	const candidateScope = shellScopeAncestry(structure, writeIndex);
+	let statementStart = scope.start;
+	// Find the last same-scope separator using the unmasked code slice. Its
+	// offsets align with the original command because shellCodeSlice is 1:1.
+	for (let offset = 0; offset < scope.code.length; offset += 1) {
+		const index = scope.start + offset;
+		if (scope.code[offset] === ";" && shellScopesEqual(shellScopeAncestry(structure, index), candidateScope)) statementStart = index + 1;
 	}
-	return false;
+	const finalStatement = scope.code.slice(Math.max(0, statementStart - scope.start));
+	// A completed if immediately before the write is safe under errexit: commands
+	// used as if conditions do not abort the shell, and `fi` itself completed.
+	// Require the entire final statement to be the reserved word so `$fi` and
+	// unrelated commands such as `echo fi` cannot spoof the exemption.
+	if (/^\s*fi\s*$/.test(finalStatement)) return true;
+	const lastOr = finalStatement.lastIndexOf("||");
+	if (lastOr < 0) return false;
+	const fallback = finalStatement.slice(lastOr + 2).trim();
+	// Only exempt alternatives whose success is structurally certain. Generic
+	// `||` handling is not enough: `cmd || exit 1` and `cmd || false` both skip
+	// the following sentinel on the watched command's failure path.
+	return /^(?:true|:)(?:\s+[^;&|]*)?$/.test(fallback) || /^[A-Za-z_][A-Za-z0-9_]*=\$\?$/.test(fallback);
 }
 
 function completionSentinelAssignments(command: string, beforeIndex: number, structure: ShellStructure): Map<string, string> {
@@ -800,10 +846,10 @@ function detectFragileErrexitCompletionSentinel(command: string): DirectWaitMatc
 
 		const wrapperScope = backgroundWrapperScope(normalized, writeIndex, structure);
 		if (!wrapperScope) continue;
-		// Only failure handling inside the matched background wrapper exempts the
-		// write; quoted text and completed sibling subshells cannot affect it.
-		if (wrapperHasExitTrap(wrapperScope, structure)) continue;
-		if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(wrapperScope.code) || /\|\|/.test(wrapperScope.code)) continue;
+		// Only failure handling that immediately determines the status before the
+		// write exempts it. Completed child subshells and unrelated earlier control
+		// flow cannot hide a later errexit-fragile command.
+		if (wrapperEndsWithFailureSafeControl(wrapperScope, writeIndex, structure)) continue;
 
 		return {
 			kind: "fragile completion sentinel",

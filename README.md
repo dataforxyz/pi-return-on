@@ -154,7 +154,7 @@ Prefer watching process exit, or use it as a fallback alongside the sentinel so 
 }
 ```
 
-The bash policy blocks the high-confidence unsafe pattern of an errexit-enabled background wrapper that records `$?` to a `.done`, `.status`, `.exit`, or `.rc` file only after the watched command. Detection covers multiline wrappers, literal or variable-backed sentinel paths, combined option forms such as `set -o pipefail -o errexit`, matched nested-parenthesis wrapper boundaries, and safety/errexit/assignment state scoped to the applicable subshell ancestry.
+The bash policy blocks the high-confidence unsafe pattern of an errexit-enabled background wrapper that records `$?` to a `.done`, `.status`, `.exit`, or `.rc` file only after the watched command. Detection covers multiline wrappers, literal or variable-backed sentinel paths, combined option forms such as `set -o pipefail -o errexit`, matched nested-parenthesis wrapper boundaries, and safety/errexit/assignment state scoped to the applicable subshell ancestry. It distinguishes background `&` from `&&`, ignores quotes and option-like text through the true end of shell comments, respects `set -`/`set --` as the end of options, and only exempts a completed `if` or a known-success `|| true`/`|| :`/status-assignment fallback when that control flow immediately determines the status written to the sentinel; an unrelated `EXIT` trap does not make a later write reliable.
 
 ## Canonical condition shapes
 
