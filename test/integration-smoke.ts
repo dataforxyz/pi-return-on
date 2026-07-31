@@ -260,7 +260,7 @@ async function expectNoWake(harness: Harness, jobId: string, durationMs: number,
 
 async function testDirectWaitPolicy(harness: Harness) {
   const systemPrompt = await harness.beforeAgentStart();
-  if (!systemPrompt.includes("Direct wait policy for return_on") || !systemPrompt.includes("Do not block the conversation with direct waits")) {
+  if (!systemPrompt.includes("Direct wait policy for return_on") || !systemPrompt.includes("Do not block the conversation with direct waits") || !systemPrompt.includes("Completion signals must survive command failure")) {
     throw new Error(`direct wait guidance was not injected into the system prompt: ${systemPrompt}`);
   }
   await harness.emit("agent_end");
@@ -300,6 +300,33 @@ async function testDirectWaitPolicy(harness: Harness) {
   const backgrounded = await harness.toolCall("bash", { command: "mkdir -p .return-on && npm run dev > .return-on/dev.log 2>&1 & echo $! > .return-on/dev.pid" });
   if (backgrounded?.block) throw new Error(`backgrounded dev server should not be blocked: ${JSON.stringify(backgrounded)}`);
 
+  const fragileSentinel = await harness.toolCall("bash", {
+    command: `set -e
+LOG=.return-on/pr-state.log
+DONE=.return-on/pr-state.done
+rm -f "$LOG" "$DONE"
+( pr-state.sh 3969 --wait >"$LOG" 2>&1; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (!fragileSentinel?.block || !String(fragileSentinel.reason).includes("fragile background wrapper") || !String(fragileSentinel.reason).includes("if <command>")) {
+    throw new Error(`errexit-fragile completion sentinel was not blocked with a safe rewrite: ${JSON.stringify(fragileSentinel)}`);
+  }
+
+  const safeSentinel = await harness.toolCall("bash", {
+    command: `set -e
+LOG=.return-on/pr-state.log
+DONE=.return-on/pr-state.done
+rm -f "$LOG" "$DONE"
+( if pr-state.sh 3969 --wait >"$LOG" 2>&1; then rc=0; else rc=$?; fi; printf '%s\\n' "$rc" > "$DONE" ) &`,
+  });
+  if (safeSentinel?.block) throw new Error(`failure-safe completion sentinel should not be blocked: ${JSON.stringify(safeSentinel)}`);
+
+  const trappedSentinel = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/pr-state.done
+( trap 'rc=$?; printf "%s\\n" "$rc" > "$DONE"' EXIT; pr-state.sh 3969 --wait ) &`,
+  });
+  if (trappedSentinel?.block) throw new Error(`EXIT-trapped completion sentinel should not be blocked: ${JSON.stringify(trappedSentinel)}`);
+
   const longTimeout = await harness.toolCall("bash", { command: "timeout 900 uv run pytest tests/" });
   if (!longTimeout?.block || !String(longTimeout.reason).includes("timeout-bounded command")) {
     throw new Error(`long timeout-bounded command was not blocked: ${JSON.stringify(longTimeout)}`);
@@ -332,6 +359,9 @@ async function testDirectWaitPolicy(harness: Harness) {
   }
   if (!auditLines.some((entry) => entry.action === "allowed_backgrounded" && entry.detail === "package manager dev server")) {
     throw new Error(`backgrounded direct-wait opportunity was not audited: ${JSON.stringify(auditLines)}`);
+  }
+  if (!auditLines.some((entry) => entry.action === "blocked" && entry.kind === "fragile completion sentinel")) {
+    throw new Error(`fragile completion sentinel was not audited: ${JSON.stringify(auditLines)}`);
   }
   if (!auditLines.some((entry) => entry.action === "blocked" && entry.kind === "timeout-bounded command" && entry.detail === "timeout 900s")) {
     throw new Error(`long timeout-bounded command was not audited: ${JSON.stringify(auditLines)}`);

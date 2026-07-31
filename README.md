@@ -123,6 +123,39 @@ Durations accept numbers as milliseconds or strings like `500ms`, `2s`, `10m`, `
 
 Check-in wakeups include the elapsed time, next check-in, timeout remaining, latest wait summary, and the eventual resume instruction. The watcher remains active after a check-in and will still fire normally when its condition is met or its timeout expires.
 
+### Failure-safe background completion
+
+A completion file must be written for both successful and failed commands. This wrapper is unsafe because `set -e` can exit the subshell before `.done` is written:
+
+```bash
+set -e
+( long-command >.return-on/work.log 2>&1; printf '%s\n' "$?" >.return-on/work.done ) &
+```
+
+Record the terminal status through failure-safe control flow and capture the pid:
+
+```bash
+set -e
+(
+  if long-command >.return-on/work.log 2>&1; then rc=0; else rc=$?; fi
+  printf '%s\n' "$rc" >.return-on/work.done
+) &
+printf '%s\n' "$!" >.return-on/work.pid
+```
+
+Prefer watching process exit, or use it as a fallback alongside the sentinel so an unexpectedly broken wrapper still wakes the session:
+
+```json
+{
+  "any": [
+    { "type": "file", "path": ".return-on/work.done", "exists": true },
+    { "type": "process", "pidFile": ".return-on/work.pid", "status": "exited" }
+  ]
+}
+```
+
+The bash policy blocks the high-confidence unsafe pattern of an errexit-enabled background wrapper that records `$?` to a `.done`, `.status`, `.exit`, or `.rc` file only after the watched command.
+
 ## Canonical condition shapes
 
 The biggest source of `return_on` errors in real sessions is using the wrong condition shape. Prefer these canonical forms; common older wrapper shorthands are accepted for compatibility and normalized when the watcher is registered.
