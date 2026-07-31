@@ -634,29 +634,81 @@ function isExplicitlyBackgrounded(command: string): boolean {
 		|| /(^|[^&])&(\s*(echo\s+\$!|disown|$|[;]))/.test(normalized);
 }
 
-function detectFragileErrexitCompletionSentinel(normalized: string): DirectWaitMatch | undefined {
-	if (!isExplicitlyBackgrounded(normalized)) return undefined;
-	if (!/(?:^|[;&()]\s*)set\s+(?:-[a-zA-Z]*e[a-zA-Z]*\b|-o\s+errexit\b)/.test(normalized)) return undefined;
-	// Be conservative when the wrapper contains an explicit errexit escape or
-	// failure-safe control flow. These forms can reliably reach their sentinel.
-	if (/(?:^|[;&()]\s*)set\s+(?:\+[a-zA-Z]*e[a-zA-Z]*\b|\+o\s+errexit\b)/.test(normalized)) return undefined;
-	if (/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/.test(normalized)) return undefined;
-	if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(normalized) || /\|\|/.test(normalized)) return undefined;
+const COMPLETION_SENTINEL_SUFFIX = /\.(?:done|status|exit|rc)$/;
 
-	for (const assignment of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;]+))/g)) {
-		const variable = assignment[1];
-		const value = assignment[2] ?? assignment[3] ?? assignment[4] ?? "";
-		if (!/\.(?:done|status|exit|rc)$/.test(value)) continue;
-		const escapedVariable = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-		const redirect = `>{1,2}\\s*["']?\\$\\{?${escapedVariable}\\}?["']?`;
-		const directExitWrite = new RegExp(`;\\s*(?:printf|echo)\\b[^;&|)]*\\$\\?[^;&|)]*${redirect}`);
-		const capturedExitWrite = new RegExp(`;\\s*[A-Za-z_][A-Za-z0-9_]*=\\$\\?\\s*;\\s*(?:printf|echo)\\b[^;&|)]*${redirect}`);
-		if (directExitWrite.test(normalized) || capturedExitWrite.test(normalized)) {
-			return {
-				kind: "fragile completion sentinel",
-				detail: `set -e may skip the ${path.basename(value)} write after a nonzero exit`,
-			};
+function normalizeShellForSentinelAnalysis(command: string): string {
+	return command
+		.replace(/\\\r?\n/g, " ")
+		.replace(/\r?\n/g, " ; ")
+		.replace(/\s+/g, " ")
+		.replace(/;\s*;/g, ";")
+		.trim();
+}
+
+function errexitEnabledBefore(command: string, beforeIndex: number): boolean {
+	let last: { index: number; enabled: boolean } | undefined;
+	const prefix = command.slice(0, beforeIndex);
+	for (const statement of prefix.matchAll(/(?:^|[;&()]\s*)set\b([^;&()]*)/g)) {
+		const args = statement[1] ?? "";
+		const argumentOffset = (statement.index ?? 0) + statement[0].length - args.length;
+		for (const option of args.matchAll(/(?:^|\s)(-[a-zA-Z]*e[a-zA-Z]*|\+[a-zA-Z]*e[a-zA-Z]*|-o\s+errexit|\+o\s+errexit)(?=\s|$)/g)) {
+			const token = option[1];
+			last = { index: argumentOffset + (option.index ?? 0), enabled: token.startsWith("-") };
 		}
+	}
+	return last?.enabled === true;
+}
+
+function backgroundWrapperScope(command: string, writeIndex: number): string | undefined {
+	let open = command.lastIndexOf("(", writeIndex);
+	while (open >= 0) {
+		const close = command.indexOf(")", writeIndex);
+		if (close >= 0 && /^\s*&/.test(command.slice(close + 1))) return command.slice(open + 1, writeIndex);
+		open = command.lastIndexOf("(", open - 1);
+	}
+	return isExplicitlyBackgrounded(command) ? command.slice(0, writeIndex) : undefined;
+}
+
+function completionSentinelAssignments(command: string, beforeIndex: number): Map<string, string> {
+	const assignments = new Map<string, string>();
+	for (const assignment of command.slice(0, beforeIndex).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;]+))/g)) {
+		const value = assignment[2] ?? assignment[3] ?? assignment[4] ?? "";
+		assignments.set(assignment[1], value);
+	}
+	return assignments;
+}
+
+function resolveCompletionSentinelTarget(rawTarget: string, assignments: ReadonlyMap<string, string>): string | undefined {
+	const variable = rawTarget.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/)?.[1];
+	const value = variable ? assignments.get(variable) : rawTarget;
+	return value && COMPLETION_SENTINEL_SUFFIX.test(value) ? value : undefined;
+}
+
+function detectFragileErrexitCompletionSentinel(command: string): DirectWaitMatch | undefined {
+	const normalized = normalizeShellForSentinelAnalysis(command);
+	if (!normalized || !isExplicitlyBackgrounded(normalized)) return undefined;
+
+	const terminalWrite = /;\s*(?:([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*;\s*)?(?:printf|echo)\b([^;&|)]*)>{1,2}\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|)]+))/g;
+	for (const write of normalized.matchAll(terminalWrite)) {
+		const writeIndex = write.index ?? 0;
+		const capturedExit = !!write[1];
+		const outputArgs = write[2] ?? "";
+		if (!capturedExit && !/\$\?/.test(outputArgs)) continue;
+		const rawTarget = write[3] ?? write[4] ?? write[5] ?? "";
+		const target = resolveCompletionSentinelTarget(rawTarget, completionSentinelAssignments(normalized, writeIndex));
+		if (!target || !errexitEnabledBefore(normalized, writeIndex)) continue;
+
+		const wrapperScope = backgroundWrapperScope(normalized, writeIndex);
+		if (!wrapperScope) continue;
+		// Only failure handling inside the background wrapper exempts the write;
+		// unrelated if/|| constructs elsewhere in the tool command do not.
+		if (/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/.test(wrapperScope)) continue;
+		if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(wrapperScope) || /\|\|/.test(wrapperScope)) continue;
+
+		return {
+			kind: "fragile completion sentinel",
+			detail: `set -e may skip the ${path.basename(target)} write after a nonzero exit`,
+		};
 	}
 	return undefined;
 }
@@ -709,7 +761,7 @@ function detectDirectWaitPattern(normalized: string): DirectWaitMatch | undefine
 function analyzeDirectWait(command: string): DirectWaitAnalysis | undefined {
 	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
 	if (!normalized) return undefined;
-	const fragileSentinel = detectFragileErrexitCompletionSentinel(normalized);
+	const fragileSentinel = detectFragileErrexitCompletionSentinel(command);
 	if (fragileSentinel) return { ...fragileSentinel, action: "blocked" };
 	const match = detectDirectWaitPattern(normalized);
 	if (!match) return undefined;
