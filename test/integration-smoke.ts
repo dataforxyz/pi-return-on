@@ -360,6 +360,110 @@ DONE=.return-on/sibling-disable.done
 set -e
 ( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
     },
+    {
+      name: "comment text cannot disable errexit",
+      command: `set -e
+set -x # +e is only a comment
+DONE=.return-on/comment-option.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "semicolon inside comment cannot expose fake set +e",
+      command: `set -e
+set -x # ; set +e is still only a comment
+DONE=.return-on/comment-semicolon.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "odd quote characters in comments cannot hide errexit",
+      command: `# don't retry manually
+set -e
+# it's watched via return_on
+DONE=.return-on/comment-quotes.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "positional +e after double dash cannot disable errexit",
+      command: `set -e
+set -- +e
+DONE=.return-on/positional-disable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "positional +e after lone dash cannot disable errexit",
+      command: `set -e
+set - +e
+DONE=.return-on/positional-lone-dash-disable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "backslash at end of comment cannot hide errexit on next line",
+      command: `# note \\
+set -e
+DONE=.return-on/comment-backslash.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "variable named fi cannot spoof completed if",
+      command: `set -e
+fi=earlier
+DONE=.return-on/fi-variable.done
+( pr-state.sh 3969 --wait; echo $fi; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "argument named fi cannot spoof completed if",
+      command: `set -e
+DONE=.return-on/fi-argument.done
+( pr-state.sh 3969 --wait; echo fi; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "or-list exit fallback cannot exempt sentinel",
+      command: `set -e
+DONE=.return-on/or-exit.done
+( pr-state.sh 3969 --wait || exit 1; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "or-list false fallback cannot exempt sentinel",
+      command: `set -e
+DONE=.return-on/or-false.done
+( pr-state.sh 3969 --wait || false; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "if in completed nested subshell does not exempt wrapper",
+      command: `set -e
+DONE=.return-on/nested-if.done
+( ( if true; then printf nested; fi ); pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "or-list in completed nested subshell does not exempt wrapper",
+      command: `set -e
+DONE=.return-on/nested-or.done
+( ( false || true ); pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "EXIT trap in completed nested subshell does not exempt wrapper",
+      command: `set -e
+DONE=.return-on/nested-trap.done
+( ( trap 'printf nested' EXIT; true ); pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "unrelated EXIT trap in wrapper does not exempt sentinel",
+      command: `set -e
+DONE=.return-on/unrelated-trap.done
+( trap 'printf cleanup' EXIT; pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "unrelated completed if in wrapper does not exempt later command",
+      command: `set -e
+DONE=.return-on/unrelated-if.done
+( if true; then printf earlier; fi; pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
+    {
+      name: "unrelated earlier or-list in wrapper does not exempt later command",
+      command: `set -e
+DONE=.return-on/unrelated-or.done
+( false || true; pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+    },
   ];
   for (const candidate of hardenedFragileCases) {
     const result = await harness.toolCall("bash", { command: candidate.command });
@@ -376,6 +480,27 @@ rm -f "$LOG" "$DONE"
 ( if pr-state.sh 3969 --wait >"$LOG" 2>&1; then rc=0; else rc=$?; fi; printf '%s\\n' "$rc" > "$DONE" ) &`,
   });
   if (safeSentinel?.block) throw new Error(`failure-safe completion sentinel should not be blocked: ${JSON.stringify(safeSentinel)}`);
+
+  const safeIfStatus = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/safe-if.done
+( if pr-state.sh 3969 --wait; then :; else :; fi; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (safeIfStatus?.block) throw new Error(`completed if immediately before sentinel should not be blocked: ${JSON.stringify(safeIfStatus)}`);
+
+  const safeOrStatus = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/safe-or.done
+( pr-state.sh 3969 --wait || true; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (safeOrStatus?.block) throw new Error(`or-list immediately before sentinel should not be blocked: ${JSON.stringify(safeOrStatus)}`);
+
+  const safeOrAssignmentStatus = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/safe-or-assignment.done
+( pr-state.sh 3969 --wait || rc=$?; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (safeOrAssignmentStatus?.block) throw new Error(`status-capturing or-list immediately before sentinel should not be blocked: ${JSON.stringify(safeOrAssignmentStatus)}`);
 
   const trappedSentinel = await harness.toolCall("bash", {
     command: `set -e
@@ -412,6 +537,65 @@ set -e
 ( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
   });
   if (siblingAssignmentDoesNotLeak?.block) throw new Error(`sentinel assignment from a completed sibling subshell should not leak: ${JSON.stringify(siblingAssignmentDoesNotLeak)}`);
+
+  const commentCannotEnableErrexit = await harness.toolCall("bash", {
+    command: `set +e
+set -x # -e is only a comment
+DONE=.return-on/comment-enable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (commentCannotEnableErrexit?.block) throw new Error(`comment text should not enable errexit: ${JSON.stringify(commentCannotEnableErrexit)}`);
+
+  const semicolonCommentCannotEnableErrexit = await harness.toolCall("bash", {
+    command: `set +e
+set -x # ; set -e is still only a comment
+DONE=.return-on/comment-semicolon-enable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (semicolonCommentCannotEnableErrexit?.block) throw new Error(`semicolon-delimited comment text should not enable errexit: ${JSON.stringify(semicolonCommentCannotEnableErrexit)}`);
+
+  const quotedCommentCannotHideDisable = await harness.toolCall("bash", {
+    command: `set -e
+# don't retry manually
+set +e
+# it's fine now
+DONE=.return-on/comment-quote-disable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (quotedCommentCannotHideDisable?.block) throw new Error(`quote characters in comments should not hide set +e: ${JSON.stringify(quotedCommentCannotHideDisable)}`);
+
+  const positionalEnableIsNotOption = await harness.toolCall("bash", {
+    command: `set +e
+set -- -e
+DONE=.return-on/positional-enable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (positionalEnableIsNotOption?.block) throw new Error(`set -- -e should not enable errexit: ${JSON.stringify(positionalEnableIsNotOption)}`);
+
+  const loneDashPositionalEnableIsNotOption = await harness.toolCall("bash", {
+    command: `set +e
+set - -e
+DONE=.return-on/positional-lone-dash-enable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (loneDashPositionalEnableIsNotOption?.block) throw new Error(`set - -e should not enable errexit: ${JSON.stringify(loneDashPositionalEnableIsNotOption)}`);
+
+  const backslashCommentCannotHideDisable = await harness.toolCall("bash", {
+    command: `set -e
+# note \\
+set +e
+DONE=.return-on/comment-backslash-disable.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) &`,
+  });
+  if (backslashCommentCannotHideDisable?.block) throw new Error(`backslash at end of comment should not hide set +e on the next line: ${JSON.stringify(backslashCommentCannotHideDisable)}`);
+
+  const andListIsNotBackground = await harness.toolCall("bash", {
+    command: `set -e
+DONE=.return-on/and-list.done
+( pr-state.sh 3969 --wait; printf '%s\\n' "$?" > "$DONE" ) && printf complete
+printf unrelated &`,
+  });
+  if (andListIsNotBackground?.block) throw new Error(`&& group should not be treated as the background wrapper: ${JSON.stringify(andListIsNotBackground)}`);
 
   const longTimeout = await harness.toolCall("bash", { command: "timeout 900 uv run pytest tests/" });
   if (!longTimeout?.block || !String(longTimeout.reason).includes("timeout-bounded command")) {
