@@ -637,18 +637,98 @@ function isExplicitlyBackgrounded(command: string): boolean {
 const COMPLETION_SENTINEL_SUFFIX = /\.(?:done|status|exit|rc)$/;
 
 function normalizeShellForSentinelAnalysis(command: string): string {
-	return command
-		.replace(/\\\r?\n/g, " ")
-		.replace(/\r?\n/g, " ; ")
-		.replace(/\s+/g, " ")
-		.replace(/;\s*;/g, ";")
-		.trim();
+	let normalized = "";
+	let quote: "'" | '"' | "`" | undefined;
+	for (let index = 0; index < command.length; index += 1) {
+		const char = command[index];
+		const next = command[index + 1];
+		if (char === "\\" && quote !== "'" && (next === "\n" || (next === "\r" && command[index + 2] === "\n"))) {
+			index += next === "\r" ? 2 : 1;
+			normalized += " ";
+			continue;
+		}
+		if (char === "\n" || (char === "\r" && next === "\n")) {
+			if (char === "\r") index += 1;
+			normalized += quote ? " " : " ; ";
+			continue;
+		}
+		if (!quote && (char === "'" || char === '"' || char === "`")) quote = char;
+		else if (quote === char && command[index - 1] !== "\\") quote = undefined;
+		normalized += char;
+	}
+	return normalized.replace(/\s+/g, " ").replace(/;\s*;/g, ";").trim();
 }
 
-function errexitEnabledBefore(command: string, beforeIndex: number): boolean {
+interface ShellParenPair {
+	open: number;
+	close: number;
+}
+
+interface ShellStructure {
+	pairs: ShellParenPair[];
+	ignored: Uint8Array;
+}
+
+function scanShellStructure(command: string): ShellStructure {
+	const pairs: ShellParenPair[] = [];
+	const stack: number[] = [];
+	const ignored = new Uint8Array(command.length);
+	let quote: "'" | '"' | "`" | undefined;
+	let comment = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const char = command[index];
+		if (comment) {
+			ignored[index] = 1;
+			if (char === ";") comment = false;
+			continue;
+		}
+		if (quote) {
+			ignored[index] = 1;
+			if (char === quote && command[index - 1] !== "\\") quote = undefined;
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+			ignored[index] = 1;
+			continue;
+		}
+		if (char === "#" && (index === 0 || /[\s;]/.test(command[index - 1]))) {
+			comment = true;
+			ignored[index] = 1;
+			continue;
+		}
+		if (char === "(") stack.push(index);
+		else if (char === ")") {
+			const open = stack.pop();
+			if (open !== undefined) pairs.push({ open, close: index });
+		}
+	}
+	return { pairs: pairs.sort((left, right) => left.open - right.open), ignored };
+}
+
+function shellScopeAncestry(structure: ShellStructure, index: number): ShellParenPair[] {
+	return structure.pairs.filter((pair) => pair.open < index && index < pair.close);
+}
+
+function shellScopeIsAncestor(ancestor: readonly ShellParenPair[], descendant: readonly ShellParenPair[]): boolean {
+	return ancestor.length <= descendant.length && ancestor.every((pair, index) => pair.open === descendant[index]?.open && pair.close === descendant[index]?.close);
+}
+
+function shellCodeSlice(command: string, structure: ShellStructure, start: number, end: number): string {
+	let result = "";
+	for (let index = start; index < end; index += 1) result += structure.ignored[index] ? " " : command[index];
+	return result;
+}
+
+function errexitEnabledBefore(command: string, beforeIndex: number, structure: ShellStructure): boolean {
 	let last: { index: number; enabled: boolean } | undefined;
+	const candidateScope = shellScopeAncestry(structure, beforeIndex);
 	const prefix = command.slice(0, beforeIndex);
 	for (const statement of prefix.matchAll(/(?:^|[;&()]\s*)set\b([^;&()]*)/g)) {
+		const statementIndex = (statement.index ?? 0) + statement[0].indexOf("set");
+		if (structure.ignored[statementIndex]) continue;
+		const statementScope = shellScopeAncestry(structure, statementIndex);
+		if (!shellScopeIsAncestor(statementScope, candidateScope)) continue;
 		const args = statement[1] ?? "";
 		const argumentOffset = (statement.index ?? 0) + statement[0].length - args.length;
 		for (const option of args.matchAll(/(?:^|\s)(-[a-zA-Z]*e[a-zA-Z]*|\+[a-zA-Z]*e[a-zA-Z]*|-o\s+errexit|\+o\s+errexit)(?=\s|$)/g)) {
@@ -659,19 +739,37 @@ function errexitEnabledBefore(command: string, beforeIndex: number): boolean {
 	return last?.enabled === true;
 }
 
-function backgroundWrapperScope(command: string, writeIndex: number): string | undefined {
-	let open = command.lastIndexOf("(", writeIndex);
-	while (open >= 0) {
-		const close = command.indexOf(")", writeIndex);
-		if (close >= 0 && /^\s*&/.test(command.slice(close + 1))) return command.slice(open + 1, writeIndex);
-		open = command.lastIndexOf("(", open - 1);
-	}
-	return isExplicitlyBackgrounded(command) ? command.slice(0, writeIndex) : undefined;
+interface BackgroundWrapperScope {
+	start: number;
+	text: string;
+	code: string;
 }
 
-function completionSentinelAssignments(command: string, beforeIndex: number): Map<string, string> {
+function backgroundWrapperScope(command: string, writeIndex: number, structure: ShellStructure): BackgroundWrapperScope | undefined {
+	const containing = shellScopeAncestry(structure, writeIndex).sort((left, right) => right.open - left.open);
+	for (const pair of containing) {
+		if (!/^\s*&/.test(command.slice(pair.close + 1))) continue;
+		const start = pair.open + 1;
+		return { start, text: command.slice(start, writeIndex), code: shellCodeSlice(command, structure, start, writeIndex) };
+	}
+	if (!isExplicitlyBackgrounded(command)) return undefined;
+	return { start: 0, text: command.slice(0, writeIndex), code: shellCodeSlice(command, structure, 0, writeIndex) };
+}
+
+function wrapperHasExitTrap(scope: BackgroundWrapperScope, structure: ShellStructure): boolean {
+	for (const trap of scope.text.matchAll(/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/g)) {
+		if (!structure.ignored[scope.start + (trap.index ?? 0)]) return true;
+	}
+	return false;
+}
+
+function completionSentinelAssignments(command: string, beforeIndex: number, structure: ShellStructure): Map<string, string> {
 	const assignments = new Map<string, string>();
+	const candidateScope = shellScopeAncestry(structure, beforeIndex);
 	for (const assignment of command.slice(0, beforeIndex).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;]+))/g)) {
+		const assignmentIndex = assignment.index ?? 0;
+		if (structure.ignored[assignmentIndex]) continue;
+		if (!shellScopeIsAncestor(shellScopeAncestry(structure, assignmentIndex), candidateScope)) continue;
 		const value = assignment[2] ?? assignment[3] ?? assignment[4] ?? "";
 		assignments.set(assignment[1], value);
 	}
@@ -687,23 +785,25 @@ function resolveCompletionSentinelTarget(rawTarget: string, assignments: Readonl
 function detectFragileErrexitCompletionSentinel(command: string): DirectWaitMatch | undefined {
 	const normalized = normalizeShellForSentinelAnalysis(command);
 	if (!normalized || !isExplicitlyBackgrounded(normalized)) return undefined;
+	const structure = scanShellStructure(normalized);
 
 	const terminalWrite = /;\s*(?:([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*;\s*)?(?:printf|echo)\b([^;&|)]*)>{1,2}\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|)]+))/g;
 	for (const write of normalized.matchAll(terminalWrite)) {
 		const writeIndex = write.index ?? 0;
+		if (structure.ignored[writeIndex]) continue;
 		const capturedExit = !!write[1];
 		const outputArgs = write[2] ?? "";
 		if (!capturedExit && !/\$\?/.test(outputArgs)) continue;
 		const rawTarget = write[3] ?? write[4] ?? write[5] ?? "";
-		const target = resolveCompletionSentinelTarget(rawTarget, completionSentinelAssignments(normalized, writeIndex));
-		if (!target || !errexitEnabledBefore(normalized, writeIndex)) continue;
+		const target = resolveCompletionSentinelTarget(rawTarget, completionSentinelAssignments(normalized, writeIndex, structure));
+		if (!target || !errexitEnabledBefore(normalized, writeIndex, structure)) continue;
 
-		const wrapperScope = backgroundWrapperScope(normalized, writeIndex);
+		const wrapperScope = backgroundWrapperScope(normalized, writeIndex, structure);
 		if (!wrapperScope) continue;
-		// Only failure handling inside the background wrapper exempts the write;
-		// unrelated if/|| constructs elsewhere in the tool command do not.
-		if (/\btrap\s+(?:"[^"]*"|'[^']*'|[^;&]+)\s+(?:EXIT|0)\b/.test(wrapperScope)) continue;
-		if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(wrapperScope) || /\|\|/.test(wrapperScope)) continue;
+		// Only failure handling inside the matched background wrapper exempts the
+		// write; quoted text and completed sibling subshells cannot affect it.
+		if (wrapperHasExitTrap(wrapperScope, structure)) continue;
+		if (/\bif\b[\s\S]*\b(?:then|else|fi)\b/.test(wrapperScope.code) || /\|\|/.test(wrapperScope.code)) continue;
 
 		return {
 			kind: "fragile completion sentinel",
