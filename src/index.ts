@@ -8,7 +8,6 @@ import * as net from "node:net";
 import * as http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
@@ -94,6 +93,10 @@ const PARENT_SESSION_FILE_ENVS = [RETURN_ON_PARENT_SESSION_FILE_ENV, INTERCOM_PA
 const PARENT_SESSION_ID_ENVS = [RETURN_ON_PARENT_SESSION_ID_ENV, INTERCOM_PARENT_SESSION_ID_ENV] as const;
 const PARENT_SESSION_NAME_ENVS = [RETURN_ON_PARENT_SESSION_NAME_ENV, INTERCOM_PARENT_SESSION_NAME_ENV] as const;
 const PARENT_INTERCOM_TARGET_ENVS = [RETURN_ON_PARENT_INTERCOM_TARGET_ENV, INTERCOM_PARENT_INTERCOM_TARGET_ENV] as const;
+
+function stringEnum<T extends readonly string[]>(values: T) {
+	return Type.Unsafe<T[number]>({ type: "string", enum: [...values] });
+}
 
 const DIRECT_WAIT_SYSTEM_GUIDANCE = [
 	"Direct wait policy for return_on:",
@@ -5095,7 +5098,47 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	pi.on("before_agent_start", async (event) => {
+	let initializeSessionPromise: Promise<void> | undefined;
+
+	async function initializeSessionRuntime(ctx: ExtensionContext): Promise<void> {
+		if (!initializeSessionPromise) {
+			initializeSessionPromise = (async () => {
+				await loadJobs();
+				await startJobsStateWatcher(pi);
+				await clearPendingCheckInWakes(currentSessionFile);
+				await loadHandlers();
+				try {
+					await reconcileHandlerRunsOnStartup(pi, currentSessionFile, true);
+				} catch (error) {
+					console.error(`[${EXTENSION_NAME}] Failed to reconcile handler runs:`, error);
+				}
+				try {
+					await pruneState();
+				} catch (error) {
+					console.error(`[${EXTENSION_NAME}] Failed to prune retained state:`, error);
+				}
+				await deliverPendingFiredEvents(pi);
+				try {
+					await drainReturnOnBackgroundQueue(pi);
+				} catch (error) {
+					console.error(`[${EXTENSION_NAME}] Failed to drain background event queue:`, error);
+				}
+				ensureTicker(pi);
+				if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
+					ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
+				}
+			})();
+		}
+		try {
+			await initializeSessionPromise;
+		} catch (error) {
+			initializeSessionPromise = undefined;
+			throw error;
+		}
+	}
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		await initializeSessionRuntime(ctx);
 		agentTurnActive = true;
 		return { systemPrompt: `${event.systemPrompt}\n\n${DIRECT_WAIT_SYSTEM_GUIDANCE}` };
 	});
@@ -5142,33 +5185,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
 		activateScheduler(pi);
+		initializeSessionPromise = undefined;
 		latestCtx = ctx;
 		piForksExtensionEnabled(pi);
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
-		await loadJobs();
-		await startJobsStateWatcher(pi);
-		await clearPendingCheckInWakes(currentSessionFile);
-		await loadHandlers();
-		try {
-			await reconcileHandlerRunsOnStartup(pi, currentSessionFile, true);
-		} catch (error) {
-			console.error(`[${EXTENSION_NAME}] Failed to reconcile handler runs:`, error);
-		}
-		try {
-			await pruneState();
-		} catch (error) {
-			console.error(`[${EXTENSION_NAME}] Failed to prune retained state:`, error);
-		}
-		await deliverPendingFiredEvents(pi);
-		try {
-			await drainReturnOnBackgroundQueue(pi);
-		} catch (error) {
-			console.error(`[${EXTENSION_NAME}] Failed to drain background event queue:`, error);
-		}
-		ensureTicker(pi);
-		if (ctx.hasUI && activeJobsForCurrentSession().length > 0) {
-			ctx.ui.notify(`return_on watching ${activeJobsForCurrentSession().length} job(s)`, "info");
-		}
+		const mode = (ctx as ExtensionContext & { mode?: string }).mode;
+		const sessionEntries = (ctx.sessionManager as unknown as { getEntries?: () => Array<{ type: string }> }).getEntries?.() ?? [];
+		const hasConversationEntries = sessionEntries.some((entry) => entry.type === "message");
+		const isEmptyRpcBootstrap = mode === "rpc" && !hasConversationEntries;
+		if (isEmptyRpcBootstrap) return;
+		await initializeSessionRuntime(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -5189,6 +5215,7 @@ export default function (pi: ExtensionAPI) {
 		if (immediateTickTimer) clearTimeout(immediateTickTimer);
 		immediateTickTimer = undefined;
 		latestCtx = undefined;
+		initializeSessionPromise = undefined;
 	});
 
 	pi.registerCommand("return-on-list", {
@@ -5476,7 +5503,7 @@ export default function (pi: ExtensionAPI) {
 		name: "return_on_list",
 		label: "List Return On",
 		description: "List return_on watcher jobs for this session.",
-		parameters: Type.Object({ status: Type.Optional(StringEnum(["active", "fired", "cancelled", "all"] as const)) }),
+		parameters: Type.Object({ status: Type.Optional(stringEnum(["active", "fired", "cancelled", "all"] as const)) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			await loadJobs();
@@ -5545,7 +5572,7 @@ export default function (pi: ExtensionAPI) {
 		name: "return_on_handlers",
 		label: "List Return On Handlers",
 		description: "List background fork/sibling handlers launched for fired return_on jobs.",
-		parameters: Type.Object({ status: Type.Optional(StringEnum(["starting", "running", "complete", "failed", "all"] as const)) }),
+		parameters: Type.Object({ status: Type.Optional(stringEnum(["starting", "running", "complete", "failed", "all"] as const)) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			await loadHandlers();
@@ -5565,7 +5592,7 @@ export default function (pi: ExtensionAPI) {
 		name: "return_on_fired_events",
 		label: "List Return On Fired Events",
 		description: "List durable fired-event capsules used for restart-safe return_on delivery.",
-		parameters: Type.Object({ status: Type.Optional(StringEnum(["pending", "delivered", "failed", "all"] as const)), limit: Type.Optional(Type.Number()) }),
+		parameters: Type.Object({ status: Type.Optional(stringEnum(["pending", "delivered", "failed", "all"] as const)), limit: Type.Optional(Type.Number()) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const session = ctx.sessionManager.getSessionFile() ?? undefined;

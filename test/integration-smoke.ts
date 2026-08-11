@@ -98,7 +98,7 @@ async function withEnv(overrides: Record<string, string | undefined>, fn: () => 
   }
 }
 
-function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean; signal?: () => AbortSignal | undefined } = {}) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; mode?: "tui" | "rpc" | "json" | "print"; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean; signal?: () => AbortSignal | undefined } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
@@ -111,11 +111,12 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; confirm?
 
   const ctx: any = {
     cwd,
+    mode: options.mode ?? "tui",
     hasUI: options.hasUI ?? true,
     isIdle: options.isIdle ?? (() => true),
     get signal() { return options.signal?.(); },
     hasPendingMessages: options.hasPendingMessages ?? (() => false),
-    sessionManager: { getSessionFile: () => sessionFile },
+    sessionManager: { getSessionFile: () => sessionFile, getEntries: () => entries },
     ui: {
       confirm: async () => {
         confirmCalls += 1;
@@ -2629,6 +2630,15 @@ async function testStatusCancelSessionIsolation() {
   await sessionAAgain.emit("session_shutdown");
 }
 
+async function testEmptyRpcBootstrapSkipsRuntimeActivation() {
+  const rpc = createHarness("rpc-provider-probe", { mode: "rpc" });
+  await rpc.emit("session_start");
+  if (rpc.statuses.length !== 0 || rpc.notifications.length !== 0 || rpc.messages.length !== 0) {
+    throw new Error(`empty RPC bootstrap activated return_on runtime: ${JSON.stringify({ statuses: rpc.statuses, notifications: rpc.notifications, messages: rpc.messages })}`);
+  }
+  await rpc.emit("session_shutdown");
+}
+
 async function testSessionIsolation() {
   const label = "smoke session isolation";
   const resume = "session isolation resume";
@@ -2723,6 +2733,7 @@ await testFailedFiredEventRetries();
 await testSessionIsolation();
 await testStatusCancelSessionIsolation();
 await testRetentionPrune();
+await testEmptyRpcBootstrapSkipsRuntimeActivation();
 
 const duplicateIds = allJobIds.filter((id, index) => allJobIds.indexOf(id) !== index);
 if (duplicateIds.length > 0) throw new Error(`duplicate job ids: ${duplicateIds.join(", ")}`);

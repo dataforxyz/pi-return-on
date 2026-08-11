@@ -29,21 +29,23 @@
     "check:lifecycle": "node scripts/check-return-on-lifecycle.mjs"
   },
   "peerDependencies": {
-    "pi-forks": "^0.1.0"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "pi-forks": "^0.1.0",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "pi-forks": {
       "optional": true
     }
   },
-  "dependencies": {
+  "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.8",
     "@earendil-works/pi-coding-agent": "^0.79.8",
     "@earendil-works/pi-tui": "^0.79.8",
-    "typebox": "^1.1.38"
-  },
-  "devDependencies": {
     "tsx": "^4.20.6",
+    "typebox": "^1.1.38",
     "typescript": "^5.0.0"
   }
 }

@@ -744,6 +744,12 @@ pi ext install .
 
 For development, copy or symlink `src/index.ts` into `~/.pi/agent/extensions/pi-return-on/index.ts` and run `/reload`.
 
+## RPC and embedded-client compatibility
+
+`pi-return-on` supports Pi's RPC mode, including clients such as Paseo. Empty RPC bootstrap sessions used only for provider/model discovery do not activate watchers or consume pending fired events. The runtime initializes on the first agent turn, while resumed RPC sessions that already contain conversation messages initialize during normal session startup.
+
+The extension also avoids a runtime import of `@earendil-works/pi-ai` for its tool enum schemas. This prevents a project-local, older Pi dependency tree from overriding the host Pi runtime when an embedded client launches Pi from that project.
+
 ## State and restart behavior
 
 Jobs are persisted to:
