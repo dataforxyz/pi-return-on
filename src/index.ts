@@ -76,6 +76,7 @@ const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_HANDLER_ARTIFACT_RETENTION_DAYS = 7;
 const DEFAULT_HANDLER_ARTIFACT_RETENTION_MS = DEFAULT_HANDLER_ARTIFACT_RETENTION_DAYS * 86_400_000;
 const DEFAULT_TERMINAL_JOB_MAX = 500;
+const DEFAULT_DELIVERED_FIRED_EVENT_MAX = 500;
 const DEFAULT_AUDIT_MAX_ENTRIES = 5000;
 const JOBS_LOCK_TIMEOUT_MS = Math.max(10, Number.parseInt(process.env.PI_RETURN_ON_LOCK_TIMEOUT_MS || "10000", 10) || 10_000);
 const FLOCK_BIN = process.env.PI_RETURN_ON_FLOCK_BIN || ["/usr/bin/flock", "/bin/flock"].find((candidate) => fs.existsSync(candidate)) || "flock";
@@ -408,6 +409,7 @@ interface PruneSummary {
 	retentionMs: number;
 	handlerRetentionMs: number;
 	auditMaxEntries: number;
+	deliveredFiredEventMax: number;
 	jobsPruned: number;
 	firedEventsPruned: number;
 	handlersPruned: number;
@@ -1612,6 +1614,7 @@ function formatPruneSummary(summary: PruneSummary): string {
 	return [
 		`return_on prune ${summary.dryRun ? "dry run" : "complete"}`,
 		`State retention: ${formatDuration(summary.retentionMs)}; handler artifact retention: ${formatDuration(summary.handlerRetentionMs)}; audit max entries: ${summary.auditMaxEntries}`,
+		`Delivered fired-event max: ${summary.deliveredFiredEventMax}`,
 		`Jobs pruned: ${summary.jobsPruned}`,
 		`Fired events pruned: ${summary.firedEventsPruned}`,
 		`Handlers pruned: ${summary.handlersPruned}; handler dirs pruned: ${summary.handlerDirsPruned}; orphan handler dirs pruned: ${summary.orphanHandlerDirsPruned} (${summary.orphanHandlerBytesPruned} bytes)`,
@@ -1678,7 +1681,26 @@ async function pruneDirectWaitAudit(cutoff: number, maxEntries: number, dryRun: 
 	return pruned;
 }
 
-async function pruneFiredEventsIfEligible(eventPaths: string[], cutoff: number): Promise<number> {
+function firedEventPruneCandidates(
+	firedEvents: Array<{ path: string; event: FiredEventState }>,
+	cutoff: number,
+	maxDeliveredEvents: number,
+	protectedJobIds: ReadonlySet<string>,
+): { paths: string[]; countBoundPaths: Set<string> } {
+	const ordinaryDelivered = firedEvents.filter(({ event }) => event.deliveredAt !== undefined && !protectedJobIds.has(event.jobId));
+	const countBoundPaths = new Set(ordinaryDelivered
+		.slice()
+		.sort((a, b) => (b.event.deliveredAt ?? b.event.firedAt ?? 0) - (a.event.deliveredAt ?? a.event.firedAt ?? 0) || b.path.localeCompare(a.path))
+		.slice(Math.max(0, maxDeliveredEvents))
+		.map(({ path: eventPath }) => eventPath));
+	const paths = new Set(ordinaryDelivered
+		.filter(({ event }) => event.deliveredAt! < cutoff)
+		.map(({ path: eventPath }) => eventPath));
+	for (const eventPath of countBoundPaths) paths.add(eventPath);
+	return { paths: [...paths], countBoundPaths };
+}
+
+async function pruneFiredEventsIfEligible(eventPaths: string[], cutoff: number, countBoundPaths: ReadonlySet<string>): Promise<number> {
 	if (eventPaths.length === 0) return 0;
 	return withJobsFileLockRetry(async () => {
 		const handlers = await readHandlersFile();
@@ -1692,7 +1714,8 @@ async function pruneFiredEventsIfEligible(eventPaths: string[], cutoff: number):
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 				throw error;
 			}
-			if (!event.deliveredAt || event.deliveredAt >= cutoff || firedEventNeedsJobProtection(event, activeHandlerIds)) continue;
+			if (!event.deliveredAt || firedEventNeedsJobProtection(event, activeHandlerIds)) continue;
+			if (event.deliveredAt >= cutoff && !countBoundPaths.has(eventPath)) continue;
 			await fsp.rm(eventPath, { force: true });
 			pruned += 1;
 		}
@@ -1778,10 +1801,10 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		await appendLifecycleAudit("jobs_pruned", { jobsPruned, cutoff, terminalMax: DEFAULT_TERMINAL_JOB_MAX, protectedJobCount: protectedJobIds.size });
 	}
 
-	const firedEventPruneCandidates = firedEvents
-		.filter(({ event }) => event.deliveredAt !== undefined && event.deliveredAt < cutoff && !protectedJobIds.has(event.jobId))
-		.map(({ path: eventPath }) => eventPath);
-	const firedEventsPruned = dryRun ? firedEventPruneCandidates.length : await pruneFiredEventsIfEligible(firedEventPruneCandidates, cutoff);
+	const firedEventPrunePlan = firedEventPruneCandidates(firedEvents, cutoff, DEFAULT_DELIVERED_FIRED_EVENT_MAX, protectedJobIds);
+	const firedEventsPruned = dryRun
+		? firedEventPrunePlan.paths.length
+		: await pruneFiredEventsIfEligible(firedEventPrunePlan.paths, cutoff, firedEventPrunePlan.countBoundPaths);
 
 	let handlersPruned = 0;
 	let handlerDirsPruned = 0;
@@ -1828,6 +1851,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		retentionMs,
 		handlerRetentionMs,
 		auditMaxEntries,
+		deliveredFiredEventMax: DEFAULT_DELIVERED_FIRED_EVENT_MAX,
 		jobsPruned,
 		firedEventsPruned,
 		handlersPruned,

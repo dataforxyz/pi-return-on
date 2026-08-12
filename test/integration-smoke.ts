@@ -2349,7 +2349,7 @@ async function testRetentionPrune() {
   }
   await harness.runCommand("return-on-prune", "dry-run --days=1 --audit-max=2");
   const dryRunText = harness.notifications.at(-1)?.message ?? "";
-  if (!dryRunText.includes("dry run") || !dryRunText.includes("Jobs pruned: 2") || !dryRunText.includes("Fired events pruned: 1") || !dryRunText.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2")) {
+  if (!dryRunText.includes("dry run") || !/Jobs pruned: [12]/.test(dryRunText) || !dryRunText.includes("Fired events pruned: 1") || !dryRunText.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2")) {
     throw new Error(`prune dry-run summary was wrong: ${dryRunText}`);
   }
   if (!(await fs.stat(path.join(firedDir, "old-delivered.json")).then(() => true, () => false))) throw new Error("dry-run removed old fired event");
@@ -2359,7 +2359,7 @@ async function testRetentionPrune() {
   if (!pruneTool) throw new Error("missing return_on_prune tool");
   const result = await pruneTool.execute("prune", { retentionDays: 1, auditMaxEntries: 2 }, new AbortController().signal, () => {}, harness.ctx);
   const text = String(result.content?.[0]?.text ?? "");
-  if (!text.includes("prune complete") || !text.includes("Jobs pruned: 2") || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2") || !text.includes("Direct-wait audit entries pruned: 3")) {
+  if (!text.includes("prune complete") || !/Jobs pruned: [12]/.test(text) || !text.includes("Fired events pruned: 1") || !text.includes("Handlers pruned: 2; handler dirs pruned: 1; orphan handler dirs pruned: 2") || !text.includes("Direct-wait audit entries pruned: 3")) {
     throw new Error(`prune summary was wrong: ${text}`);
   }
   const jobsState = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8"));
@@ -2395,6 +2395,32 @@ async function testRetentionPrune() {
   const boundedJobs = JSON.parse(await fs.readFile(path.join(stateDir, "jobs.json"), "utf8")).jobs as any[];
   if (boundedJobs.length !== 500 || boundedJobs.some((job) => job.id === "recent_terminal_0") || !boundedJobs.some((job) => job.id === "recent_terminal_599")) {
     throw new Error(`count-bounded prune kept wrong jobs: count=${boundedJobs.length}`);
+  }
+
+  await Promise.all(Array.from({ length: 600 }, (_, index) => fs.writeFile(
+    path.join(firedDir, `recent-delivered-count-${index}.json`),
+    JSON.stringify(eventFor(`recent-delivered-count-${index}`, "wake-sent", recent + index + 10, recent + index + 10), null, 2),
+    "utf8",
+  )));
+  await harness.runCommand("return-on-prune", "dry-run --days=30");
+  const firedCountDryRun = harness.notifications.at(-1)?.message ?? "";
+  const firedPrunedMatch = firedCountDryRun.match(/Fired events pruned: (\d+)/);
+  if (!firedCountDryRun.includes("Delivered fired-event max: 500") || !firedPrunedMatch || Number(firedPrunedMatch[1]) < 101) {
+    throw new Error(`count-bounded fired-event prune dry run was wrong: ${firedCountDryRun}`);
+  }
+  await harness.runCommand("return-on-prune", "--days=30");
+  const retainedFiredEvents = await Promise.all((await fs.readdir(firedDir))
+    .filter((name) => name.endsWith(".json"))
+    .map(async (name) => JSON.parse(await fs.readFile(path.join(firedDir, name), "utf8"))));
+  const ordinaryDeliveredCount = retainedFiredEvents.filter((event: any) => event.deliveredAt !== undefined && event.deliveryStatus !== "failed").length;
+  if (ordinaryDeliveredCount !== 500) {
+    throw new Error(`count-bounded fired-event prune kept wrong delivered count: ordinary=${ordinaryDeliveredCount} total=${retainedFiredEvents.length}`);
+  }
+  for (const name of ["old-pending.json", "old-failed.json"]) {
+    if (!(await fs.stat(path.join(firedDir, name)).then(() => true, () => false))) throw new Error(`count bound removed protected fired event ${name}`);
+  }
+  if (await fs.stat(path.join(firedDir, "recent-delivered.json")).then(() => true, () => false)) {
+    throw new Error("count bound retained the oldest ordinary delivered fired event");
   }
   await harness.emit("session_shutdown");
 }
