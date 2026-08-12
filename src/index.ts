@@ -1163,25 +1163,31 @@ async function protectionStateFingerprint(): Promise<string> {
 	return `${fired}|${handlers}`;
 }
 
-async function readPendingDeliveryProtectionSnapshotLocked(): Promise<PendingDeliveryProtectionSnapshot> {
-	const [events, handlers] = await Promise.all([
-		readFiredEventFiles(),
-		readHandlersFile(),
-	]);
+function pendingDeliveryProtectionSnapshot(
+	events: Array<{ path: string; event: FiredEventState }>,
+	handlers: ReturnOnHandlerRun[],
+	fingerprint: string,
+): PendingDeliveryProtectionSnapshot {
 	const activeHandlerIds = new Set(handlers.filter(isActiveHandlerRun).map((run) => run.id));
 	return {
 		jobIds: new Set(events.filter(({ event }) => firedEventNeedsJobProtection(event, activeHandlerIds)).map(({ event }) => event.jobId)),
-		fingerprint: await protectionStateFingerprint(),
+		fingerprint,
 	};
 }
 
-async function readPendingDeliveryProtectionSnapshot(): Promise<PendingDeliveryProtectionSnapshot> {
-	// Fired capsules and handler state are mutated under the shared jobs lock.
-	// Read them under that same lock instead of repeatedly trying to observe a
-	// globally quiet directory. With many Pi sessions, unrelated deliveries can
-	// otherwise invalidate every optimistic snapshot and stall a tool call for
-	// minutes while it waits behind repeated full-directory scans.
-	return withJobsFileLockRetry(readPendingDeliveryProtectionSnapshotLocked);
+async function readPendingDeliveryProtectionSnapshot(): Promise<PendingDeliveryProtectionSnapshot | undefined> {
+	// Read the potentially large fired-event set outside the global commit lock.
+	// Fired capsule updates are atomic renames, so this is a coherent best-effort
+	// snapshot. saveJobs revalidates the cheap directory/handler fingerprint while
+	// holding the lock. If delivery traffic never goes quiet, callers preserve all
+	// terminal state and defer retention rather than sacrificing global liveness.
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		const before = await protectionStateFingerprint();
+		const [events, handlers] = await Promise.all([readFiredEventFiles(), readHandlersFile()]);
+		const after = await protectionStateFingerprint();
+		if (before === after) return pendingDeliveryProtectionSnapshot(events, handlers, after);
+	}
+	return undefined;
 }
 
 
@@ -1264,19 +1270,63 @@ async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds
 		const cutoff = options.pruneTerminalBefore ?? Date.now() - DEFAULT_RETENTION_MS;
 		savingJobs = true;
 		try {
-			await withJobsFileLockRetry(async () => {
-				const diskState = await readJobsState();
+			for (let attempt = 0; attempt < 5; attempt += 1) {
 				const protectedJobIds = new Set(options.protectedJobIds ?? []);
-				if (options.protectedJobIdsComplete !== true && jobsNeedProtectionLookup(memoryJobs, diskState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
-					const suppliedSnapshotStillCurrent = options.protectionFingerprint !== undefined
-						&& await protectionStateFingerprint() === options.protectionFingerprint;
-					if (!suppliedSnapshotStillCurrent) {
-						const protectionSnapshot = await readPendingDeliveryProtectionSnapshotLocked();
+				let protectionSnapshot: PendingDeliveryProtectionSnapshot | undefined = options.protectedJobIdsComplete === true
+					? undefined
+					: options.protectionFingerprint
+						? { jobIds: new Set(protectedJobIds), fingerprint: options.protectionFingerprint }
+						: undefined;
+				const previewState = await readJobsState();
+				const previewNeedsProtection = options.protectedJobIdsComplete !== true
+					&& jobsNeedProtectionLookup(memoryJobs, previewState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX);
+				if (previewNeedsProtection && !protectionSnapshot) {
+					protectionSnapshot = await readPendingDeliveryProtectionSnapshot();
+					if (protectionSnapshot) {
 						for (const jobId of protectionSnapshot.jobIds) protectedJobIds.add(jobId);
 					}
 				}
-				const merged = mergeJobsForSave(memoryJobs, diskState.jobs, protectedJobIds, insertedJobIds);
-				const nextJobs = retainBoundedJobs(merged, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
+				let snapshotChanged = false;
+				await withJobsFileLockRetry(async () => {
+					const diskState = await readJobsState();
+					const needsProtection = options.protectedJobIdsComplete !== true
+						&& jobsNeedProtectionLookup(memoryJobs, diskState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX);
+					if (needsProtection && protectionSnapshot && await protectionStateFingerprint() !== protectionSnapshot.fingerprint) {
+						snapshotChanged = true;
+						return;
+					}
+					const merged = mergeJobsForSave(memoryJobs, diskState.jobs, protectedJobIds, insertedJobIds);
+					// If delivery state is continuously changing, do not prune terminal jobs
+					// without a reliable protection set. Persist the registration/transition
+					// unbounded and let a later quiet cleanup restore the normal cap.
+					const nextJobs = needsProtection && !protectionSnapshot
+						? merged
+						: retainBoundedJobs(merged, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
+					const revision = jobsContentRevision(nextJobs);
+					if (diskState.revision !== revision) {
+						const tmp = atomicTempPath(JOBS_FILE);
+						await fsp.writeFile(tmp, JSON.stringify({ version: 1, revision, jobs: nextJobs } satisfies JobsState, null, 2), "utf8");
+						await fsp.rename(tmp, JOBS_FILE);
+						await writeJobsRevision(revision);
+					}
+					// Preserve object identity for jobs that callers may still be mutating
+					// after an awaited save (fire/delivery paths do this), while accepting
+					// the bounded on-disk set and dropping pruned terminal memory records.
+					jobs = mergeJobsForReload(jobs, nextJobs, pendingJobInsertIds);
+					for (const jobId of insertedJobIds) {
+						if (nextJobs.some((job) => job.id === jobId)) pendingJobInsertIds.delete(jobId);
+					}
+					lastSeenJobsRevision = revision;
+				});
+				if (!snapshotChanged) return;
+				options = { ...options, protectionFingerprint: undefined };
+			}
+			// Continuous fingerprint churn defeated every optimistic retry. Commit
+			// without retention on one final pass; correctness and liveness take
+			// precedence over immediately enforcing the history bound.
+			await withJobsFileLockRetry(async () => {
+				const diskState = await readJobsState();
+				const nextJobs = mergeJobsForSave(memoryJobs, diskState.jobs, [], insertedJobIds);
 				const revision = jobsContentRevision(nextJobs);
 				if (diskState.revision !== revision) {
 					const tmp = atomicTempPath(JOBS_FILE);
@@ -1284,9 +1334,6 @@ async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds
 					await fsp.rename(tmp, JOBS_FILE);
 					await writeJobsRevision(revision);
 				}
-				// Preserve object identity for jobs that callers may still be mutating
-				// after an awaited save (fire/delivery paths do this), while accepting
-				// the bounded on-disk set and dropping pruned terminal memory records.
 				jobs = mergeJobsForReload(jobs, nextJobs, pendingJobInsertIds);
 				for (const jobId of insertedJobIds) {
 					if (nextJobs.some((job) => job.id === jobId)) pendingJobInsertIds.delete(jobId);
@@ -1786,7 +1833,10 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 	const handlerCutoff = Date.now() - handlerRetentionMs;
 	const firedEvents = await readFiredEventFiles();
 	const deliveryProtection = await readPendingDeliveryProtectionSnapshot();
-	const protectedJobIds = deliveryProtection.jobIds;
+	// Pruning is optional maintenance. If delivery state is continuously busy,
+	// skip destructive job/event retention rather than taking the global lock for
+	// a long rescan or guessing which terminal records are protected.
+	const protectedJobIds = deliveryProtection?.jobIds ?? new Set(jobs.filter(isTerminalJob).map((job) => job.id));
 
 	const keptJobs = retainBoundedJobs(jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
 	const jobsPruned = jobs.length - keptJobs.length;
@@ -1797,7 +1847,7 @@ async function pruneState(options: PruneOptions = {}): Promise<PruneSummary> {
 		// otherwise delete an active watcher that another session registered a
 		// moment earlier, leaving only a job_registered audit entry and no fired,
 		// timeout, or cancelled terminal state.
-		await saveJobs({ pruneTerminalBefore: cutoff, protectedJobIds, protectionFingerprint: deliveryProtection.fingerprint });
+		await saveJobs({ pruneTerminalBefore: cutoff, protectedJobIds, protectionFingerprint: deliveryProtection?.fingerprint, protectedJobIdsComplete: deliveryProtection === undefined });
 		await appendLifecycleAudit("jobs_pruned", { jobsPruned, cutoff, terminalMax: DEFAULT_TERMINAL_JOB_MAX, protectedJobCount: protectedJobIds.size });
 	}
 
