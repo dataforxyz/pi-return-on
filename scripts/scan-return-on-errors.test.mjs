@@ -71,6 +71,30 @@ test("scan-return-on-errors marks old 10m timeout cap errors as fixed by current
   assert.equal(scan.resolvedErrors[0].reason, "covered_by_current_default_max_timeout");
 });
 
+test("scan-return-on-errors suppresses delivery snapshot churn fixed by shared locking", () => {
+  const root = mkdtempSync(join(tmpdir(), "return-on-error-scan-"));
+  const file = join(root, "session.jsonl");
+  const parent = entry("a3", undefined, {
+    role: "assistant",
+    content: [
+      { type: "toolCall", name: "return_on", arguments: { condition: { type: "timer", after: "1m" }, resume: "later" } },
+    ],
+  });
+  const result = entry("r3", "a3", {
+    role: "toolResult",
+    toolName: "return_on",
+    isError: true,
+    content: [{ type: "text", text: "return_on delivery state kept changing while preparing jobs retention" }],
+  });
+  writeFileSync(file, `${JSON.stringify(parent)}\n${JSON.stringify(result)}\n`);
+
+  const scan = runScan(root);
+  assert.equal(scan.totalAll, 1);
+  assert.equal(scan.resolvedTotal, 1);
+  assert.equal(scan.total, 0);
+  assert.equal(scan.resolvedErrors[0].reason, "fixed_by_locked_delivery_snapshot");
+});
+
 test("scan-return-on-errors suppresses exec cmd alias errors fixed by current compatibility", () => {
   const root = mkdtempSync(join(tmpdir(), "return-on-error-scan-"));
   const file = join(root, "session.jsonl");

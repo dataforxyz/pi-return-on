@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx");
 const fixture = path.join(repoRoot, "test", "fixtures", "state-writer-child.ts");
+const firedEventChurnFixture = path.join(repoRoot, "test", "fixtures", "fired-event-churn-child.ts");
 
 function startWriter(stateDir: string, writerId: string, mode = "register", extraEnv: NodeJS.ProcessEnv = {}): ChildProcessWithoutNullStreams {
 	return spawn(tsxBin, [fixture], {
@@ -20,6 +21,18 @@ function startWriter(stateDir: string, writerId: string, mode = "register", extr
 			PI_RETURN_ON_STATE_DIR: stateDir,
 			RETURN_ON_WRITER_ID: writerId,
 			RETURN_ON_WRITER_MODE: mode,
+		},
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+}
+
+function startFiredEventChurner(stateDir: string, jobId: string): ChildProcessWithoutNullStreams {
+	return spawn(tsxBin, [firedEventChurnFixture], {
+		cwd: repoRoot,
+		env: {
+			...process.env,
+			PI_RETURN_ON_STATE_DIR: stateDir,
+			RETURN_ON_CHURN_JOB_ID: jobId,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -169,6 +182,68 @@ test("performance canary bounds 4,000 recent terminal jobs under concurrent star
 		assert.ok(stat.size < 2_000_000, `bounded jobs state remained too large: ${stat.size} bytes`);
 		await assertJobsRevisionMatchesContent(stateDir);
 	} finally {
+		await fs.rm(stateDir, { recursive: true, force: true });
+	}
+});
+
+test("registration completes while unrelated fired delivery state is continuously changing", async () => {
+	const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "return-on-delivery-churn-"));
+	let churner: ChildProcessWithoutNullStreams | undefined;
+	try {
+		const now = Date.now();
+		const terminalJobs = Array.from({ length: 502 }, (_, index) => ({
+			id: `ro_terminal_${index}`,
+			label: `terminal ${index}`,
+			cwd: stateDir,
+			createdAt: now - 10_000 + index,
+			updatedAt: now - 10_000 + index,
+			status: "fired",
+			condition: { type: "timer", after: "1s" },
+			resume: "done",
+			firedAt: now - 10_000 + index,
+			latches: {},
+			leafState: {},
+		}));
+		const revision = createHash("sha256").update(JSON.stringify(terminalJobs)).digest("hex");
+		await fs.writeFile(path.join(stateDir, "jobs.json"), JSON.stringify({ version: 1, revision, jobs: terminalJobs }, null, 2), "utf8");
+		await fs.writeFile(path.join(stateDir, "jobs.revision"), `${revision}\n`, "utf8");
+		const firedDir = path.join(stateDir, "fired");
+		await fs.mkdir(firedDir, { recursive: true });
+		await Promise.all(terminalJobs.map((job, index) => fs.writeFile(path.join(firedDir, `${job.id}.json`), JSON.stringify({
+			version: 1,
+			event: "return_on.fired",
+			id: job.id,
+			jobId: job.id,
+			label: job.label,
+			reason: "churn test",
+			createdAt: job.createdAt,
+			firedAt: job.firedAt,
+			cwd: stateDir,
+			resume: job.resume,
+			job,
+			deliveryStatus: index === 0 ? "queued" : "wake-sent",
+			deliveredAt: now,
+		}), "utf8")));
+
+		churner = startFiredEventChurner(stateDir, "ro_terminal_501");
+		await waitForOutput(churner, "READY");
+		const writer = startWriter(stateDir, "delivery-churn-register");
+		await waitForExit(writer, 10_000);
+		churner.stdin.write("STOP\n");
+		await waitForExit(churner, 10_000);
+		churner = undefined;
+
+		const jobs = await readJobs(stateDir);
+		assert.equal(jobs.filter((job) => job.status !== "active").length, 501);
+		assert.equal(jobs.filter((job) => job.status === "active").length, 1);
+		assert.equal(jobs.some((job) => job.id === "ro_terminal_0"), true, "queued delivery lost terminal job protection");
+		assert.equal(jobs.some((job) => job.id === "ro_terminal_1"), false, "oldest unprotected terminal job was not pruned");
+		await assertJobsRevisionMatchesContent(stateDir);
+	} finally {
+		if (churner && churner.exitCode === null) {
+			churner.stdin.write("STOP\n");
+			await waitForExit(churner, 10_000).catch(() => churner?.kill("SIGKILL"));
+		}
 		await fs.rm(stateDir, { recursive: true, force: true });
 	}
 });

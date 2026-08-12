@@ -497,6 +497,8 @@ let lastSeenJobsRevision: string | undefined;
 const pendingJobInsertIds = new Set<string>();
 const ownedFiredEventClaimTokens = new Map<string, string>();
 let saveJobsQueue: Promise<void> = Promise.resolve();
+let conditionProgressSaveActive = false;
+let conditionProgressSavePending = false;
 let saveHandlersQueue: Promise<void> = Promise.resolve();
 let fileWatchSignature = "";
 let fileWatchers = new Map<string, fs.FSWatcher>();
@@ -1159,22 +1161,25 @@ async function protectionStateFingerprint(): Promise<string> {
 	return `${fired}|${handlers}`;
 }
 
+async function readPendingDeliveryProtectionSnapshotLocked(): Promise<PendingDeliveryProtectionSnapshot> {
+	const [events, handlers] = await Promise.all([
+		readFiredEventFiles(),
+		readHandlersFile(),
+	]);
+	const activeHandlerIds = new Set(handlers.filter(isActiveHandlerRun).map((run) => run.id));
+	return {
+		jobIds: new Set(events.filter(({ event }) => firedEventNeedsJobProtection(event, activeHandlerIds)).map(({ event }) => event.jobId)),
+		fingerprint: await protectionStateFingerprint(),
+	};
+}
+
 async function readPendingDeliveryProtectionSnapshot(): Promise<PendingDeliveryProtectionSnapshot> {
-	for (let attempt = 0; attempt < 5; attempt += 1) {
-		const before = await protectionStateFingerprint();
-		const [events, handlers] = await Promise.all([
-			readFiredEventFiles(),
-			readHandlersFile(),
-		]);
-		const after = await protectionStateFingerprint();
-		if (before !== after) continue;
-		const activeHandlerIds = new Set(handlers.filter(isActiveHandlerRun).map((run) => run.id));
-		return {
-			jobIds: new Set(events.filter(({ event }) => firedEventNeedsJobProtection(event, activeHandlerIds)).map(({ event }) => event.jobId)),
-			fingerprint: after,
-		};
-	}
-	throw new Error("return_on delivery state kept changing while preparing jobs retention");
+	// Fired capsules and handler state are mutated under the shared jobs lock.
+	// Read them under that same lock instead of repeatedly trying to observe a
+	// globally quiet directory. With many Pi sessions, unrelated deliveries can
+	// otherwise invalidate every optimistic snapshot and stall a tool call for
+	// minutes while it waits behind repeated full-directory scans.
+	return withJobsFileLockRetry(readPendingDeliveryProtectionSnapshotLocked);
 }
 
 
@@ -1249,8 +1254,6 @@ async function writeJobsRevision(revision: string): Promise<void> {
 	await fsp.rename(tmp, JOBS_REVISION_FILE);
 }
 
-class ProtectionSnapshotChangedError extends Error {}
-
 async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds?: ReadonlySet<string>; protectedJobIdsComplete?: boolean; protectionFingerprint?: string } = {}): Promise<void> {
 	const memoryJobs = cloneJobs(jobs);
 	const insertedJobIds = new Set(pendingJobInsertIds);
@@ -1259,49 +1262,35 @@ async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds
 		const cutoff = options.pruneTerminalBefore ?? Date.now() - DEFAULT_RETENTION_MS;
 		savingJobs = true;
 		try {
-			for (let snapshotAttempt = 0; snapshotAttempt < 5; snapshotAttempt += 1) {
+			await withJobsFileLockRetry(async () => {
+				const diskState = await readJobsState();
 				const protectedJobIds = new Set(options.protectedJobIds ?? []);
-				let protectionSnapshot: PendingDeliveryProtectionSnapshot | undefined = snapshotAttempt === 0 && options.protectionFingerprint
-					? { jobIds: new Set(protectedJobIds), fingerprint: options.protectionFingerprint }
-					: undefined;
-				if (options.protectedJobIdsComplete !== true && !protectionSnapshot) {
-					const previewState = await readJobsState();
-					if (jobsNeedProtectionLookup(memoryJobs, previewState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
-						protectionSnapshot = await readPendingDeliveryProtectionSnapshot();
+				if (options.protectedJobIdsComplete !== true && jobsNeedProtectionLookup(memoryJobs, diskState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
+					const suppliedSnapshotStillCurrent = options.protectionFingerprint !== undefined
+						&& await protectionStateFingerprint() === options.protectionFingerprint;
+					if (!suppliedSnapshotStillCurrent) {
+						const protectionSnapshot = await readPendingDeliveryProtectionSnapshotLocked();
 						for (const jobId of protectionSnapshot.jobIds) protectedJobIds.add(jobId);
 					}
 				}
-				try {
-					await withJobsFileLockRetry(async () => {
-						const diskState = await readJobsState();
-						if (options.protectedJobIdsComplete !== true && jobsNeedProtectionLookup(memoryJobs, diskState.jobs, cutoff, DEFAULT_TERMINAL_JOB_MAX)) {
-							if (!protectionSnapshot || await protectionStateFingerprint() !== protectionSnapshot.fingerprint) {
-								throw new ProtectionSnapshotChangedError("return_on delivery protection changed before jobs commit");
-							}
-						}
-						const merged = mergeJobsForSave(memoryJobs, diskState.jobs, protectedJobIds, insertedJobIds);
-						const nextJobs = retainBoundedJobs(merged, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
-						const revision = jobsContentRevision(nextJobs);
-						if (diskState.revision !== revision) {
-							const tmp = atomicTempPath(JOBS_FILE);
-							await fsp.writeFile(tmp, JSON.stringify({ version: 1, revision, jobs: nextJobs } satisfies JobsState, null, 2), "utf8");
-							await fsp.rename(tmp, JOBS_FILE);
-							await writeJobsRevision(revision);
-						}
-						// Preserve object identity for jobs that callers may still be mutating
-						// after an awaited save (fire/delivery paths do this), while accepting
-						// the bounded on-disk set and dropping pruned terminal memory records.
-						jobs = mergeJobsForReload(jobs, nextJobs, pendingJobInsertIds);
-						for (const jobId of insertedJobIds) {
-							if (nextJobs.some((job) => job.id === jobId)) pendingJobInsertIds.delete(jobId);
-						}
-						lastSeenJobsRevision = revision;
-					});
-					return;
-				} catch (error) {
-					if (!(error instanceof ProtectionSnapshotChangedError) || snapshotAttempt === 4) throw error;
+				const merged = mergeJobsForSave(memoryJobs, diskState.jobs, protectedJobIds, insertedJobIds);
+				const nextJobs = retainBoundedJobs(merged, cutoff, DEFAULT_TERMINAL_JOB_MAX, protectedJobIds);
+				const revision = jobsContentRevision(nextJobs);
+				if (diskState.revision !== revision) {
+					const tmp = atomicTempPath(JOBS_FILE);
+					await fsp.writeFile(tmp, JSON.stringify({ version: 1, revision, jobs: nextJobs } satisfies JobsState, null, 2), "utf8");
+					await fsp.rename(tmp, JOBS_FILE);
+					await writeJobsRevision(revision);
 				}
-			}
+				// Preserve object identity for jobs that callers may still be mutating
+				// after an awaited save (fire/delivery paths do this), while accepting
+				// the bounded on-disk set and dropping pruned terminal memory records.
+				jobs = mergeJobsForReload(jobs, nextJobs, pendingJobInsertIds);
+				for (const jobId of insertedJobIds) {
+					if (nextJobs.some((job) => job.id === jobId)) pendingJobInsertIds.delete(jobId);
+				}
+				lastSeenJobsRevision = revision;
+			});
 		} finally {
 			savingJobs = false;
 		}
@@ -1309,6 +1298,25 @@ async function saveJobs(options: { pruneTerminalBefore?: number; protectedJobIds
 	const result = saveJobsQueue.then(run, run);
 	saveJobsQueue = result.catch(() => undefined);
 	await result;
+}
+
+function queueConditionProgressSave(): void {
+	conditionProgressSavePending = true;
+	if (conditionProgressSaveActive) return;
+	conditionProgressSaveActive = true;
+	void (async () => {
+		try {
+			while (conditionProgressSavePending) {
+				conditionProgressSavePending = false;
+				await saveJobs();
+			}
+		} catch (error) {
+			console.error(`[${EXTENSION_NAME}] Failed to persist condition progress:`, error);
+		} finally {
+			conditionProgressSaveActive = false;
+			if (conditionProgressSavePending) queueConditionProgressSave();
+		}
+	})();
 }
 
 async function readHandlersFile(): Promise<ReturnOnHandlerRun[]> {
@@ -3445,11 +3453,13 @@ async function tick(pi: ExtensionAPI, generation: number): Promise<void> {
 			tickerScheduled = true;
 		}
 		if (changed) {
-			// Observation persistence is serialized by saveJobsQueue and snapshots the
-			// current state synchronously. Do not hold the single evaluation gate while
-			// waiting behind unrelated writers; later terminal/check-in saves remain
-			// ordered behind this snapshot and are still awaited by their own paths.
-			void saveJobs().catch((error) => console.error(`[${EXTENSION_NAME}] Failed to persist condition progress:`, error));
+			// Observation persistence must not hold the single evaluation gate, but it
+			// also must not append an unbounded number of full-state saves while another
+			// writer owns the shared lock. Coalesce progress into one active save plus
+			// at most one follow-up snapshot. Awaited terminal and registration saves can
+			// then enter the queue between those snapshots instead of freezing behind a
+			// long FIFO backlog.
+			queueConditionProgressSave();
 		}
 	} finally {
 		ticking = false;

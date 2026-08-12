@@ -165,6 +165,9 @@ function classifyResolved(text, args) {
 	if (text.includes("resume: must have required properties resume") && hasMisplacedReturnOnParams(args?.condition)) {
 		return "supported_by_current_misplaced_job_param_compat";
 	}
+	if (text === "return_on delivery state kept changing while preparing jobs retention") {
+		return "fixed_by_locked_delivery_snapshot";
+	}
 	return undefined;
 }
 
