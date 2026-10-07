@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import * as net from "node:net";
 import * as http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildForkHandlerEnv, buildForkRunPaths, launchDetachedFork } from "./fork-runtime.ts";
@@ -70,6 +70,8 @@ const OUTPUT_LIMIT_BYTES = 50 * 1024;
 const DIRECT_SLEEP_BLOCK_THRESHOLD_MS = 10_000;
 const DIRECT_TIMEOUT_AUDIT_THRESHOLD_MS = 30_000;
 const DIRECT_TIMEOUT_BLOCK_THRESHOLD_MS = 300_000;
+const AUTO_BACKGROUND_TIMEOUT_GRACE_MS = 15_000;
+const DEFAULT_AUTO_BACKGROUND_TOOL_TIMEOUT_MIN_MS = 5 * 60_000;
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_RETENTION_MS = DEFAULT_RETENTION_DAYS * 86_400_000;
@@ -204,6 +206,7 @@ interface WebhookConfig {
 }
 
 type DeliveryMode = "wake" | "fork" | "auto";
+type AutoBackgroundMode = "off" | "explicit" | "explicit-and-long-tool-timeout";
 type HandlerNotifyMode = "ack-and-summary" | "summary" | "none";
 type HandlerContextMode = "fork" | "capsule";
 
@@ -249,6 +252,9 @@ interface ReturnOnSettings {
 	triggerParentOnSummary?: boolean | string | number;
 	defaultHandlerContext?: HandlerContextMode;
 	handlerContext?: HandlerContextMode;
+	autoBackground?: AutoBackgroundMode;
+	autoBackgroundToolTimeoutMin?: string | number;
+	autoBackgroundCheckInEvery?: string | number;
 }
 
 interface ReturnOnConfig {
@@ -258,6 +264,9 @@ interface ReturnOnConfig {
 	defaultDeliveryNotify: HandlerNotifyMode;
 	triggerParentOnSummary: boolean;
 	defaultHandlerContext: HandlerContextMode;
+	autoBackground: AutoBackgroundMode;
+	autoBackgroundToolTimeoutMinMs: number;
+	autoBackgroundCheckInEveryMs?: number;
 }
 
 interface ReturnOnJob {
@@ -447,7 +456,7 @@ interface ConditionLeafTarget {
 	condition: LeafCondition;
 }
 
-type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_short_timeout" | "allowed_backgrounded";
+type DirectWaitAuditAction = "blocked" | "allowed_short_sleep" | "allowed_short_timeout" | "allowed_backgrounded" | "auto_backgrounded";
 
 interface DirectWaitMatch {
 	kind: string;
@@ -547,6 +556,12 @@ function parseDeliveryModeSetting(value: unknown, fallback: DeliveryMode, name: 
 	throw new Error(`${name} must be 'wake', 'fork', or 'auto'`);
 }
 
+function parseAutoBackgroundSetting(value: unknown): AutoBackgroundMode {
+	if (value === undefined || value === null || value === "") return "off";
+	if (value === "off" || value === "explicit" || value === "explicit-and-long-tool-timeout") return value;
+	throw new Error("returnOn.autoBackground must be 'off', 'explicit', or 'explicit-and-long-tool-timeout'");
+}
+
 function parseNotifySetting(value: unknown, fallback: HandlerNotifyMode, name: string): HandlerNotifyMode {
 	if (value === undefined || value === null || value === "") return fallback;
 	if (value === "ack-and-summary" || value === "summary" || value === "none") return value;
@@ -577,9 +592,72 @@ function getPiAgentDir(): string {
 		: path.join(os.homedir(), ".pi", "agent");
 }
 
-async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
+function projectSettingsAreTrusted(ctx: ExtensionContext): boolean {
+	try {
+		return ctx.isProjectTrusted();
+	} catch {
+		return false;
+	}
+}
+
+function isPiCliProcess(): boolean {
+	// Embedded SDK sessions do not set this marker. Their base-tool overrides are
+	// intentionally indistinguishable from builtin metadata, so fail closed.
+	return process.env.PI_CODING_AGENT === "true";
+}
+
+function returnOnSettingsPath(): string {
+	return path.join(getPiAgentDir(), "settings.json");
+}
+
+async function loadBuiltinBashOptions(cwd: string, includeProjectSettings = false): Promise<{ shellPath?: string; commandPrefix?: string }> {
+	let shellPath: string | undefined;
+	let commandPrefix: string | undefined;
+	const settingFiles = [path.join(getPiAgentDir(), "settings.json"), ...(includeProjectSettings ? [path.join(cwd, ".pi", "settings.json")] : [])];
+	for (const file of settingFiles) {
+		const settings = await readJsonObject(file);
+		if (typeof settings?.shellPath === "string") shellPath = settings.shellPath;
+		if (typeof settings?.shellCommandPrefix === "string") commandPrefix = settings.shellCommandPrefix;
+	}
+	return { ...(shellPath !== undefined ? { shellPath } : {}), ...(commandPrefix !== undefined ? { commandPrefix } : {}) };
+}
+
+async function saveUserReturnOnSettings(patch: Partial<ReturnOnSettings>): Promise<void> {
+	const file = returnOnSettingsPath();
+	const settings = (await readJsonObject(file)) ?? {};
+	const existing = isObject(settings.returnOn) ? settings.returnOn : {};
+	settings.returnOn = { ...existing, ...patch };
+	await fsp.mkdir(path.dirname(file), { recursive: true });
+	let mode = 0o600;
+	try {
+		mode = (await fsp.stat(file)).mode & 0o777;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const tmp = atomicTempPath(file);
+	try {
+		await fsp.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode });
+		await fsp.chmod(tmp, mode);
+		await fsp.rename(tmp, file);
+	} catch (error) {
+		await fsp.rm(tmp, { force: true }).catch(() => {});
+		throw error;
+	}
+}
+
+function formatAutoBackgroundConfig(config: ReturnOnConfig): string {
+	return [
+		`autoBackground: ${config.autoBackground}`,
+		`autoBackgroundToolTimeoutMin: ${formatDuration(config.autoBackgroundToolTimeoutMinMs)}`,
+		`autoBackgroundCheckInEvery: ${config.autoBackgroundCheckInEveryMs === undefined ? "off" : formatDuration(config.autoBackgroundCheckInEveryMs)}`,
+		`Settings file: ${returnOnSettingsPath()}`,
+	].join("\n");
+}
+
+async function loadReturnOnConfig(cwd: string, includeProjectSettings = false): Promise<ReturnOnConfig> {
 	let settings: ReturnOnSettings = {};
-	for (const file of [path.join(getPiAgentDir(), "settings.json"), path.join(cwd, ".pi", "settings.json")]) {
+	const settingFiles = [path.join(getPiAgentDir(), "settings.json"), ...(includeProjectSettings ? [path.join(cwd, ".pi", "settings.json")] : [])];
+	for (const file of settingFiles) {
 		const parsed = await readJsonObject(expandHome(file));
 		if (isObject(parsed?.returnOn)) settings = { ...settings, ...parsed.returnOn };
 	}
@@ -592,7 +670,23 @@ async function loadReturnOnConfig(cwd: string): Promise<ReturnOnConfig> {
 	const defaultDeliveryNotify = parseNotifySetting(process.env.PI_RETURN_ON_DELIVERY_NOTIFY ?? settings.defaultDeliveryNotify, "summary", "returnOn.defaultDeliveryNotify");
 	const triggerParentOnSummary = parseBooleanSetting(process.env.PI_RETURN_ON_TRIGGER_PARENT_ON_SUMMARY ?? settings.triggerParentOnSummary, true, "returnOn.triggerParentOnSummary");
 	const defaultHandlerContext = parseHandlerContextSetting(process.env.PI_RETURN_ON_HANDLER_CONTEXT ?? settings.defaultHandlerContext ?? settings.handlerContext, "fork", "returnOn.defaultHandlerContext");
-	return { defaultTimeoutMs, maxTimeoutMs, defaultDeliveryMode, defaultDeliveryNotify, triggerParentOnSummary, defaultHandlerContext };
+	const autoBackground = parseAutoBackgroundSetting(settings.autoBackground);
+	const autoBackgroundToolTimeoutMinMs = parsePositiveDurationSetting(settings.autoBackgroundToolTimeoutMin, DEFAULT_AUTO_BACKGROUND_TOOL_TIMEOUT_MIN_MS, "returnOn.autoBackgroundToolTimeoutMin");
+	if (autoBackground === "explicit-and-long-tool-timeout" && autoBackgroundToolTimeoutMinMs + AUTO_BACKGROUND_TIMEOUT_GRACE_MS > maxTimeoutMs) {
+		throw new Error("returnOn.autoBackgroundToolTimeoutMin plus auto-background grace must not exceed returnOn.maxTimeout");
+	}
+	const autoBackgroundCheckInEveryMs = parseCheckInEvery(settings.autoBackgroundCheckInEvery);
+	return {
+		defaultTimeoutMs,
+		maxTimeoutMs,
+		defaultDeliveryMode,
+		defaultDeliveryNotify,
+		triggerParentOnSummary,
+		defaultHandlerContext,
+		autoBackground,
+		autoBackgroundToolTimeoutMinMs,
+		...(autoBackgroundCheckInEveryMs !== undefined ? { autoBackgroundCheckInEveryMs } : {}),
+	};
 }
 
 function parseRequestedJobTimeout(input: unknown, config: ReturnOnConfig): number {
@@ -927,6 +1021,190 @@ function analyzeDirectWait(command: string): DirectWaitAnalysis | undefined {
 function findDirectWait(command: string): DirectWaitMatch | undefined {
 	const analysis = analyzeDirectWait(command);
 	return analysis?.action === "blocked" ? analysis : undefined;
+}
+
+interface AutoBackgroundMatch extends DirectWaitMatch {
+	source: "explicit" | "tool-timeout";
+}
+
+function longBashToolTimeoutMatch(timeoutSeconds: unknown, config: ReturnOnConfig): AutoBackgroundMatch | undefined {
+	if (config.autoBackground !== "explicit-and-long-tool-timeout" || typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds)) return undefined;
+	const timeoutMs = timeoutSeconds * 1000;
+	if (timeoutMs < config.autoBackgroundToolTimeoutMinMs) return undefined;
+	return {
+		kind: "long bash tool timeout",
+		detail: `bash timeout ${formatDuration(timeoutMs)}`,
+		durationMs: timeoutMs,
+		source: "tool-timeout",
+	};
+}
+
+function wholeFiniteExplicitWait(command: string, match: DirectWaitMatch): boolean {
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	if (match.kind === "long sleep") return /^(?:rtk\s+run\s+)?sleep\s+\d+(?:\.\d+)?(?:ms|s|m|h|d)?$/.test(normalized);
+	// A timeout only bounds the whole shell request when it is not followed by
+	// another top-level shell command. Rejecting quoted operators is conservative
+	// but safe: false negatives retain the existing actionable direct-wait block.
+	return match.kind === "timeout-bounded command" && normalized.startsWith("timeout ") && !/[;&|]/.test(normalized);
+}
+
+function boundedAutoDurationMs(matchDurationMs: number | undefined, toolTimeoutMs: number | undefined): number | undefined {
+	if (matchDurationMs === undefined) return toolTimeoutMs;
+	if (toolTimeoutMs === undefined) return matchDurationMs;
+	return Math.min(matchDurationMs, toolTimeoutMs);
+}
+
+function autoBackgroundMatch(command: string, timeoutSeconds: unknown, config: ReturnOnConfig): AutoBackgroundMatch | undefined {
+	if (config.autoBackground === "off" || isExplicitlyBackgrounded(command)) return undefined;
+	if (timeoutSeconds !== undefined && (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)) return undefined;
+	const toolTimeoutMs = typeof timeoutSeconds === "number" ? timeoutSeconds * 1000 : undefined;
+	const directWait = analyzeDirectWait(command);
+	// Only rewrite complete, finite explicit waits. Streaming logs, dev servers,
+	// compound commands, CI watches, and fragile wrappers need an explicit signal.
+	if (directWait?.action === "blocked" && (directWait.kind === "long sleep" || directWait.kind === "timeout-bounded command") && wholeFiniteExplicitWait(command, directWait)) {
+		const expectedMs = boundedAutoDurationMs(directWait.durationMs, toolTimeoutMs);
+		if (expectedMs !== undefined && expectedMs + AUTO_BACKGROUND_TIMEOUT_GRACE_MS <= config.maxTimeoutMs) {
+			return { ...directWait, durationMs: expectedMs, source: "explicit" };
+		}
+	}
+	const toolTimeout = longBashToolTimeoutMatch(timeoutSeconds, config);
+	if (toolTimeout && (toolTimeout.durationMs ?? 0) + AUTO_BACKGROUND_TIMEOUT_GRACE_MS <= config.maxTimeoutMs) return toolTimeout;
+	return undefined;
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function autoBackgroundPaths(id: string): { dir: string; log: string; pid: string; done: string; ready: string } {
+	const dir = ".return-on";
+	const stem = `${dir}/auto-bash-${id}`;
+	return { dir, log: `${stem}.log`, pid: `${stem}.pid`, done: `${stem}.done`, ready: `${stem}.ready` };
+}
+
+function autoBackgroundWorkerCommand(command: string, donePath: string, timeoutMs: number | undefined): string {
+	const timedCommand = timeoutMs === undefined
+		? `/usr/bin/env bash -c ${shellQuote(command)}`
+		: `timeout --kill-after=5s ${timeoutMs / 1000}s /usr/bin/env bash -c ${shellQuote(command)}`;
+	return [
+		`trap 'rc=$?; printf "%s\\n" "$rc" > "${donePath}"' EXIT`,
+		timedCommand,
+	].join("\n");
+}
+
+function autoBackgroundEnvironment(ctx: ExtensionContext): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	delete env.PI_SESSION_ID;
+	delete env.PI_SESSION_FILE;
+	delete env.PI_PROVIDER;
+	delete env.PI_MODEL;
+	delete env.PI_REASONING_LEVEL;
+	env.PI_SESSION_ID = ctx.sessionManager.getSessionId();
+	const sessionFile = ctx.sessionManager.getSessionFile();
+	if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+	if (ctx.model) {
+		env.PI_PROVIDER = ctx.model.provider;
+		env.PI_MODEL = ctx.model.id;
+	}
+	const thinkingLevel = (ctx as ExtensionContext & { thinkingLevel?: string }).thinkingLevel;
+	if (thinkingLevel) env.PI_REASONING_LEVEL = thinkingLevel;
+	return env;
+}
+
+function signalAutoBackgroundProcess(pid: number, signal: NodeJS.Signals): boolean {
+	if (process.platform !== "win32") {
+		try {
+			process.kill(-pid, signal);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		}
+	}
+	try {
+		process.kill(pid, signal);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		return false;
+	}
+}
+
+async function stopAutoBackgroundPid(pid: number): Promise<void> {
+	if (!signalAutoBackgroundProcess(pid, "SIGTERM")) return;
+	await new Promise<void>((resolve) => setTimeout(resolve, 250));
+	signalAutoBackgroundProcess(pid, "SIGKILL");
+}
+
+interface AutoBackgroundLaunch {
+	pid: number;
+	disposeAbort: () => void;
+}
+
+async function startAutoBackgroundProcess(command: string, paths: { dir: string; log: string; pid: string; done: string; ready: string }, timeoutMs: number | undefined, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<AutoBackgroundLaunch> {
+	if (signal?.aborted) throw new Error("aborted");
+	await fsp.mkdir(path.resolve(ctx.cwd, paths.dir), { recursive: true });
+	await Promise.all([paths.log, paths.pid, paths.done, paths.ready].map((file) => fsp.rm(path.resolve(ctx.cwd, file), { force: true })));
+	const log = await fsp.open(path.resolve(ctx.cwd, paths.log), "w");
+	let childPid: number | undefined;
+	let abort: (() => void) | undefined;
+	let launch: AutoBackgroundLaunch | undefined;
+	let failure: unknown;
+	try {
+		const child = spawn("/usr/bin/env", ["bash", "-c", autoBackgroundWorkerCommand(command, paths.done, timeoutMs)], {
+			cwd: ctx.cwd,
+			detached: process.platform !== "win32",
+			env: autoBackgroundEnvironment(ctx),
+			stdio: ["ignore", log.fd, log.fd],
+		});
+		await new Promise<void>((resolve, reject) => {
+			child.once("spawn", resolve);
+			child.once("error", reject);
+		});
+		if (!child.pid) throw new Error("failed to start auto-background bash process");
+		childPid = child.pid;
+		if (signal?.aborted) throw new Error("aborted");
+		await fsp.writeFile(path.resolve(ctx.cwd, paths.pid), `${childPid}\n`, "utf8");
+		if (signal?.aborted) throw new Error("aborted");
+		child.unref();
+		const abortHandler = () => { void stopAutoBackgroundPid(childPid!); };
+		abort = abortHandler;
+		signal?.addEventListener("abort", abortHandler, { once: true });
+		if (signal?.aborted) abortHandler();
+		launch = { pid: childPid, disposeAbort: () => signal?.removeEventListener("abort", abortHandler) };
+	} catch (error) {
+		failure = error;
+	}
+	try {
+		await log.close();
+	} catch (error) {
+		failure ??= error;
+	}
+	if (failure !== undefined) {
+		if (abort) signal?.removeEventListener("abort", abort);
+		if (childPid !== undefined) await stopAutoBackgroundPid(childPid);
+		throw failure;
+	}
+	if (!launch) throw new Error("failed to start auto-background bash process");
+	return launch;
+}
+
+async function stopAutoBackgroundProcess(pidFile: string, cwd: string): Promise<void> {
+	try {
+		const pid = Number.parseInt((await fsp.readFile(path.resolve(cwd, pidFile), "utf8")).trim(), 10);
+		if (!Number.isSafeInteger(pid) || pid <= 0) return;
+		await stopAutoBackgroundPid(pid);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[${EXTENSION_NAME}] Failed to stop unregistered auto-background process:`, error);
+	}
+}
+
+async function cancelAutoBackgroundWatcher(job: ReturnOnJob): Promise<void> {
+	if (job.status !== "active") return;
+	job.status = "cancelled";
+	job.cancelledAt = Date.now();
+	job.updatedAt = job.cancelledAt;
+	await saveJobs();
+	await appendLifecycleAudit("job_cancelled", { id: job.id, label: job.label, cancelledAt: job.cancelledAt, reason: "auto-background launch failed" });
 }
 
 function suggestReturnOnForDirectWait(match: DirectWaitMatch): string {
@@ -5161,6 +5439,11 @@ function commandReply(content: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag?.("return-on-auto-background", {
+		description: "Allow /return-on-config to activate automatic builtin-bash backgrounding in this Pi CLI process",
+		type: "boolean",
+		default: false,
+	});
 	(pi.on as unknown as (event: "context", handler: (event: { messages: unknown[] }) => { messages: unknown[] } | undefined) => void)("context", (event) => {
 		const messages = compactReturnOnHandlerMessages(event.messages);
 		if (messages === event.messages) return undefined;
@@ -5183,6 +5466,18 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let initializeSessionPromise: Promise<void> | undefined;
+	let autoBackgroundBashAvailable = false;
+	let autoBackgroundBashOwner: string | undefined;
+	let autoBackgroundBashInitialized = false;
+	// A persisted mode selects behavior, but a human must activate it for this
+	// runtime through /return-on-config before bash can be overridden.
+	let autoBackgroundSessionAttested = false;
+
+	function currentBashOwner(): string | undefined {
+		const tool = pi.getAllTools().find((candidate) => candidate.name === "bash");
+		if (!tool?.sourceInfo) return undefined;
+		return `${tool.sourceInfo.source}\u0000${tool.sourceInfo.path}`;
+	}
 
 	async function initializeSessionRuntime(ctx: ExtensionContext): Promise<void> {
 		if (!initializeSessionPromise) {
@@ -5239,11 +5534,22 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
-		const input = event.input as { command?: unknown };
+		const input = event.input as { command?: unknown; timeout?: unknown };
 		const command = typeof input.command === "string" ? input.command : "";
-		const directWait = analyzeDirectWait(command);
+		const config = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
+		const autoMatch = autoBackgroundMatch(command, input.timeout, config);
+		const ownsBash = autoBackgroundBashAvailable && autoBackgroundBashOwner === currentBashOwner();
+		// The bash override below owns eligible auto-background requests. Do not
+		// block them here: it returns a terminating, persisted watcher receipt.
+		if (autoMatch && ownsBash) return undefined;
+		let directWait = analyzeDirectWait(command);
+		const longToolTimeout = longBashToolTimeoutMatch(input.timeout, config);
+		if (!directWait && ((autoMatch && !ownsBash) || (longToolTimeout && (longToolTimeout.durationMs ?? 0) + AUTO_BACKGROUND_TIMEOUT_GRACE_MS > config.maxTimeoutMs))) {
+			directWait = { ...(autoMatch ?? longToolTimeout!), action: "blocked" };
+		}
 		if (!directWait) return undefined;
-		const reason = directWait.action === "blocked" ? formatDirectWaitBlockReason(directWait) : undefined;
+		let reason = directWait.action === "blocked" ? formatDirectWaitBlockReason(directWait) : undefined;
+		if (reason && autoMatch && !ownsBash) reason += " Auto-backgrounding is unavailable because another extension owns the bash tool; use an explicit background wrapper and return_on watcher instead.";
 		const auditEntry: DirectWaitAuditEntry = {
 			version: 1,
 			event: "direct_wait",
@@ -5268,11 +5574,17 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		autoBackgroundSessionAttested = false;
+		autoBackgroundBashAvailable = false;
+		// Keep the registered wrapper owner: Pi may retain this extension runtime
+		// across sessions, and a later explicit re-attestation must reuse it.
+		autoBackgroundBashInitialized = false;
 		activateScheduler(pi);
 		initializeSessionPromise = undefined;
 		latestCtx = ctx;
 		piForksExtensionEnabled(pi);
 		currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+		await configureAutoBackgroundBash(ctx);
 		const mode = (ctx as ExtensionContext & { mode?: string }).mode;
 		const sessionEntries = (ctx.sessionManager as unknown as { getEntries?: () => Array<{ type: string }> }).getEntries?.() ?? [];
 		const hasConversationEntries = sessionEntries.some((entry) => entry.type === "message");
@@ -5299,7 +5611,117 @@ export default function (pi: ExtensionAPI) {
 		if (immediateTickTimer) clearTimeout(immediateTickTimer);
 		immediateTickTimer = undefined;
 		latestCtx = undefined;
+		autoBackgroundSessionAttested = false;
+		autoBackgroundBashAvailable = false;
+		autoBackgroundBashInitialized = false;
 		initializeSessionPromise = undefined;
+	});
+
+	pi.registerCommand("return-on-config", {
+		description: "Configure return_on auto-backgrounding: /return-on-config [status|off|explicit|long [min] [check-in]]",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			// This command writes the user/global settings file, so validate and
+			// report its global value rather than a project overlay.
+			const current = await loadReturnOnConfig(ctx.cwd, false);
+			let mode: AutoBackgroundMode | undefined;
+			let min: string | undefined;
+			let checkIn: string | undefined;
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts.length > 0) {
+				const [requested, requestedMin, requestedCheckIn] = parts;
+				if (requested === "status") {
+					const effective = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
+					const effectiveProjectConfig = projectSettingsAreTrusted(ctx) && (effective.autoBackground !== current.autoBackground || effective.autoBackgroundToolTimeoutMinMs !== current.autoBackgroundToolTimeoutMinMs || effective.autoBackgroundCheckInEveryMs !== current.autoBackgroundCheckInEveryMs)
+						? `\nEffective configuration in this trusted project differs because .pi/settings.json overrides it:\n${formatAutoBackgroundConfig(effective)}`
+						: "";
+					ctx.ui.notify(`${formatAutoBackgroundConfig(current)}${effectiveProjectConfig}`, "info");
+					return;
+				}
+				if (requested === "off" || requested === "explicit") mode = requested;
+				else if (requested === "long" || requested === "explicit-and-long-tool-timeout") mode = "explicit-and-long-tool-timeout";
+				else {
+					ctx.ui.notify("Usage: /return-on-config [status|off|explicit|long [min] [check-in]]. Example: /return-on-config long 5m 5m", "warning");
+					return;
+				}
+				min = requestedMin;
+				checkIn = requestedCheckIn;
+			} else {
+				if (!ctx.hasUI) {
+					ctx.ui.notify("Use /return-on-config off, explicit, or long [min] [check-in] when no interactive UI is available.", "warning");
+					return;
+				}
+				const choice = await ctx.ui.select("Return On auto-background", [
+					"Off",
+					"Explicit finite waits only",
+					"Explicit waits and long Bash tool timeouts",
+					"Set long Bash timeout minimum",
+					"Set auto-background check-in interval",
+					"Show current configuration",
+				]);
+				if (!choice || choice === "Show current configuration") {
+					if (choice) ctx.ui.notify(formatAutoBackgroundConfig(current), "info");
+					return;
+				}
+				if (choice === "Off") mode = "off";
+				else if (choice === "Explicit finite waits only") mode = "explicit";
+				else if (choice === "Explicit waits and long Bash tool timeouts") mode = "explicit-and-long-tool-timeout";
+				else if (choice === "Set long Bash timeout minimum") {
+					min = await ctx.ui.input("Long Bash timeout minimum", `Current: ${formatDuration(current.autoBackgroundToolTimeoutMinMs)} (for example: 5m)`);
+				} else {
+					checkIn = await ctx.ui.input("Auto-background check-in interval", `Current: ${current.autoBackgroundCheckInEveryMs === undefined ? "off" : formatDuration(current.autoBackgroundCheckInEveryMs)} (for example: 5m, or off)`);
+				}
+			}
+			if (min === "") min = undefined;
+			if (checkIn === "") checkIn = undefined;
+			try {
+				const patch: Partial<ReturnOnSettings> = {};
+				if (mode !== undefined) patch.autoBackground = mode;
+				if (min !== undefined) {
+					const minMs = parseDuration(min);
+					if (minMs === undefined || minMs <= 0) throw new Error("autoBackgroundToolTimeoutMin must be a positive duration");
+					if ((mode ?? current.autoBackground) === "explicit-and-long-tool-timeout" && minMs + AUTO_BACKGROUND_TIMEOUT_GRACE_MS > current.maxTimeoutMs) {
+						throw new Error("autoBackgroundToolTimeoutMin plus auto-background grace must not exceed returnOn.maxTimeout");
+					}
+					patch.autoBackgroundToolTimeoutMin = min;
+				}
+				if (checkIn !== undefined) {
+					if (checkIn.trim().toLowerCase() === "off") patch.autoBackgroundCheckInEvery = undefined;
+					else {
+						parseCheckInEvery(checkIn);
+						patch.autoBackgroundCheckInEvery = checkIn;
+					}
+				}
+				if (Object.keys(patch).length === 0) return;
+				await saveUserReturnOnSettings(patch);
+				const updated = await loadReturnOnConfig(ctx.cwd, false);
+				const effective = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
+				if (updated.autoBackground !== "off") {
+					if (ctx.mode !== "tui") {
+						throw new Error("Auto-background configuration was saved, but activation requires /return-on-config in an interactive Pi TUI session.");
+					}
+					autoBackgroundSessionAttested = true;
+					autoBackgroundBashInitialized = false;
+					await configureAutoBackgroundBash(ctx);
+				} else {
+					autoBackgroundSessionAttested = false;
+				}
+				const cliFlagEnabled = (pi as any).getFlag?.("return-on-auto-background") === true;
+				const activation = updated.autoBackground !== "off" && !autoBackgroundBashAvailable
+					? cliFlagEnabled
+						? "\nAuto-background was saved but could not activate because this is not a standard Pi CLI session with its builtin bash tool."
+						: "\nAuto-background was saved but could not activate. Restart Pi with --return-on-auto-background, then run /return-on-config again in that interactive session."
+					: updated.autoBackground !== "off"
+						? "\nAuto-background is active for this interactive session."
+						: "";
+				const effectiveProjectConfig = projectSettingsAreTrusted(ctx) && (effective.autoBackground !== updated.autoBackground || effective.autoBackgroundToolTimeoutMinMs !== updated.autoBackgroundToolTimeoutMinMs || effective.autoBackgroundCheckInEveryMs !== updated.autoBackgroundCheckInEveryMs)
+					? `\nEffective configuration in this trusted project differs because .pi/settings.json overrides it:\n${formatAutoBackgroundConfig(effective)}`
+					: "";
+				ctx.ui.notify(`Saved global return_on auto-background configuration.\n${formatAutoBackgroundConfig(updated)}${effectiveProjectConfig}${activation}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			}
+		},
 	});
 
 	pi.registerCommand("return-on-list", {
@@ -5418,7 +5840,7 @@ export default function (pi: ExtensionAPI) {
 		handler: notifyDirectWaitAudit,
 	});
 
-	pi.registerTool({
+	const returnOnTool = {
 		name: "return_on",
 		label: "Return On",
 		description: "Register a background condition watcher and wake the agent later when the condition tree becomes true. Supports timer, file, process, port, url, incoming webhook, and exec leaves plus and/or/not groups.",
@@ -5448,7 +5870,7 @@ export default function (pi: ExtensionAPI) {
 			allowExec: Type.Optional(Type.Boolean({ description: "Required/confirmed when condition contains exec leaves" })),
 			maxFires: Type.Optional(Type.Number({ description: "How many times this watcher should fire before it is retired. Defaults to 1. After each fire the condition must evaluate false at least once before it can fire again (edge-triggered). The watcher is also retired by its timeout, whichever comes first." })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId: string, params: Record<string, any>, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) {
 			latestCtx = ctx;
 			currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 			await loadJobs();
@@ -5465,7 +5887,7 @@ export default function (pi: ExtensionAPI) {
 				if (!allowExec) throw new Error("User did not approve exec watcher.");
 			}
 
-			const returnOnConfig = await loadReturnOnConfig(ctx.cwd);
+			const returnOnConfig = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
 			const timeoutMs = parseRequestedJobTimeout(request.timeout, returnOnConfig);
 			const checkInEveryMs = parseCheckInEvery(request.checkInEvery);
 			const webhook = normalizeWebhook(request.webhook);
@@ -5553,7 +5975,122 @@ export default function (pi: ExtensionAPI) {
 				terminate: endTurn,
 			};
 		},
-	});
+	};
+	pi.registerTool(returnOnTool as any);
+
+	async function configureAutoBackgroundBash(ctx: ExtensionContext): Promise<void> {
+		if (autoBackgroundBashInitialized || !autoBackgroundSessionAttested) return;
+		autoBackgroundBashInitialized = true;
+		const config = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
+		if (config.autoBackground === "off") return;
+		// An earlier explicit activation may have registered this wrapper already.
+		// Its execute path reloads config for each call, so reusing it is correct.
+		if (autoBackgroundBashOwner && currentBashOwner() === autoBackgroundBashOwner) {
+			autoBackgroundBashAvailable = true;
+			return;
+		}
+		const existingBash = pi.getAllTools().find((tool) => tool.name === "bash");
+		// Tool overrides do not compose. Replacing another extension's bash tool would
+		// silently bypass its sandbox/remote-routing policy, so retain the direct-wait
+		// block when the built-in tool is not the current implementation.
+		const cliActivationAuthorized = isPiCliProcess() && (pi as any).getFlag?.("return-on-auto-background") === true;
+		autoBackgroundBashAvailable = cliActivationAuthorized && existingBash?.sourceInfo?.source === "builtin";
+		if (autoBackgroundBashAvailable) {
+			// ExtensionAPI exposes builtin-tool metadata, not its executable definition.
+			// Rebuild the builtin with the same public Pi shell settings so normal
+			// commands retain shellPath/shellCommandPrefix behavior.
+			const bashOptions = await loadBuiltinBashOptions(ctx.cwd, projectSettingsAreTrusted(ctx));
+			const builtInBash = createBashToolDefinition(ctx.cwd, bashOptions);
+			pi.registerTool({
+				...builtInBash,
+			promptGuidelines: [
+					...(builtInBash.promptGuidelines ?? []),
+			"When return_on auto-backgrounds an eligible bash request, its terminating receipt names the watcher and artifacts. Do not poll; wait for return_on to resume the session.",
+		],
+		async execute(toolCallId: string, params: { command: string; timeout?: number }, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
+			const command = typeof params.command === "string" ? params.command : "";
+			const config = await loadReturnOnConfig(ctx.cwd, projectSettingsAreTrusted(ctx));
+			const match = autoBackgroundMatch(command, params.timeout, config);
+			if (!match) {
+				// Rebuilt with Pi's configured shell settings, session environment,
+				// streaming, and rendering for ordinary non-matching commands.
+				return builtInBash.execute(toolCallId, params, signal, onUpdate, ctx);
+			}
+
+			const artifacts = autoBackgroundPaths(makeId());
+			const toolTimeoutMs = typeof params.timeout === "number" && Number.isFinite(params.timeout) ? params.timeout * 1000 : undefined;
+			const waitMs = (boundedAutoDurationMs(match.durationMs, toolTimeoutMs) ?? config.defaultTimeoutMs) + AUTO_BACKGROUND_TIMEOUT_GRACE_MS;
+			if (signal?.aborted) throw new Error("aborted");
+			const registration = await returnOnTool.execute(toolCallId, {
+				label: `auto-backgrounded bash: ${truncateInline(command.replace(/\s+/g, " "), 80)}`,
+				// This durable pre-launch condition deliberately remains false until
+				// start succeeds and replaces it with the known detached PID below.
+				condition: { type: "file", path: artifacts.ready, exists: true, every: "2s" },
+				resume: `The auto-backgrounded bash command finished. Read ${artifacts.log}; ${artifacts.done} contains its exit status when available.`,
+				timeout: waitMs,
+				...(config.autoBackgroundCheckInEveryMs !== undefined ? { checkInEvery: config.autoBackgroundCheckInEveryMs } : {}),
+				endTurn: true,
+			}, signal, undefined, ctx);
+			const job = registration.details?.job as ReturnOnJob;
+			let launch: AutoBackgroundLaunch | undefined;
+			try {
+				launch = await startAutoBackgroundProcess(command, artifacts, toolTimeoutMs, ctx, signal);
+				job.condition = { type: "process", pid: launch.pid, state: "exited", every: "2s" };
+				job.updatedAt = Date.now();
+				await saveJobs();
+				ensureTicker(pi);
+				if (signal?.aborted) throw new Error("aborted");
+			} catch (error) {
+				launch?.disposeAbort();
+				if (launch) await stopAutoBackgroundPid(launch.pid);
+				await cancelAutoBackgroundWatcher(job);
+				throw error;
+			}
+			const auditEntry: DirectWaitAuditEntry = {
+				version: 1,
+				event: "direct_wait",
+				timestamp: Date.now(),
+				cwd: ctx.cwd,
+				sessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+				toolName: "bash",
+				command: redactCommand(command),
+				thresholdMs: config.autoBackgroundToolTimeoutMinMs,
+				kind: match.kind,
+				detail: match.detail,
+				...(match.durationMs !== undefined ? { durationMs: match.durationMs } : {}),
+				action: "auto_backgrounded",
+			};
+			await appendDirectWaitAudit(auditEntry);
+			try {
+				pi.appendEntry?.("return-on-direct-wait", auditEntry);
+			} catch {
+				// Best-effort audit trail.
+			}
+			if (signal?.aborted) {
+				launch?.disposeAbort();
+				if (launch) await stopAutoBackgroundPid(launch.pid);
+				await cancelAutoBackgroundWatcher(job);
+				throw new Error("aborted");
+			}
+			launch?.disposeAbort();
+			return {
+				content: [{ type: "text", text: [
+					"✅ Auto-backgrounded bash command with return_on.",
+					`Watcher: ${job?.id ?? "registered"}`,
+					`PID: ${artifacts.pid}`,
+					`Log: ${artifacts.log}`,
+					`Exit status: ${artifacts.done}`,
+					"This result requests termination of the current tool batch. Do not poll; return_on will resume the session when the command exits.",
+				].join("\n") }],
+				details: { job, artifacts, autoBackground: { source: match.source, kind: match.kind, originalCommand: command } },
+				terminate: true,
+			};
+			},
+		} as any);
+			autoBackgroundBashOwner = currentBashOwner();
+			autoBackgroundBashAvailable = autoBackgroundBashOwner !== undefined;
+		}
+	}
 
 	pi.registerTool({
 		name: "return_on_cancel",

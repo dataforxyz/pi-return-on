@@ -70,8 +70,12 @@ node scripts/scan-direct-waits.mjs --json --audit-only /path/to/direct-wait-audi
 
 The scanner reports structured audit counts plus text-log candidates such as long sleeps, streaming waits, polling loops, and foreground dev servers that may not have gone through the current blocker.
 
-## Deferred option
+## Opt-in auto-backgrounding
 
-### Option D: auto-convert
+### Option D: auto-convert safe finite waits
 
-Automatically converting a blocking command into a background command plus `return_on` watcher is tracked separately because it can unexpectedly change command semantics. See GitHub issue #1.
+Auto-conversion is available only when `returnOn.autoBackground` enables it. In an interactive session, `/return-on-config` provides a menu; direct forms include `/return-on-config off`, `/return-on-config explicit`, and `/return-on-config long 5m 5m`. The extension first persists a provisional false launch gate, starts a failure-safe detached wrapper with `.return-on/auto-bash-*.{log,pid,done}` artifacts, then binds and saves a process-exit watcher using the known numeric PID. It returns a visible terminating receipt to the model and records `auto_backgrounded` in the audit log.
+
+`"explicit"` mode is deliberately limited to finite explicit waits (`sleep` and GNU `timeout N <command>`). `"explicit-and-long-tool-timeout"` additionally converts generic commands carrying a long Pi bash-tool `timeout` field, such as `make verify-fast-checks` with `timeout: 900`. It preserves that tool deadline with GNU `timeout` in the wrapper. A long tool timeout beyond `returnOn.maxTimeout` is blocked rather than allowed to occupy the foreground turn.
+
+Streaming logs, foreground servers, CI watches, infinite loops, compound shell commands, and fragile completion wrappers are not auto-converted: their correct readiness condition or duration cannot be inferred safely, so the existing actionable block remains. The feature is off by default because its `/usr/bin/env bash` wrapper is not appropriate for commands that require a custom non-Bash Pi shell. Persisting a mode alone never registers the override: a user must launch Pi with `--return-on-auto-background` and invoke `/return-on-config` in an interactive TUI session to activate it. This double opt-in prevents inherited configuration and environment markers from silently replacing an embedded SDK’s opaque base-tool override, while `--no-builtin-tools` and sandbox/SSH/custom extension policies remain protected. Project-local auto-background settings are read only when Pi trusts the project.

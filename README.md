@@ -231,6 +231,49 @@ Lower the cap (for example `"maxTimeout": "10m"`) if you want tighter bounds; ra
 
 `defaultTimeoutMs` and `maxTimeoutMs` are also accepted as millisecond numbers. The default must be positive and cannot exceed the max. Environment variables `PI_RETURN_ON_DEFAULT_TIMEOUT` and `PI_RETURN_ON_MAX_TIMEOUT` can override the settings for debugging or local experiments.
 
+## Auto-backgrounding eligible bash commands
+
+`return_on` can opt in to converting safe, finite foreground bash waits into a background process plus a watcher receipt that requests the current tool batch terminate. It is **off by default** because conversion changes foreground-command semantics. When it applies, the extension shows the model a tool result containing the watcher id and `.return-on/auto-bash-*.{pid,log,done}` paths and records an `auto_backgrounded` audit event. Pi ends the turn when every sibling tool result also terminates; otherwise the model must not poll the auto-backgrounded command. The normal fired watcher resumes the session.
+
+```json
+{
+  "returnOn": {
+    "autoBackground": "explicit-and-long-tool-timeout",
+    "autoBackgroundToolTimeoutMin": "5m",
+    "autoBackgroundCheckInEvery": "5m"
+  }
+}
+```
+
+You do not need to edit JSON manually. In an interactive Pi session, use `/return-on-config` to open the auto-background menu, or set it directly:
+
+```text
+/return-on-config off
+/return-on-config explicit
+/return-on-config long 5m 5m
+/return-on-config status
+```
+
+The command writes only the `returnOn` section of the active Pi agent directory’s global `settings.json` (normally `~/.pi/agent/settings.json`, or `$PI_CODING_AGENT_DIR/settings.json` for an isolated Pi). It validates against that global file, not a project override. A trusted project’s `.pi/settings.json` can still override the effective values and is called out by the command. For safety, the saved mode does **not** override bash automatically on startup. Start Pi with the extension’s explicit process authorization flag, then run `/return-on-config` in each interactive TUI session:
+
+```bash
+pi --return-on-auto-background
+```
+
+The command’s session activation then takes effect immediately when the builtin is available; disabling immediately stops matching commands from being converted.
+
+`autoBackground` values:
+
+- `"off"` (default): retain the normal direct-wait gate.
+- `"explicit"`: automatically background safe, finite explicit waits: long `sleep` and GNU `timeout N <command>` where `N` fits under the configured return_on maximum after a small grace period. Other explicit wait patterns remain blocked because they need a caller-supplied readiness condition.
+- `"explicit-and-long-tool-timeout"`: also background a generic bash command when the **Pi bash-tool** `timeout` field meets `autoBackgroundToolTimeoutMin` (default `5m`). This covers commands such as `make verify-fast-checks` submitted with `timeout: 900` even though the command text does not contain `timeout`.
+
+The original bash-tool timeout is preserved for both modes by running the background command under GNU `timeout` with a short kill grace. An implicit long timeout that would exceed `returnOn.maxTimeout` is blocked with the normal actionable direct-wait guidance rather than run in the foreground. `autoBackgroundToolTimeoutMin` plus the grace must fit within `returnOn.maxTimeout`. Explicit conversion is deliberately whole-command only: compound shell requests such as `sleep 10; long-job` remain blocked because the sleep does not bound `long-job`.
+
+The feature uses `/usr/bin/env bash` for the detached wrapper, so do not enable it for commands that rely on a non-Bash custom Pi shell. Its environment preserves Pi session variables but does not inherit custom shell startup/bootstrap behavior or Pi's internal PATH augmentation; use absolute paths for Pi-private helper binaries. Bash is never automatically overridden from persisted settings. A user must both launch the Pi CLI with `--return-on-auto-background` and activate the selected mode through `/return-on-config` in the interactive TUI. This fail-closed double opt-in prevents inherited configuration and environment markers from silently replacing an embedded SDK’s opaque base-tool override; it also does not reintroduce bash under `--no-builtin-tools`. Normal nonmatching commands preserve Pi's configured `shellPath` and `shellCommandPrefix`; use an explicit background wrapper and `return_on` watcher in unsupported sessions. Project-local `returnOn` auto-background settings are honored only for trusted projects.
+
+The watcher is persisted before the detached process starts, so a host/Pi crash cannot leave launched auto-background work without watcher state. A crash after persistence but before launch, or after launch but before the watcher is rebound to its numeric PID, leaves the provisional false launch gate active; it eventually times out even though its command may not have started or may already have finished. Normal launch failures and agent aborts cancel the watcher and terminate the recorded process group; use an explicit wrapper when exact crash-recovery semantics are required.
+
 ## Default delivery policy
 
 Use settings to make smart or fork handling the default for real workflows instead of requiring every tool call to repeat `delivery`:

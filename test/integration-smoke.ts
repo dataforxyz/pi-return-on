@@ -22,6 +22,9 @@ function getFreePort(): Promise<number> {
 }
 
 process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "pi-return-on-home-"));
+// Pi sets this marker for CLI/RPC sessions. Auto-background deliberately fails
+// closed for embedded SDK sessions, where base-tool ownership is opaque.
+process.env.PI_CODING_AGENT = "true";
 process.env.PI_RETURN_ON_WEBHOOK_PORT ??= String(await getFreePort());
 
 const { default: extension } = await import("../src/index.ts");
@@ -98,7 +101,7 @@ async function withEnv(overrides: Record<string, string | undefined>, fn: () => 
   }
 }
 
-function createHarness(sessionName: string, options: { hasUI?: boolean; mode?: "tui" | "rpc" | "json" | "print"; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean; signal?: () => AbortSignal | undefined } = {}) {
+function createHarness(sessionName: string, options: { hasUI?: boolean; mode?: "tui" | "rpc" | "json" | "print"; confirm?: boolean | (() => boolean | Promise<boolean>); failSendMessage?: boolean; isIdle?: () => boolean; hasPendingMessages?: () => boolean; signal?: () => AbortSignal | undefined; bashSource?: string; trusted?: boolean; autoBackgroundFlag?: boolean } = {}) {
   const tools = new Map<string, Tool>();
   const events = new Map<string, Function[]>();
   const messages: any[] = [];
@@ -116,7 +119,8 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; mode?: "
     isIdle: options.isIdle ?? (() => true),
     get signal() { return options.signal?.(); },
     hasPendingMessages: options.hasPendingMessages ?? (() => false),
-    sessionManager: { getSessionFile: () => sessionFile, getEntries: () => entries },
+    isProjectTrusted: () => options.trusted ?? true,
+    sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => `smoke-${sessionName}`, getEntries: () => entries },
     ui: {
       confirm: async () => {
         confirmCalls += 1;
@@ -129,8 +133,13 @@ function createHarness(sessionName: string, options: { hasUI?: boolean; mode?: "
   };
 
   const pi: any = {
+    registerFlag() {},
+    getFlag(name: string) { return name === "return-on-auto-background" ? options.autoBackgroundFlag ?? false : undefined; },
     registerTool(tool: any) {
       tools.set(tool.name, tool);
+    },
+    getAllTools() {
+      return [{ name: "bash", sourceInfo: { source: options.bashSource ?? "builtin" } }];
     },
     registerCommand(name: string, command: unknown) {
       commands.set(name, command);
@@ -646,6 +655,183 @@ printf unrelated &`,
   if (!notification.includes("Direct-wait audit") || !notification.includes("allowed_short_sleep") || !notification.includes("blocked")) {
     throw new Error(`direct wait audit command did not summarize entries: ${notification}`);
   }
+}
+
+async function testAutoBackgroundBash(_harness: Harness) {
+  if (_harness.tools.has("bash")) throw new Error("auto-background bash override was registered while the feature was off");
+  await withProjectSettings({
+    returnOn: {
+      autoBackground: "explicit-and-long-tool-timeout",
+      autoBackgroundToolTimeoutMin: "5m",
+      autoBackgroundCheckInEvery: "1s",
+      maxTimeout: "2h",
+    },
+  }, async () => {
+    const untrustedHarness = createHarness("untrusted-auto-background-session", { trusted: false });
+    await untrustedHarness.emit("session_start");
+    if (untrustedHarness.tools.has("bash")) throw new Error("untrusted project settings enabled the auto-background bash override");
+
+    await withEnv({ PI_CODING_AGENT: undefined }, async () => {
+      const embeddedHarness = createHarness("embedded-auto-background-session");
+      await embeddedHarness.emit("session_start");
+      if (embeddedHarness.tools.has("bash")) throw new Error("embedded/opaque bash ownership enabled the auto-background override");
+    });
+
+    const autoHarness = createHarness("auto-background-session", { autoBackgroundFlag: true });
+    await autoHarness.emit("session_start");
+    if (autoHarness.tools.has("bash")) throw new Error("persisted auto-background settings overrode bash before an interactive /return-on-config attestation");
+    await autoHarness.runCommand("return-on-config", "long 5m 1s");
+    if (!autoHarness.tools.has("bash")) throw new Error("interactive /return-on-config did not activate auto-background bash");
+    const marker = path.join(cwd, "auto-background-marker");
+    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ok')`)}`;
+    const eventResult = await autoHarness.toolCall("bash", { command, timeout: 300 });
+    if (eventResult?.block) throw new Error(`eligible long bash timeout was blocked instead of auto-backgrounded: ${JSON.stringify(eventResult)}`);
+    const overMax = await autoHarness.toolCall("bash", { command, timeout: 7_200 });
+    if (!overMax?.block || !String(overMax.reason).includes("long bash tool timeout")) {
+      throw new Error(`long bash timeout beyond return_on.maxTimeout was not blocked: ${JSON.stringify(overMax)}`);
+    }
+
+    const implicit = await autoHarness.callTool("bash", { command, timeout: 300 });
+    if (!implicit.terminate || !String(implicit.content?.[0]?.text).includes("Auto-backgrounded bash command")) {
+      throw new Error(`implicit long bash timeout did not return a terminating auto-background receipt: ${JSON.stringify(implicit)}`);
+    }
+    const implicitJob = implicit.details?.job;
+    if (!implicitJob?.id || implicit.details?.autoBackground?.source !== "tool-timeout") {
+      throw new Error(`implicit auto-background receipt had incomplete details: ${JSON.stringify(implicit)}`);
+    }
+    if (!(await fs.stat(path.join(cwd, implicit.details.artifacts.pid))).isFile()) {
+      throw new Error(`implicit auto-background did not create its pid artifact: ${JSON.stringify(implicit.details)}`);
+    }
+    await waitForWake(autoHarness, { jobId: implicitJob.id, label: implicitJob.label, resume: implicitJob.resume }, 6_000);
+    if (await fs.readFile(marker, "utf8") !== "ok") throw new Error("implicit auto-backgrounded bash command did not execute");
+
+    // `rtk run` reparses its shell command, so this also proves the detached
+    // wrapper preserves nested single quotes rather than injecting backslashes.
+    const fakeRtk = path.join(cwd, "rtk");
+    const rtkMarker = path.join(cwd, "auto-background-rtk-marker");
+    await fs.writeFile(fakeRtk, "#!/bin/sh\n[ \"$1\" = run ] || exit 64\nshift\nexec /bin/sh -c \"$*\"\n", { mode: 0o755 });
+    await withEnv({ PATH: `${cwd}${path.delimiter}${process.env.PATH ?? ""}` }, async () => {
+      const rtkCommand = `rtk run \"printf '%s\\n' 'RTK quoted payload' > '${rtkMarker}'\"`;
+      const rtk = await autoHarness.callTool("bash", { command: rtkCommand, timeout: 300 });
+      if (!rtk.terminate || rtk.details?.autoBackground?.source !== "tool-timeout") {
+        throw new Error(`RTK command was not auto-backgrounded: ${JSON.stringify(rtk)}`);
+      }
+      const rtkJob = rtk.details?.job;
+      await waitForWake(autoHarness, { jobId: rtkJob.id, label: rtkJob.label, resume: rtkJob.resume }, 6_000);
+    });
+    if (await fs.readFile(rtkMarker, "utf8") !== "RTK quoted payload\n") {
+      throw new Error("auto-backgrounded RTK command did not preserve quoted shell payload");
+    }
+
+    const explicitMarker = path.join(cwd, "auto-background-explicit-marker");
+    const explicitCommand = `timeout 300s ${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(explicitMarker)}, 'ok')`)}`;
+    const explicit = await autoHarness.callTool("bash", { command: explicitCommand });
+    if (!explicit.terminate || explicit.details?.autoBackground?.source !== "explicit") {
+      throw new Error(`explicit timeout command did not auto-background: ${JSON.stringify(explicit)}`);
+    }
+    const explicitJob = explicit.details?.job;
+    await waitForWake(autoHarness, { jobId: explicitJob.id, label: explicitJob.label, resume: explicitJob.resume }, 6_000);
+    if (await fs.readFile(explicitMarker, "utf8") !== "ok") throw new Error("explicit auto-backgrounded timeout command did not execute");
+
+    const shouldNotExist = path.join(cwd, "auto-background-tool-cap-marker");
+    const cappedExplicit = `timeout 1h ${JSON.stringify(process.execPath)} -e ${JSON.stringify(`setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(shouldNotExist)}, 'late'), 500)`)}`;
+    const capResult = await autoHarness.callTool("bash", { command: cappedExplicit, timeout: 0.1 });
+    if (!capResult.terminate || capResult.details?.autoBackground?.source !== "explicit") {
+      throw new Error(`explicit timeout with a shorter Pi tool cap did not auto-background: ${JSON.stringify(capResult)}`);
+    }
+    const capJob = capResult.details?.job;
+    await waitForWake(autoHarness, { jobId: capJob.id, label: capJob.label, resume: capJob.resume }, 6_000);
+    await sleep(600);
+    if (await fs.stat(shouldNotExist).then(() => true).catch(() => false)) {
+      throw new Error("Pi bash timeout was not preserved for an explicit auto-backgrounded wait");
+    }
+
+    const compound = await autoHarness.toolCall("bash", { command: "sleep 10; long-job" });
+    if (!compound?.block) throw new Error(`compound explicit wait was auto-converted instead of blocked: ${JSON.stringify(compound)}`);
+
+    const customBashHarness = createHarness("custom-bash-session", { bashSource: "custom-extension" });
+    await customBashHarness.emit("session_start");
+    const customBash = await customBashHarness.toolCall("bash", { command, timeout: 300 });
+    if (!customBash?.block || !String(customBash.reason).includes("another extension owns the bash tool")) {
+      throw new Error(`custom bash override was not protected from auto-background replacement: ${JSON.stringify(customBash)}`);
+    }
+    await autoHarness.runCommand("return-on-config", "off");
+  });
+  // Restore the primary harness after exercising a fresh session-start path.
+  await _harness.emit("session_start");
+}
+
+async function testReturnOnConfigCommand() {
+  await withUserAgentSettings({ returnOn: { autoBackground: "off" } }, async () => {
+    const configHarness = createHarness("return-on-config-session", { autoBackgroundFlag: true });
+    await configHarness.emit("session_start");
+    if (configHarness.tools.has("bash")) throw new Error("auto-background bash override started while /return-on-config was off");
+
+    await configHarness.runCommand("return-on-config", "long 5m 1m");
+    const saved = JSON.parse(await fs.readFile(path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), "utf8"));
+    if (saved.returnOn?.autoBackground !== "explicit-and-long-tool-timeout" || saved.returnOn?.autoBackgroundToolTimeoutMin !== "5m" || saved.returnOn?.autoBackgroundCheckInEvery !== "1m") {
+      throw new Error(`return-on-config did not persist requested auto-background settings: ${JSON.stringify(saved)}`);
+    }
+    if (!configHarness.tools.has("bash")) throw new Error("return-on-config did not activate auto-backgrounding for the active builtin bash tool");
+
+    await configHarness.runCommand("return-on-config", "off");
+    const disabled = JSON.parse(await fs.readFile(path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), "utf8"));
+    if (disabled.returnOn?.autoBackground !== "off") throw new Error("return-on-config off did not persist");
+    await configHarness.runCommand("return-on-config", "long 5m 1m");
+    if (!configHarness.tools.has("bash") || String(configHarness.notifications.at(-1)?.message).includes("could not activate")) {
+      throw new Error("return-on-config could not reactivate its previously registered bash wrapper after off");
+    }
+    await configHarness.emit("session_start");
+    await configHarness.runCommand("return-on-config", "long 5m 1m");
+    if (String(configHarness.notifications.at(-1)?.message).includes("could not activate")) {
+      throw new Error("return-on-config could not reactivate its wrapper after a session transition");
+    }
+    await configHarness.emit("session_shutdown");
+  });
+}
+
+async function testReturnOnConfigValidatesGlobalSettings() {
+  await withUserAgentSettings({ returnOn: { autoBackground: "off", maxTimeout: "2h" } }, async () => {
+    await withProjectSettings({ returnOn: { maxTimeout: "10h", autoBackground: "explicit" } }, async () => {
+      const configHarness = createHarness("return-on-config-global-validation-session");
+      await configHarness.emit("session_start");
+      await configHarness.runCommand("return-on-config", "long 5h");
+      const saved = JSON.parse(await fs.readFile(path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), "utf8"));
+      if (saved.returnOn?.autoBackground !== "off" || saved.returnOn?.autoBackgroundToolTimeoutMin !== undefined) {
+        throw new Error(`return-on-config accepted a value invalid in global settings: ${JSON.stringify(saved)}`);
+      }
+      const notice = configHarness.notifications.at(-1)?.message ?? "";
+      if (!notice.includes("must not exceed returnOn.maxTimeout")) {
+        throw new Error(`return-on-config did not report global validation failure: ${notice}`);
+      }
+      await configHarness.runCommand("return-on-config", "status");
+      if (!String(configHarness.notifications.at(-1)?.message).includes("Effective configuration in this trusted project differs")) {
+        throw new Error("return-on-config status did not disclose a trusted project override");
+      }
+      await configHarness.emit("session_shutdown");
+    });
+  });
+}
+
+async function testAutoBackgroundPreservesBuiltinShellSettings() {
+  const marker = path.join(cwd, "auto-background-shell-prefix-marker");
+  const shell = path.join(cwd, "auto-background-custom-shell");
+  await fs.writeFile(shell, `#!/bin/sh\nprintf %s shell > ${JSON.stringify(marker)}\nexec /bin/bash "$@"\n`, { mode: 0o755 });
+  const prefix = `printf %s prefix >> ${JSON.stringify(marker)}`;
+  await withUserAgentSettings({
+    shellPath: shell,
+    shellCommandPrefix: prefix,
+    returnOn: { autoBackground: "explicit-and-long-tool-timeout", autoBackgroundToolTimeoutMin: "5m" },
+  }, async () => {
+    const shellHarness = createHarness("auto-background-shell-settings-session", { autoBackgroundFlag: true });
+    await shellHarness.emit("session_start");
+    await shellHarness.runCommand("return-on-config", "long 5m");
+    await shellHarness.callTool("bash", { command: `printf %s command >> ${JSON.stringify(marker)}` });
+    if (await fs.readFile(marker, "utf8") !== "shellprefixcommand") {
+      throw new Error("auto-background wrapper did not preserve Pi shellPath/shellCommandPrefix for a non-eligible bash command");
+    }
+    await shellHarness.emit("session_shutdown");
+  });
 }
 
 async function testNoOpPollingDoesNotRewriteJobs(harness: Harness) {
@@ -2688,6 +2874,11 @@ const harness = createHarness("main-session");
 await harness.emit("session_start");
 
 await testDirectWaitPolicy(harness);
+await testAutoBackgroundBash(harness);
+await testReturnOnConfigCommand();
+await testReturnOnConfigValidatesGlobalSettings();
+await testAutoBackgroundPreservesBuiltinShellSettings();
+await harness.emit("session_start");
 await testNoOpPollingDoesNotRewriteJobs(harness);
 await testDelayedEvaluationSurvivesInterleavedSave(harness);
 await testCommonShorthandAccepted(harness);
